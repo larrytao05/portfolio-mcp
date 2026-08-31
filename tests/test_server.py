@@ -1,6 +1,6 @@
-import asyncio
-import pytest
 from contextlib import AsyncExitStack
+
+import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -13,6 +13,7 @@ EXPECTED_TOOLS = [
     "get_orders_by_customer_id",
 ]
 
+
 @pytest.mark.asyncio
 async def test_mcp_server_connection():
     exit_stack = AsyncExitStack()
@@ -21,14 +22,10 @@ async def test_mcp_server_connection():
         command="python", args=[SERVER_PATH], env=None
     )
 
-    stdio_transport = await exit_stack.enter_async_context(
-        stdio_client(server_params)
-    )
+    stdio_transport = await exit_stack.enter_async_context(stdio_client(server_params))
 
     stdio, write = stdio_transport
-    session = await exit_stack.enter_async_context(
-        ClientSession(stdio, write)
-    )
+    session = await exit_stack.enter_async_context(ClientSession(stdio, write))
 
     await session.initialize()
 
@@ -42,5 +39,5 @@ async def test_mcp_server_connection():
         print(f"{tool_name}: {tool_description}")
 
     assert sorted(EXPECTED_TOOLS) == sorted(tool_names)
-    
+
     await exit_stack.aclose()

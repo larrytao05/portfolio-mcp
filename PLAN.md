@@ -25,26 +25,50 @@ ready.
 - Keep provider-specific code out of the MCP tool layer.
 - Keep secrets out of source control, test fixtures, logs, and tool responses.
 
+## Decisions recorded in Milestone 0
+
+- **Deployment:** local, single-user server that others can clone and run on
+  their own machines; no hosted or multi-user service.
+- **Data sources:** Schwab and Fidelity.
+- **Read provider:** SnapTrade Personal API, initially exercised through its
+  sandbox and then connected to live accounts with read-only permissions.
+- **Future execution:** Schwab only, through a separately approved trading
+  path. Fidelity remains read-only. Automated execution is deferred until the
+  read-only server, simulation, shadow mode, risk controls, and reconciliation
+  are complete.
+- **Supported accounts:** taxable brokerage and Roth IRA only.
+- **Reporting currency:** USD.
+- **Prices:** use SnapTrade-reported valuations in the read-only phase. A
+  separate, entitled real-time quote source is required before execution.
+- **Persistence:** fetch data on demand; do not create a local portfolio
+  database yet.
+- **Privacy:** show only safe account labels/masked suffixes; never full
+  account numbers in responses or logs.
+- **Initial tools:** `list_accounts`, `get_holdings(account_id)`, and
+  `get_transactions(account_id, start_date, end_date)`.
+- **Quality tools:** Ruff for formatting and linting, Pyright for type checks,
+  and pytest for tests.
+
 ## Milestone 0 — Product decisions and project baseline
 
 **Outcome:** a concrete first release definition before implementation starts.
 
-- [ ] List the portfolio providers to support, ranked by usefulness.
-- [ ] Choose one provider for the first integration.
-- [ ] Confirm that its API offers the required read-only endpoints and
+- [x] List the portfolio providers to support, ranked by usefulness.
+- [x] Choose one provider for the first integration.
+- [x] Confirm that its API offers the required read-only endpoints and
   authentication method.
-- [ ] Identify the first release’s supported account types (for example,
+- [x] Identify the first release’s supported account types (for example,
   brokerage, retirement, cash, or crypto).
-- [ ] Decide the primary base currency and how non-base-currency values are
+- [x] Decide the primary base currency and how non-base-currency values are
   represented.
-- [ ] Decide whether market values come from the provider, a separate market
+- [x] Decide whether market values come from the provider, a separate market
   data source, or both.
-- [ ] Write a one-page data policy: local-only vs. hosted usage, retention,
+- [x] Write a one-page data policy: local-only vs. hosted usage, retention,
   logging, and whether account identifiers may be displayed.
-- [ ] Add a `.gitignore` before creating any local environment or secret file.
-- [ ] Choose formatting, linting, and type-checking tools appropriate for this
+- [x] Add a `.gitignore` before creating any local environment or secret file.
+- [x] Choose formatting, linting, and type-checking tools appropriate for this
   small Python project.
-- [ ] Record the decisions above in the README or an architecture note.
+- [x] Record the decisions above in this plan.
 
 **Exit criteria:** the first provider, supported account types, first tools,
 and data-handling boundaries are written down.

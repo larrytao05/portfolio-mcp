@@ -8,6 +8,19 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "pyright>=1.1.390",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "ruff>=0.8.0",
 ]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.pyright]
+include = ["main.py", "transactional_db.py", "tests"]
+typeCheckingMode = "basic"

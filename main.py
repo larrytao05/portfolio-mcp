@@ -1,8 +1,11 @@
 import asyncio
+
 from mcp.server.mcpserver import MCPServer
+
 from transactional_db import CUSTOMERS_TABLE, ORDERS_TABLE, PRODUCTS_TABLE
 
 mcp = MCPServer("ecommerce_tools")
+
 
 @mcp.tool()
 async def get_customer_info(customer_id: str) -> str:
@@ -12,7 +15,7 @@ async def get_customer_info(customer_id: str) -> str:
 
     if not customer_info:
         return "Customer not found"
-    
+
     return str(customer_info)
 
 
@@ -23,11 +26,9 @@ async def get_order_details(order_id: str) -> str:
     order = ORDERS_TABLE.get(order_id)
     if not order:
         return f"No order found with ID {order_id}."
-    
+
     items = [
-        PRODUCTS_TABLE[sku]["name"]
-        for sku in order["items"]
-        if sku in PRODUCTS_TABLE
+        PRODUCTS_TABLE[sku]["name"] for sku in order["items"] if sku in PRODUCTS_TABLE
     ]
     return (
         f"Order ID: {order_id}\n"
@@ -36,7 +37,8 @@ async def get_order_details(order_id: str) -> str:
         f"Status: {order['status']}\n"
         f"Total: ${order['total']:.2f}\n"
         f"Items: {', '.join(items)}"
-)
+    )
+
 
 @mcp.tool()
 async def check_inventory(product_name: str) -> str:
@@ -50,6 +52,7 @@ async def check_inventory(product_name: str) -> str:
             )
     return "\n".join(matches) if matches else "No matching products found."
 
+
 @mcp.tool()
 async def get_customer_ids_by_name(customer_name: str) -> list[str]:
     """Get customer IDs by using a customer's full name"""
@@ -59,6 +62,7 @@ async def get_customer_ids_by_name(customer_name: str) -> list[str]:
         for cust_id, info in CUSTOMERS_TABLE.items()
         if info.get("name") == customer_name
     ]
+
 
 @mcp.tool()
 async def get_orders_by_customer_id(
@@ -71,6 +75,7 @@ async def get_orders_by_customer_id(
         for order_id, order in ORDERS_TABLE.items()
         if order.get("customer_id") == customer_id
     }
+
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")
