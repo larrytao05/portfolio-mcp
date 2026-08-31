@@ -1,43 +1,115 @@
 from contextlib import AsyncExitStack
+from datetime import date
+from decimal import Decimal
 
 import pytest
-from mcp import ClientSession, StdioServerParameters
+from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 
+from portfolio_mcp.fixtures import FixturePortfolioProvider
+from portfolio_mcp.provider import AccountNotFoundError
+
 SERVER_PATH = "./main.py"
-EXPECTED_TOOLS = [
-    "get_customer_info",
-    "get_order_details",
-    "check_inventory",
-    "get_customer_ids_by_name",
-    "get_orders_by_customer_id",
-]
+EXPECTED_TOOLS = ["list_accounts", "get_holdings", "get_transactions"]
 
 
 @pytest.mark.asyncio
-async def test_mcp_server_connection():
-    exit_stack = AsyncExitStack()
+async def test_mcp_server_connection() -> None:
+    async with AsyncExitStack() as exit_stack:
+        server_params = StdioServerParameters(
+            command="python", args=[SERVER_PATH], env=None
+        )
+        stdio, write = await exit_stack.enter_async_context(stdio_client(server_params))
+        session = await exit_stack.enter_async_context(ClientSession(stdio, write))
 
-    server_params = StdioServerParameters(
-        command="python", args=[SERVER_PATH], env=None
+        await session.initialize()
+        response = await session.list_tools()
+
+    assert sorted(EXPECTED_TOOLS) == sorted(tool.name for tool in response.tools)
+
+
+@pytest.mark.asyncio
+async def test_mcp_tools_return_fixture_data() -> None:
+    async with AsyncExitStack() as exit_stack:
+        server_params = StdioServerParameters(
+            command="python", args=[SERVER_PATH], env=None
+        )
+        stdio, write = await exit_stack.enter_async_context(stdio_client(server_params))
+        session = await exit_stack.enter_async_context(ClientSession(stdio, write))
+
+        await session.initialize()
+        response = await session.call_tool(
+            "get_holdings", {"account_id": "schwab-taxable-demo"}
+        )
+
+    assert isinstance(response, types.CallToolResult)
+    assert response.is_error is False
+    assert isinstance(response.structured_content, dict)
+    assert response.structured_content["account"]["provider"] == "Schwab"
+    assert response.structured_content["positions"][0]["symbol"] == "VTI"
+
+
+@pytest.mark.asyncio
+async def test_fixture_accounts_are_safe_and_supported() -> None:
+    provider = FixturePortfolioProvider()
+
+    accounts = await provider.list_accounts()
+
+    assert [account.account_type for account in accounts] == [
+        "taxable_brokerage",
+        "roth_ira",
+    ]
+    assert [account.provider for account in accounts] == ["Schwab", "Fidelity"]
+    assert all("••••" in account.label for account in accounts)
+
+
+@pytest.mark.asyncio
+async def test_fixture_portfolio_is_approximately_ten_thousand_usd() -> None:
+    provider = FixturePortfolioProvider()
+    accounts = await provider.list_accounts()
+
+    positions = [
+        position
+        for account in accounts
+        for position in await provider.get_holdings(account.id)
+    ]
+
+    total_value = sum((position.market_value for position in positions), Decimal("0"))
+    vti_value = sum(
+        (position.market_value for position in positions if position.symbol == "VTI"),
+        Decimal("0"),
+    )
+    individual_equity_value = sum(
+        (
+            position.market_value
+            for position in positions
+            if position.symbol in {"SPGI", "NVDA", "MU"}
+        ),
+        Decimal("0"),
     )
 
-    stdio_transport = await exit_stack.enter_async_context(stdio_client(server_params))
+    assert total_value == Decimal("9999.95")
+    assert Decimal("0.499") < vti_value / total_value < Decimal("0.501")
+    assert Decimal("0.099") < individual_equity_value / total_value < Decimal("0.101")
 
-    stdio, write = stdio_transport
-    session = await exit_stack.enter_async_context(ClientSession(stdio, write))
 
-    await session.initialize()
+@pytest.mark.asyncio
+async def test_transactions_filter_to_inclusive_date_range() -> None:
+    provider = FixturePortfolioProvider()
 
-    response = await session.list_tools()
-    tools = response.tools
-    tool_names = [tool.name for tool in tools]
-    tool_descriptions = [tool.description for tool in tools]
+    transactions = await provider.get_transactions(
+        "schwab-taxable-demo", date(2026, 8, 1), date(2026, 8, 14)
+    )
 
-    print("\nYour server has the following tools:")
-    for tool_name, tool_description in zip(tool_names, tool_descriptions):
-        print(f"{tool_name}: {tool_description}")
+    assert [transaction.id for transaction in transactions] == [
+        "schwab-demo-003",
+        "schwab-demo-002",
+    ]
 
-    assert sorted(EXPECTED_TOOLS) == sorted(tool_names)
 
-    await exit_stack.aclose()
+@pytest.mark.asyncio
+async def test_unknown_account_is_rejected() -> None:
+    provider = FixturePortfolioProvider()
+
+    with pytest.raises(AccountNotFoundError, match="Account not found"):
+        await provider.get_holdings("missing-account")

@@ -22,5 +22,8 @@ line-length = 88
 select = ["E", "F", "I"]
 
 [tool.pyright]
-include = ["main.py", "transactional_db.py", "tests"]
+include = ["main.py", "portfolio_mcp", "tests"]
 typeCheckingMode = "basic"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
