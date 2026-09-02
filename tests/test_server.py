@@ -71,17 +71,24 @@ async def test_fixture_portfolio_is_approximately_ten_thousand_usd() -> None:
     positions = [
         position
         for account in accounts
-        for position in await provider.get_holdings(account.id)
+        for position in (await provider.get_holdings(account.id)).positions
     ]
 
-    total_value = sum((position.market_value for position in positions), Decimal("0"))
+    assert all(position.market_value is not None for position in positions)
+    total_value = sum(
+        (position.market_value or Decimal("0") for position in positions), Decimal("0")
+    )
     vti_value = sum(
-        (position.market_value for position in positions if position.symbol == "VTI"),
+        (
+            position.market_value or Decimal("0")
+            for position in positions
+            if position.symbol == "VTI"
+        ),
         Decimal("0"),
     )
     individual_equity_value = sum(
         (
-            position.market_value
+            position.market_value or Decimal("0")
             for position in positions
             if position.symbol in {"SPGI", "NVDA", "MU"}
         ),
@@ -97,11 +104,11 @@ async def test_fixture_portfolio_is_approximately_ten_thousand_usd() -> None:
 async def test_transactions_filter_to_inclusive_date_range() -> None:
     provider = FixturePortfolioProvider()
 
-    transactions = await provider.get_transactions(
+    history = await provider.get_transactions(
         "schwab-taxable-demo", date(2026, 8, 1), date(2026, 8, 14)
     )
 
-    assert [transaction.id for transaction in transactions] == [
+    assert [transaction.id for transaction in history.transactions] == [
         "schwab-demo-003",
         "schwab-demo-002",
     ]

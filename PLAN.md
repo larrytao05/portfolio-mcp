@@ -108,21 +108,21 @@ fixtures, and the automated test suite passes without network access.
 
 **Outcome:** provider-specific work has a narrow, testable boundary.
 
-- [ ] Define a `PortfolioProvider` interface/protocol with only required read
+- [x] Define a `PortfolioProvider` interface/protocol with only required read
   operations: accounts, positions, and transactions.
-- [ ] Decide whether snapshots/valuations belong in the initial interface or
+- [x] Decide whether snapshots/valuations belong in the initial interface or
   wait until the first provider proves the need.
-- [ ] Define provider-specific configuration separately from normalized domain
+- [x] Define provider-specific configuration separately from normalized domain
   models.
-- [ ] Define a provider exception hierarchy for authentication, authorization,
+- [x] Define a provider exception hierarchy for authentication, authorization,
   rate-limit, unavailable-service, malformed-response, and not-found cases.
-- [ ] Map those exceptions to client-safe MCP errors without leaking tokens,
+- [x] Map those exceptions to client-safe MCP errors without leaking tokens,
   raw response bodies, or account numbers.
-- [ ] Add a fixture/mock implementation conforming to the new interface.
-- [ ] Move MCP tools to depend on the interface, never on fixture dictionaries
+- [x] Add a fixture/mock implementation conforming to the new interface.
+- [x] Move MCP tools to depend on the interface, never on fixture dictionaries
   or provider SDK objects.
-- [ ] Add contract tests that every provider implementation must pass.
-- [ ] Document required fields vs. optional fields, especially cost basis,
+- [x] Add contract tests that every provider implementation must pass.
+- [x] Document required fields vs. optional fields, especially cost basis,
   market value, and transaction metadata.
 
 **Exit criteria:** replacing the fixture provider with a real provider changes

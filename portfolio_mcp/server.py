@@ -18,17 +18,8 @@ def create_server(provider: PortfolioProvider) -> MCPServer:
     @mcp.tool()
     async def get_holdings(account_id: str) -> dict[str, object]:
         """Get holdings and reported valuations for a portfolio account."""
-        accounts = await provider.list_accounts()
-        account = next((item for item in accounts if item.id == account_id), None)
-        if account is None:
-            raise ValueError(f"Account not found: {account_id}")
-
-        positions = await provider.get_holdings(account_id)
-        return {
-            "account": account.to_dict(),
-            "as_of": provider.as_of.isoformat(),
-            "positions": [position.to_dict() for position in positions],
-        }
+        snapshot = await provider.get_holdings(account_id)
+        return snapshot.to_dict()
 
     @mcp.tool()
     async def get_transactions(
@@ -40,18 +31,8 @@ def create_server(provider: PortfolioProvider) -> MCPServer:
         if start > end:
             raise ValueError("start_date must be on or before end_date")
 
-        accounts = await provider.list_accounts()
-        account = next((item for item in accounts if item.id == account_id), None)
-        if account is None:
-            raise ValueError(f"Account not found: {account_id}")
-
-        transactions = await provider.get_transactions(account_id, start, end)
-        return {
-            "account": account.to_dict(),
-            "start_date": start.isoformat(),
-            "end_date": end.isoformat(),
-            "transactions": [transaction.to_dict() for transaction in transactions],
-        }
+        history = await provider.get_transactions(account_id, start, end)
+        return history.to_dict()
 
     return mcp
 

@@ -1,7 +1,13 @@
 from datetime import date
 from decimal import Decimal
 
-from portfolio_mcp.models import Account, Position, Transaction
+from portfolio_mcp.models import (
+    Account,
+    HoldingsSnapshot,
+    Position,
+    Transaction,
+    TransactionHistory,
+)
 from portfolio_mcp.provider import AccountNotFoundError
 
 
@@ -204,25 +210,38 @@ class FixturePortfolioProvider:
                 currency="USD",
             ),
         ]
+        self._accounts_by_id = {account.id: account for account in self._accounts}
 
     async def list_accounts(self) -> list[Account]:
         return self._accounts.copy()
 
-    async def get_holdings(self, account_id: str) -> list[Position]:
-        self._ensure_account_exists(account_id)
-        return self._positions[account_id].copy()
+    async def get_holdings(self, account_id: str) -> HoldingsSnapshot:
+        account = self._get_account(account_id)
+        return HoldingsSnapshot(
+            account=account,
+            as_of=self.as_of,
+            positions=tuple(self._positions[account_id]),
+        )
 
     async def get_transactions(
         self, account_id: str, start_date: date, end_date: date
-    ) -> list[Transaction]:
-        self._ensure_account_exists(account_id)
-        return [
+    ) -> TransactionHistory:
+        account = self._get_account(account_id)
+        transactions = tuple(
             transaction
             for transaction in self._transactions
             if transaction.account_id == account_id
             and start_date <= transaction.occurred_on <= end_date
-        ]
+        )
+        return TransactionHistory(
+            account=account,
+            start_date=start_date,
+            end_date=end_date,
+            transactions=transactions,
+        )
 
-    def _ensure_account_exists(self, account_id: str) -> None:
-        if account_id not in self._positions:
+    def _get_account(self, account_id: str) -> Account:
+        account = self._accounts_by_id.get(account_id)
+        if account is None:
             raise AccountNotFoundError(f"Account not found: {account_id}")
+        return account
