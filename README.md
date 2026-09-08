@@ -1,8 +1,8 @@
 # Portfolio MCP
 
 Local, read-only MCP server for viewing brokerage accounts, holdings, and
-transactions. It currently uses fictional fixture data; no real credentials
-are needed to run or test it.
+transactions. Currently the only implemented provider is SnapTrade. It has 
+been tested using Schwab and Fidelity accounts so far.
 
 ## Provider contract
 
