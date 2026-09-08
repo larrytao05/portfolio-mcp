@@ -23,7 +23,7 @@ uv run pytest
 
 ## SnapTrade configuration
 
-The future SnapTrade adapter will read these local environment variables:
+The SnapTrade adapter reads these local environment variables:
 
 ```sh
 SNAPTRADE_CLIENT_ID=
