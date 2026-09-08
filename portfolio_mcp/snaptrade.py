@@ -138,12 +138,13 @@ class SnapTradeProvider:
             return None
 
         raw_type = _required_string(source, "raw_type")
-        account_type = _to_account_type(raw_type)
+        name = _optional_string(source.get("name"))
+        account_type = _to_account_type(raw_type, name)
         if account_type is None:
             return None
 
         number = _required_string(source, "number")
-        name = source.get("name") or account_type
+        name = name or account_type
         if not isinstance(name, str):
             raise ProviderResponseError("SnapTrade returned an unexpected response")
 
@@ -151,19 +152,28 @@ class SnapTradeProvider:
         return Account(
             id=_required_string(source, "id"),
             provider=provider,
-            label=f"{provider} {name} ••••{number[-4:]}",
+            label=_to_account_label(provider, name, number),
             account_type=account_type,
             currency="USD",
         )
 
 
-def _to_account_type(raw_type: str) -> str | None:
-    normalized = raw_type.upper()
+def _to_account_type(raw_type: str, name: str | None) -> str | None:
+    normalized = f"{raw_type} {name or ''}".upper()
     if "ROTH" in normalized and "IRA" in normalized:
         return "Roth IRA"
     if "IRA" in normalized:
         return None
     return "Taxable brokerage"
+
+
+def _to_account_label(provider: str, name: str, number: str) -> str:
+    display_name = name.removesuffix(number).rstrip() or name
+    suffix = "".join(character for character in number if character.isdigit())[-4:]
+    if suffix and len(suffix) < 4 and display_name.endswith(suffix):
+        display_name = display_name[: -len(suffix)].rstrip(" .•*-") or display_name
+    masked_number = f"••••{suffix}" if suffix else "••••"
+    return f"{provider} {display_name} {masked_number}"
 
 
 def _to_position(account_id: str, source: Mapping[str, Any]) -> Position:

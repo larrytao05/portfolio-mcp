@@ -29,9 +29,9 @@ class FakeAccountInformation:
                 {
                     "id": "roth-account",
                     "institution_name": "Fidelity",
-                    "name": "Roth IRA",
-                    "number": "12345678",
-                    "raw_type": "Roth IRA",
+                    "name": "Roth Contributory IRA ...318",
+                    "number": "...318",
+                    "raw_type": "Roth Contributory",
                     "account_category": "INVESTMENT",
                 },
                 {
@@ -145,7 +145,8 @@ async def test_get_holdings_maps_a_snapshot() -> None:
 
     snapshot = await provider.get_holdings("roth-account")
 
-    assert snapshot.account.label == "Fidelity Roth IRA ••••5678"
+    assert snapshot.account.account_type == "Roth IRA"
+    assert snapshot.account.label == "Fidelity Roth Contributory IRA ••••318"
     assert snapshot.as_of == date(2026, 9, 8)
     assert snapshot.positions[0].symbol == "VTI"
     assert snapshot.positions[0].market_value == Decimal("3152.625")
