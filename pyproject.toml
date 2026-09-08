@@ -4,6 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "mcp[cli]>=2.1.1",
+    "snaptrade-python-sdk>=13.0.13",
 ]
 
 [dependency-groups]

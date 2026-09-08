@@ -30,6 +30,15 @@ SNAPTRADE_CLIENT_ID=
 SNAPTRADE_CONSUMER_KEY=
 ```
 
-The fixture server does not read these values yet. When the live adapter is
-added, export them in your shell or load them from a local `.env` file before
-starting the server. Never commit `.env` or share its values.
+The fixture server is the default. To start the live read-only SnapTrade
+provider, export the values and select it explicitly:
+
+```sh
+export PORTFOLIO_PROVIDER=snaptrade
+export SNAPTRADE_CLIENT_ID='your-client-id'
+export SNAPTRADE_CONSUMER_KEY='your-consumer-key'
+uv run python main.py
+```
+
+Use `PORTFOLIO_PROVIDER=fixture` to return to fictional data. Never commit
+`.env` or share credential values.
