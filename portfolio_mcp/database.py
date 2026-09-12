@@ -116,11 +116,66 @@ class StoredPosition:
     as_of: date
 
     def to_dict(self) -> dict[str, str | None]:
+        gain_loss = (
+            self.position.market_value - self.position.cost_basis
+            if self.position.market_value is not None
+            and self.position.cost_basis is not None
+            else None
+        )
         return {
             "account_id": self.position.account_id,
             "as_of": self.as_of.isoformat(),
             **self.position.to_dict(),
+            "gain_loss": str(gain_loss) if gain_loss is not None else None,
         }
+
+
+@dataclass(frozen=True)
+class AccountDetail:
+    account: Account
+    refreshed_at: datetime
+    as_of: date | None
+    positions: tuple[StoredPosition, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        market_values = [
+            stored.position.market_value
+            for stored in self.positions
+            if stored.position.market_value is not None
+        ]
+        cost_bases = [
+            stored.position.cost_basis
+            for stored in self.positions
+            if stored.position.cost_basis is not None
+        ]
+        currencies_match = all(
+            stored.position.currency == self.account.currency
+            for stored in self.positions
+        )
+        return {
+            "id": self.account.id,
+            "provider": self.account.provider,
+            "label": self.account.label,
+            "account_type": self.account.account_type,
+            "currency": self.account.currency,
+            "refreshed_at": self.refreshed_at.isoformat(),
+            "as_of": self.as_of.isoformat() if self.as_of is not None else None,
+            "balances": {
+                "market_value": self._total_if_complete(
+                    market_values, currencies_match
+                ),
+                "cost_basis": self._total_if_complete(cost_bases, currencies_match),
+                "currency": self.account.currency,
+            },
+            "positions": [position.to_dict() for position in self.positions],
+        }
+
+    def _total_if_complete(
+        self, values: list[Decimal], currencies_match: bool
+    ) -> str | None:
+        if not currencies_match or len(values) != len(self.positions):
+            return None
+        return str(sum(values, start=Decimal("0")))
 
 
 @dataclass(frozen=True)
@@ -210,6 +265,32 @@ class PortfolioRepository:
                 .order_by(PositionRecord.symbol)
             )
             return [self._stored_position(record) for record in records]
+
+    def account_detail(self, account_id: str) -> AccountDetail | None:
+        with self._sessions() as session:
+            account = session.get(AccountRecord, account_id)
+            if account is None:
+                return None
+            records = list(
+                session.scalars(
+                    select(PositionRecord)
+                    .where(PositionRecord.account_id == account_id)
+                    .order_by(PositionRecord.symbol)
+                )
+            )
+            positions = tuple(self._stored_position(record) for record in records)
+            return AccountDetail(
+                account=Account(
+                    id=account.id,
+                    provider=account.provider,
+                    label=account.label,
+                    account_type=account.account_type,
+                    currency=account.currency,
+                ),
+                refreshed_at=account.refreshed_at,
+                as_of=positions[0].as_of if positions else None,
+                positions=positions,
+            )
 
     def save_refresh(
         self,
