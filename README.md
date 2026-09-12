@@ -21,6 +21,23 @@ uv run pyright
 uv run pytest
 ```
 
+## Dashboard development
+
+The dashboard frontend lives in `dashboard/` and talks to a local FastAPI API.
+
+```sh
+uv run uvicorn api_main:app --reload
+cd dashboard && npm install && npm run dev
+```
+
+The API listens on `127.0.0.1:8000`; Vite proxies `/api` requests from the
+frontend development server. This starts fixture data by default. To use a
+configured SnapTrade provider, start the API with:
+
+```sh
+uv run --env-file .env uvicorn api_main:app --reload
+```
+
 ## SnapTrade configuration
 
 The SnapTrade adapter reads these local environment variables:
