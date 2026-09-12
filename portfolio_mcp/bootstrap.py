@@ -21,3 +21,8 @@ def create_provider(
     raise ProviderConfigurationError(
         "PORTFOLIO_PROVIDER must be either 'fixture' or 'snaptrade'"
     )
+
+
+def create_database_url(environment: Mapping[str, str] | None = None) -> str:
+    source = os.environ if environment is None else environment
+    return source.get("PORTFOLIO_DATABASE_URL", "sqlite:///portfolio.db")

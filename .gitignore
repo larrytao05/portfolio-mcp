@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 .venv/
 .env
+portfolio.db
 .codex/
 dashboard/node_modules/
 dashboard/dist/
