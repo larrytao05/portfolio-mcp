@@ -2,13 +2,23 @@ from datetime import date
 
 import pytest
 
-from portfolio_mcp.fixtures import FixturePortfolioProvider
-from portfolio_mcp.provider import AccountNotFoundError, PortfolioProvider
+from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
+from portfolio_mcp.provider import (
+    AccountNotFoundError,
+    InstrumentNotFoundError,
+    MarketDataProvider,
+    PortfolioProvider,
+)
 
 
 @pytest.fixture
 def provider() -> PortfolioProvider:
     return FixturePortfolioProvider()
+
+
+@pytest.fixture
+def market_data_provider() -> MarketDataProvider:
+    return FixtureMarketDataProvider()
 
 
 @pytest.mark.asyncio
@@ -65,3 +75,37 @@ async def test_provider_contract_rejects_unknown_accounts(
 ) -> None:
     with pytest.raises(AccountNotFoundError, match="Account not found"):
         await provider.get_holdings("missing-account")
+
+
+@pytest.mark.asyncio
+async def test_market_data_contract_searches_canonical_instruments(
+    market_data_provider: MarketDataProvider,
+) -> None:
+    instruments = await market_data_provider.search_instruments("vanguard")
+
+    assert [(instrument.id, instrument.symbol) for instrument in instruments] == [
+        ("us-etf:VTI", "VTI"),
+    ]
+    assert await market_data_provider.search_instruments("not-a-symbol") == []
+
+
+@pytest.mark.asyncio
+async def test_market_data_contract_preserves_unavailable_quote_fields(
+    market_data_provider: MarketDataProvider,
+) -> None:
+    quote = await market_data_provider.get_quote("us-fund:FIXTURE_UNAVAILABLE")
+
+    assert quote.instrument.id == "us-fund:FIXTURE_UNAVAILABLE"
+    assert quote.source == "fixture_market_data"
+    assert quote.observed_at.isoformat() == "2026-09-12T20:00:00+00:00"
+    assert quote.last_price is None
+    assert quote.bid_price is None
+    assert quote.ask_price is None
+
+
+@pytest.mark.asyncio
+async def test_market_data_contract_rejects_unknown_instruments(
+    market_data_provider: MarketDataProvider,
+) -> None:
+    with pytest.raises(InstrumentNotFoundError, match="Instrument not found"):
+        await market_data_provider.get_quote("missing")

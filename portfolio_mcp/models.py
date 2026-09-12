@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 
@@ -106,4 +106,50 @@ class TransactionHistory:
             "transactions": [
                 transaction.to_dict() for transaction in self.transactions
             ],
+        }
+
+
+@dataclass(frozen=True)
+class Instrument:
+    """A broker-recognized instrument with a stable, provider-neutral identity."""
+
+    id: str
+    symbol: str
+    name: str
+    asset_class: str
+    exchange: str | None
+    currency: str | None
+
+    def to_dict(self) -> dict[str, str | None]:
+        return {
+            "id": self.id,
+            "symbol": self.symbol,
+            "name": self.name,
+            "asset_class": self.asset_class,
+            "exchange": self.exchange,
+            "currency": self.currency,
+        }
+
+
+@dataclass(frozen=True)
+class Quote:
+    """A sourced observation of an instrument's available market prices."""
+
+    instrument: Instrument
+    source: str
+    observed_at: datetime
+    last_price: Decimal | None
+    bid_price: Decimal | None
+    ask_price: Decimal | None
+    currency: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "instrument": self.instrument.to_dict(),
+            "source": self.source,
+            "observed_at": self.observed_at.isoformat(),
+            "last_price": str(self.last_price) if self.last_price is not None else None,
+            "bid_price": str(self.bid_price) if self.bid_price is not None else None,
+            "ask_price": str(self.ask_price) if self.ask_price is not None else None,
+            "currency": self.currency,
         }
