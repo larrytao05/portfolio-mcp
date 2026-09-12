@@ -15,6 +15,13 @@ class FailingFixtureProvider(FixturePortfolioProvider):
         raise ProviderUnavailableError("Fixture provider is unavailable")
 
 
+class PartiallyFailingFixtureProvider(FixturePortfolioProvider):
+    async def get_holdings(self, account_id: str) -> HoldingsSnapshot:
+        if account_id == "schwab-taxable-demo":
+            raise ProviderUnavailableError("Schwab fixture data is unavailable")
+        return await super().get_holdings(account_id)
+
+
 def create_client(tmp_path, clock=None) -> TestClient:
     database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
     return TestClient(
@@ -41,18 +48,31 @@ def test_refresh_persists_accounts(tmp_path) -> None:
     response = client.post("/api/refresh")
 
     assert response.status_code == 200
-    assert response.json()["refresh"] == {
-        "id": 1,
-        "status": "success",
-        "started_at": response.json()["refresh"]["started_at"],
-        "completed_at": response.json()["refresh"]["completed_at"],
-        "accounts_refreshed": 2,
-        "positions_refreshed": 9,
-        "daily_snapshots_recorded": 2,
-        "error_code": None,
-        "error_message": None,
-    }
-    assert response.json()["refresh"]["started_at"].endswith("+00:00")
+    refresh = response.json()["refresh"]
+    assert refresh["status"] == "success"
+    assert refresh["accounts_refreshed"] == 2
+    assert refresh["positions_refreshed"] == 9
+    assert refresh["daily_snapshots_recorded"] == 2
+    assert refresh["warnings"] == []
+    assert refresh["provider_outcomes"] == [
+        {
+            "provider": "Fidelity",
+            "status": "success",
+            "accounts_refreshed": 1,
+            "stale_accounts": 0,
+            "excluded_accounts": 0,
+            "warning": None,
+        },
+        {
+            "provider": "Schwab",
+            "status": "success",
+            "accounts_refreshed": 1,
+            "stale_accounts": 0,
+            "excluded_accounts": 0,
+            "warning": None,
+        },
+    ]
+    assert refresh["started_at"].endswith("+00:00")
 
     response = client.get("/api/accounts")
 
@@ -204,3 +224,103 @@ def test_failed_refresh_is_persisted_without_replacing_saved_data(tmp_path) -> N
     assert latest["status"] == "failed"
     assert latest["error_code"] == "provider_error"
     assert latest["error_message"] == "Fixture provider is unavailable"
+    assert latest["warnings"] == [
+        "Fidelity data is stale; last successful data is shown.",
+        "Schwab data is stale; last successful data is shown.",
+    ]
+    assert all(
+        account["is_stale"]
+        for account in failing_client.get("/api/accounts").json()["accounts"]
+    )
+
+
+def test_partial_refresh_keeps_failed_provider_data_stale(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
+    initial_time = datetime(2026, 9, 12, 14, 0, tzinfo=UTC)
+    partial_time = datetime(2026, 9, 12, 15, 0, tzinfo=UTC)
+    initial_client = TestClient(
+        create_app(
+            FixturePortfolioProvider(),
+            database_url=database_url,
+            clock=lambda: initial_time,
+        )
+    )
+    initial_client.post("/api/refresh")
+    partial_client = TestClient(
+        create_app(
+            PartiallyFailingFixtureProvider(),
+            database_url=database_url,
+            clock=lambda: partial_time,
+        )
+    )
+
+    response = partial_client.post("/api/refresh")
+
+    assert response.status_code == 200
+    refresh = response.json()["refresh"]
+    assert refresh["status"] == "partial"
+    assert refresh["accounts_refreshed"] == 1
+    assert refresh["positions_refreshed"] == 5
+    assert refresh["warnings"] == [
+        "Schwab data is stale; last successful data is shown."
+    ]
+    assert refresh["provider_outcomes"][1] == {
+        "provider": "Schwab",
+        "status": "failed",
+        "accounts_refreshed": 0,
+        "stale_accounts": 1,
+        "excluded_accounts": 0,
+        "warning": "Schwab data is stale; last successful data is shown.",
+    }
+
+    accounts = {
+        account["id"]: account
+        for account in partial_client.get("/api/accounts").json()["accounts"]
+    }
+    assert accounts["fidelity-roth-demo"]["is_stale"] is False
+    assert (
+        accounts["fidelity-roth-demo"]["source_refreshed_at"]
+        == partial_time.isoformat()
+    )
+    assert accounts["schwab-taxable-demo"]["is_stale"] is True
+    assert (
+        accounts["schwab-taxable-demo"]["source_refreshed_at"]
+        == initial_time.isoformat()
+    )
+
+    positions = partial_client.get(
+        "/api/accounts/schwab-taxable-demo/positions"
+    ).json()["positions"]
+    assert len(positions) == 4
+    assert all(position["is_stale"] for position in positions)
+    assert all(
+        position["source_refreshed_at"] == initial_time.isoformat()
+        for position in positions
+    )
+
+
+def test_partial_refresh_discloses_a_provider_without_saved_data(tmp_path) -> None:
+    client = TestClient(
+        create_app(
+            PartiallyFailingFixtureProvider(),
+            database_url=f"sqlite:///{tmp_path / 'portfolio.db'}",
+        )
+    )
+
+    response = client.post("/api/refresh")
+
+    assert response.status_code == 200
+    refresh = response.json()["refresh"]
+    assert refresh["status"] == "partial"
+    assert refresh["provider_outcomes"][1] == {
+        "provider": "Schwab",
+        "status": "failed",
+        "accounts_refreshed": 0,
+        "stale_accounts": 0,
+        "excluded_accounts": 1,
+        "warning": "Schwab data is unavailable and excluded from totals.",
+    }
+    assert {
+        account["provider"]
+        for account in client.get("/api/accounts").json()["accounts"]
+    } == {"Fidelity"}

@@ -21,9 +21,6 @@ class PortfolioRefreshService:
         started_at = self._as_utc(self._clock())
         try:
             accounts = await self._provider.list_accounts()
-            snapshots = [
-                await self._provider.get_holdings(account.id) for account in accounts
-            ]
         except ProviderError as error:
             self._repository.save_failed_refresh(
                 started_at,
@@ -40,6 +37,14 @@ class PortfolioRefreshService:
                 "Portfolio refresh failed",
             )
             raise
+
+        snapshots = []
+        failed_accounts = []
+        for account in accounts:
+            try:
+                snapshots.append(await self._provider.get_holdings(account.id))
+            except Exception:
+                failed_accounts.append(account)
         completed_at = self._as_utc(self._clock())
         snapshot_date = started_at.astimezone(ZoneInfo("America/New_York")).date()
         return self._repository.save_refresh(
@@ -47,6 +52,7 @@ class PortfolioRefreshService:
             started_at,
             completed_at,
             snapshot_date,
+            failed_accounts,
         )
 
     def _as_utc(self, value: datetime) -> datetime:
