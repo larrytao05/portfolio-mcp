@@ -38,6 +38,11 @@ configured SnapTrade provider, start the API with:
 uv run --env-file .env uvicorn api_main:app --reload
 ```
 
+On first launch, select **Refresh portfolio** in the dashboard to save the
+provider's current accounts and holdings. The local SQLite database defaults to
+the ignored `portfolio.db`; set `PORTFOLIO_DATABASE_URL` to use another SQLite
+location.
+
 ## SnapTrade configuration
 
 The SnapTrade adapter reads these local environment variables:
