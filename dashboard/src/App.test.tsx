@@ -1,11 +1,12 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
 
 const api = vi.hoisted(() => ({
   getAccountPositions: vi.fn(),
+  getActivity: vi.fn(),
   getAccounts: vi.fn(),
   getHealth: vi.fn(),
   getLatestRefresh: vi.fn(),
@@ -26,11 +27,17 @@ function renderApp() {
 }
 
 describe("App", () => {
+  afterEach(cleanup);
+
   beforeEach(() => {
     vi.clearAllMocks();
     api.getHealth.mockResolvedValue({ status: "ok" });
     api.getAccounts.mockResolvedValue({ accounts: [] });
     api.getAccountPositions.mockResolvedValue({ positions: [] });
+    api.getActivity.mockResolvedValue({
+      activities: [],
+      pagination: { limit: 50, offset: 0, total: 0 },
+    });
     api.getLatestRefresh.mockResolvedValue({ refresh: null });
     api.refreshPortfolio.mockResolvedValue({
       refresh: {
@@ -102,5 +109,21 @@ describe("App", () => {
 
     expect(await screen.findByText(/Last saved refresh: success/)).toBeTruthy();
     expect(await screen.findByText(/9.123456789123456789 shares/)).toBeTruthy();
+  });
+
+  it("shows an empty filtered activity feed", async () => {
+    renderApp();
+
+    expect(await screen.findByText("No activity matches these filters.")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Activity symbol"), {
+      target: { value: "NOT-A-SYMBOL" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Apply activity filters" }));
+
+    await waitFor(() =>
+      expect(api.getActivity).toHaveBeenLastCalledWith(
+        expect.objectContaining({ symbol: "NOT-A-SYMBOL" }),
+      ),
+    );
   });
 });

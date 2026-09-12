@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import Mapping
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any, Callable, cast
 
@@ -213,11 +213,12 @@ def _to_transaction(account_id: str, source: Mapping[str, Any]) -> Transaction:
         else None
     )
     transaction_type = _required_string(source, "type")
+    trade_date = source.get("trade_date")
 
     return Transaction(
         id=_required_string(source, "id"),
         account_id=account_id,
-        occurred_on=_to_date(source.get("trade_date")),
+        occurred_on=_to_date(trade_date),
         transaction_type=transaction_type,
         symbol=symbol,
         description=_optional_string(source.get("description")) or transaction_type,
@@ -225,6 +226,7 @@ def _to_transaction(account_id: str, source: Mapping[str, Any]) -> Transaction:
         amount=_optional_decimal(source.get("amount")) or Decimal("0"),
         fees=_optional_decimal(source.get("fee")) or Decimal("0"),
         currency=currency or "USD",
+        occurred_at=_optional_datetime(trade_date),
     )
 
 
@@ -275,6 +277,18 @@ def _to_date(value: object) -> date:
         except ValueError:
             pass
     raise ProviderResponseError("SnapTrade returned an unexpected response")
+
+
+def _optional_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.astimezone(UTC) if value.tzinfo is not None else None
+    if isinstance(value, str) and "T" in value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
+        except ValueError:
+            pass
+    return None
 
 
 def _translate_error(error: Exception) -> ProviderError:

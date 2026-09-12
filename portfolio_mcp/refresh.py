@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
 from portfolio_mcp.database import PortfolioRepository, RefreshResult
@@ -24,6 +24,15 @@ class PortfolioRefreshService:
             snapshots = [
                 await self._provider.get_holdings(account.id) for account in accounts
             ]
+            transactions = [
+                transaction
+                for account in accounts
+                for transaction in (
+                    await self._provider.get_transactions(
+                        account.id, date(1970, 1, 1), started_at.date()
+                    )
+                ).transactions
+            ]
         except ProviderError as error:
             self._repository.save_failed_refresh(
                 started_at,
@@ -47,6 +56,7 @@ class PortfolioRefreshService:
             started_at,
             completed_at,
             snapshot_date,
+            transactions,
         )
 
     def _as_utc(self, value: datetime) -> datetime:
