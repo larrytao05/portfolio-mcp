@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 from portfolio_mcp.database import PortfolioRepository, RefreshResult
-from portfolio_mcp.provider import PortfolioProvider
+from portfolio_mcp.provider import PortfolioProvider, ProviderError
 
 
 class PortfolioRefreshService:
@@ -19,10 +19,27 @@ class PortfolioRefreshService:
 
     async def refresh(self) -> RefreshResult:
         started_at = self._as_utc(self._clock())
-        accounts = await self._provider.list_accounts()
-        snapshots = [
-            await self._provider.get_holdings(account.id) for account in accounts
-        ]
+        try:
+            accounts = await self._provider.list_accounts()
+            snapshots = [
+                await self._provider.get_holdings(account.id) for account in accounts
+            ]
+        except ProviderError as error:
+            self._repository.save_failed_refresh(
+                started_at,
+                self._as_utc(self._clock()),
+                "provider_error",
+                str(error),
+            )
+            raise
+        except Exception:
+            self._repository.save_failed_refresh(
+                started_at,
+                self._as_utc(self._clock()),
+                "unexpected_error",
+                "Portfolio refresh failed",
+            )
+            raise
         completed_at = self._as_utc(self._clock())
         snapshot_date = started_at.astimezone(ZoneInfo("America/New_York")).date()
         return self._repository.save_refresh(

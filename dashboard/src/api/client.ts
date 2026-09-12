@@ -18,6 +18,21 @@ export type RefreshResult = {
   accounts_refreshed: number;
   positions_refreshed: number;
   daily_snapshots_recorded: number;
+  error_code: string | null;
+  error_message: string | null;
+};
+
+export type Position = {
+  account_id: string;
+  as_of: string;
+  symbol: string;
+  name: string;
+  asset_class: string;
+  quantity: string;
+  current_price: string | null;
+  market_value: string | null;
+  cost_basis: string | null;
+  currency: string;
 };
 
 async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -35,6 +50,14 @@ export function getHealth(): Promise<{ status: string }> {
 
 export function getAccounts(): Promise<AccountsResponse> {
   return getJson("/api/accounts");
+}
+
+export function getAccountPositions(accountId: string): Promise<{ positions: Position[] }> {
+  return getJson(`/api/accounts/${encodeURIComponent(accountId)}/positions`);
+}
+
+export function getLatestRefresh(): Promise<{ refresh: RefreshResult | null }> {
+  return getJson("/api/refreshes/latest");
 }
 
 export function refreshPortfolio(): Promise<{ refresh: RefreshResult }> {

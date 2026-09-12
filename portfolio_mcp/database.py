@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -7,8 +8,8 @@ from sqlalchemy import (
     Date,
     ForeignKey,
     Integer,
-    Numeric,
     String,
+    Text,
     UniqueConstraint,
     delete,
     select,
@@ -18,7 +19,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 from sqlalchemy.types import TypeDecorator
 
 from alembic import command
-from portfolio_mcp.models import Account, HoldingsSnapshot
+from portfolio_mcp.models import Account, HoldingsSnapshot, Position
 
 
 class Base(DeclarativeBase):
@@ -42,6 +43,19 @@ class UtcTimestamp(TypeDecorator[datetime]):
         return datetime.fromisoformat(value) if value is not None else None
 
 
+class ExactDecimal(TypeDecorator[Decimal]):
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value: Decimal | None, dialect: object) -> str | None:
+        return str(value) if value is not None else None
+
+    def process_result_value(
+        self, value: str | None, dialect: object
+    ) -> Decimal | None:
+        return Decimal(value) if value is not None else None
+
+
 class AccountRecord(Base):
     __tablename__ = "accounts"
 
@@ -62,10 +76,10 @@ class PositionRecord(Base):
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     asset_class: Mapped[str] = mapped_column(String(64), nullable=False)
-    quantity: Mapped[Decimal] = mapped_column(Numeric(24, 8), nullable=False)
-    current_price: Mapped[Decimal | None] = mapped_column(Numeric(24, 8))
-    market_value: Mapped[Decimal | None] = mapped_column(Numeric(24, 8))
-    cost_basis: Mapped[Decimal | None] = mapped_column(Numeric(24, 8))
+    quantity: Mapped[Decimal] = mapped_column(ExactDecimal(), nullable=False)
+    current_price: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    market_value: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    cost_basis: Mapped[Decimal | None] = mapped_column(ExactDecimal())
     currency: Mapped[str] = mapped_column(String(8), nullable=False)
     as_of: Mapped[date] = mapped_column(Date, nullable=False)
 
@@ -77,7 +91,7 @@ class DailyAccountValueRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), nullable=False)
     snapshot_date: Mapped[date] = mapped_column(Date, nullable=False)
-    value: Mapped[Decimal] = mapped_column(Numeric(24, 8), nullable=False)
+    value: Mapped[Decimal] = mapped_column(ExactDecimal(), nullable=False)
     currency: Mapped[str] = mapped_column(String(8), nullable=False)
     recorded_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
 
@@ -92,6 +106,65 @@ class RefreshRunRecord(Base):
     account_count: Mapped[int] = mapped_column(Integer, nullable=False)
     position_count: Mapped[int] = mapped_column(Integer, nullable=False)
     snapshot_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_message: Mapped[str | None] = mapped_column(String(256))
+
+
+@dataclass(frozen=True)
+class StoredPosition:
+    position: Position
+    as_of: date
+
+    def to_dict(self) -> dict[str, str | None]:
+        return {
+            "account_id": self.position.account_id,
+            "as_of": self.as_of.isoformat(),
+            **self.position.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class DailyAccountValue:
+    account_id: str
+    snapshot_date: date
+    value: Decimal
+    currency: str
+    recorded_at: datetime
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "account_id": self.account_id,
+            "snapshot_date": self.snapshot_date.isoformat(),
+            "value": str(self.value),
+            "currency": self.currency,
+            "recorded_at": self.recorded_at.isoformat(),
+        }
+
+
+@dataclass(frozen=True)
+class RefreshResult:
+    id: int
+    status: str
+    started_at: datetime
+    completed_at: datetime
+    account_count: int
+    position_count: int
+    snapshot_count: int
+    error_code: str | None = None
+    error_message: str | None = None
+
+    def to_dict(self) -> dict[str, int | str | None]:
+        return {
+            "id": self.id,
+            "status": self.status,
+            "started_at": self.started_at.isoformat(),
+            "completed_at": self.completed_at.isoformat(),
+            "accounts_refreshed": self.account_count,
+            "positions_refreshed": self.position_count,
+            "daily_snapshots_recorded": self.snapshot_count,
+            "error_code": self.error_code,
+            "error_message": self.error_message,
+        }
 
 
 def create_engine_for(database_url: str) -> Engine:
@@ -126,6 +199,17 @@ class PortfolioRepository:
                 )
                 for record in records
             ]
+
+    def list_positions(self, account_id: str) -> list[StoredPosition] | None:
+        with self._sessions() as session:
+            if session.get(AccountRecord, account_id) is None:
+                return None
+            records = session.scalars(
+                select(PositionRecord)
+                .where(PositionRecord.account_id == account_id)
+                .order_by(PositionRecord.symbol)
+            )
+            return [self._stored_position(record) for record in records]
 
     def save_refresh(
         self,
@@ -164,15 +248,54 @@ class PortfolioRepository:
                 snapshot_count=run.snapshot_count,
             )
 
-    def daily_values(self, account_id: str) -> list[DailyAccountValueRecord]:
-        with self._sessions() as session:
-            return list(
-                session.scalars(
-                    select(DailyAccountValueRecord)
-                    .where(DailyAccountValueRecord.account_id == account_id)
-                    .order_by(DailyAccountValueRecord.snapshot_date)
-                )
+    def save_failed_refresh(
+        self,
+        started_at: datetime,
+        completed_at: datetime,
+        error_code: str,
+        error_message: str,
+    ) -> RefreshResult:
+        with self._sessions.begin() as session:
+            run = RefreshRunRecord(
+                started_at=started_at,
+                completed_at=completed_at,
+                status="failed",
+                account_count=0,
+                position_count=0,
+                snapshot_count=0,
+                error_code=error_code,
+                error_message=error_message,
             )
+            session.add(run)
+            session.flush()
+            return self._refresh_result(run)
+
+    def daily_values(self, account_id: str) -> list[DailyAccountValue] | None:
+        with self._sessions() as session:
+            if session.get(AccountRecord, account_id) is None:
+                return None
+            records = session.scalars(
+                select(DailyAccountValueRecord)
+                .where(DailyAccountValueRecord.account_id == account_id)
+                .order_by(DailyAccountValueRecord.snapshot_date)
+            )
+            return [
+                DailyAccountValue(
+                    account_id=record.account_id,
+                    snapshot_date=record.snapshot_date,
+                    value=record.value,
+                    currency=record.currency,
+                    recorded_at=record.recorded_at,
+                )
+                for record in records
+            ]
+
+    def latest_refresh(self) -> RefreshResult | None:
+        with self._sessions() as session:
+            record = session.scalar(
+                select(RefreshRunRecord).order_by(RefreshRunRecord.id.desc()).limit(1)
+            )
+            return self._refresh_result(record) if record is not None else None
 
     def _save_snapshot(
         self,
@@ -238,33 +361,31 @@ class PortfolioRepository:
         daily_value.currency = snapshot.account.currency
         daily_value.recorded_at = refreshed_at
 
+    def _stored_position(self, record: PositionRecord) -> StoredPosition:
+        return StoredPosition(
+            position=Position(
+                account_id=record.account_id,
+                symbol=record.symbol,
+                name=record.name,
+                asset_class=record.asset_class,
+                quantity=record.quantity,
+                current_price=record.current_price,
+                market_value=record.market_value,
+                cost_basis=record.cost_basis,
+                currency=record.currency,
+            ),
+            as_of=record.as_of,
+        )
 
-class RefreshResult:
-    def __init__(
-        self,
-        id: int,
-        status: str,
-        started_at: datetime,
-        completed_at: datetime,
-        account_count: int,
-        position_count: int,
-        snapshot_count: int,
-    ) -> None:
-        self.id = id
-        self.status = status
-        self.started_at = started_at
-        self.completed_at = completed_at
-        self.account_count = account_count
-        self.position_count = position_count
-        self.snapshot_count = snapshot_count
-
-    def to_dict(self) -> dict[str, int | str]:
-        return {
-            "id": self.id,
-            "status": self.status,
-            "started_at": self.started_at.isoformat(),
-            "completed_at": self.completed_at.isoformat(),
-            "accounts_refreshed": self.account_count,
-            "positions_refreshed": self.position_count,
-            "daily_snapshots_recorded": self.snapshot_count,
-        }
+    def _refresh_result(self, record: RefreshRunRecord) -> RefreshResult:
+        return RefreshResult(
+            id=record.id,
+            status=record.status,
+            started_at=record.started_at,
+            completed_at=record.completed_at,
+            account_count=record.account_count,
+            position_count=record.position_count,
+            snapshot_count=record.snapshot_count,
+            error_code=record.error_code,
+            error_message=record.error_message,
+        )
