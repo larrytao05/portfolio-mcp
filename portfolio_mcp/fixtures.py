@@ -1,14 +1,16 @@
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 from portfolio_mcp.models import (
     Account,
     HoldingsSnapshot,
+    Instrument,
     Position,
+    Quote,
     Transaction,
     TransactionHistory,
 )
-from portfolio_mcp.provider import AccountNotFoundError
+from portfolio_mcp.provider import AccountNotFoundError, InstrumentNotFoundError
 
 
 class FixturePortfolioProvider:
@@ -245,3 +247,84 @@ class FixturePortfolioProvider:
         if account is None:
             raise AccountNotFoundError(f"Account not found: {account_id}")
         return account
+
+
+class FixtureMarketDataProvider:
+    source = "fixture_market_data"
+    observed_at = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+
+    def __init__(self) -> None:
+        instruments = (
+            Instrument(
+                id="us-etf:VTI",
+                symbol="VTI",
+                name="Vanguard Total Stock Market ETF",
+                asset_class="equity_etf",
+                exchange="NYSE Arca",
+                currency="USD",
+            ),
+            Instrument(
+                id="us-equity:NVDA",
+                symbol="NVDA",
+                name="NVIDIA Corporation",
+                asset_class="equity",
+                exchange="NASDAQ",
+                currency="USD",
+            ),
+            Instrument(
+                id="us-etf:GLD",
+                symbol="GLD",
+                name="SPDR Gold Shares",
+                asset_class="commodity_etf",
+                exchange="NYSE Arca",
+                currency="USD",
+            ),
+            Instrument(
+                id="us-fund:FIXTURE_UNAVAILABLE",
+                symbol="FIXTURE_UNAVAILABLE",
+                name="Fixture Unavailable Price Fund",
+                asset_class="mutual_fund",
+                exchange=None,
+                currency="USD",
+            ),
+        )
+        self._instruments = {instrument.id: instrument for instrument in instruments}
+        self._prices = {
+            "us-etf:VTI": (Decimal("333.33"), Decimal("333.30"), Decimal("333.36")),
+            "us-equity:NVDA": (
+                Decimal("200.00"),
+                Decimal("199.95"),
+                Decimal("200.05"),
+            ),
+            "us-etf:GLD": (Decimal("250.00"), Decimal("249.90"), Decimal("250.10")),
+            "us-fund:FIXTURE_UNAVAILABLE": (None, None, None),
+        }
+
+    async def search_instruments(self, query: str) -> list[Instrument]:
+        normalized = query.casefold().strip()
+        if not normalized:
+            return []
+
+        return [
+            instrument
+            for instrument in self._instruments.values()
+            if normalized in instrument.symbol.casefold()
+            or normalized in instrument.name.casefold()
+        ]
+
+    async def get_quote(self, instrument_id: str) -> Quote:
+        instrument = self._instruments.get(instrument_id)
+        prices = self._prices.get(instrument_id)
+        if instrument is None or prices is None:
+            raise InstrumentNotFoundError("Instrument not found")
+
+        last_price, bid_price, ask_price = prices
+        return Quote(
+            instrument=instrument,
+            source=self.source,
+            observed_at=self.observed_at,
+            last_price=last_price,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            currency=instrument.currency,
+        )

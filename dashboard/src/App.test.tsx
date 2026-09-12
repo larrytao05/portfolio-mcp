@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
 
@@ -9,7 +9,9 @@ const api = vi.hoisted(() => ({
   getAccounts: vi.fn(),
   getHealth: vi.fn(),
   getLatestRefresh: vi.fn(),
+  getQuote: vi.fn(),
   refreshPortfolio: vi.fn(),
+  searchInstruments: vi.fn(),
 }));
 
 vi.mock("./api/client", () => api);
@@ -26,12 +28,16 @@ function renderApp() {
 }
 
 describe("App", () => {
+  afterEach(cleanup);
+
   beforeEach(() => {
     vi.clearAllMocks();
     api.getHealth.mockResolvedValue({ status: "ok" });
     api.getAccounts.mockResolvedValue({ accounts: [] });
     api.getAccountPositions.mockResolvedValue({ positions: [] });
     api.getLatestRefresh.mockResolvedValue({ refresh: null });
+    api.searchInstruments.mockResolvedValue({ instruments: [] });
+    api.getQuote.mockResolvedValue({ quote: null });
     api.refreshPortfolio.mockResolvedValue({
       refresh: {
         id: 1,
@@ -102,5 +108,67 @@ describe("App", () => {
 
     expect(await screen.findByText(/Last saved refresh: success/)).toBeTruthy();
     expect(await screen.findByText(/9.123456789123456789 shares/)).toBeTruthy();
+  });
+
+  it("shows no-match and unavailable quote states", async () => {
+    api.searchInstruments
+      .mockResolvedValueOnce({ instruments: [] })
+      .mockResolvedValueOnce({
+        instruments: [
+          {
+            id: "us-fund:FIXTURE_UNAVAILABLE",
+            symbol: "FIXTURE_UNAVAILABLE",
+            name: "Fixture Unavailable Price Fund",
+            asset_class: "mutual_fund",
+            exchange: null,
+            currency: "USD",
+          },
+        ],
+      });
+    api.getQuote.mockResolvedValue({
+      quote: {
+        instrument: {
+          id: "us-fund:FIXTURE_UNAVAILABLE",
+          symbol: "FIXTURE_UNAVAILABLE",
+          name: "Fixture Unavailable Price Fund",
+          asset_class: "mutual_fund",
+          exchange: null,
+          currency: "USD",
+        },
+        source: "fixture_market_data",
+        observed_at: "2026-09-12T20:00:00+00:00",
+        last_price: null,
+        bid_price: null,
+        ask_price: null,
+        currency: "USD",
+      },
+    });
+    renderApp();
+
+    const input = screen.getByLabelText("Search instruments");
+    fireEvent.change(input, { target: { value: "not-a-symbol" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    expect(await screen.findByText("No instruments found.")).toBeTruthy();
+
+    fireEvent.change(input, { target: { value: "unavailable" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: /FIXTURE_UNAVAILABLE/ }),
+    );
+
+    expect(await screen.findByText("Canonical identity: us-fund:FIXTURE_UNAVAILABLE")).toBeTruthy();
+    expect(await screen.findByText("Source: fixture_market_data")).toBeTruthy();
+    expect(await screen.findByText(/Last price: unavailable USD/)).toBeTruthy();
+    expect(await screen.findByText(/Observed:/)).toBeTruthy();
+  });
+
+  it("shows a safe message when a provider-backed search fails", async () => {
+    api.searchInstruments.mockRejectedValue(new Error("provider failure"));
+    renderApp();
+
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    expect(await screen.findByText("Instrument search is unavailable.")).toBeTruthy();
   });
 });
