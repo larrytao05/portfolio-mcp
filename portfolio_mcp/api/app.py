@@ -42,6 +42,13 @@ def create_app(
             raise HTTPException(status_code=404, detail="Account not found")
         return {"positions": [position.to_dict() for position in positions]}
 
+    @app.get("/api/accounts/{account_id}")
+    async def get_account(account_id: str) -> dict[str, object]:
+        account = repository.account_detail(account_id)
+        if account is None:
+            raise HTTPException(status_code=404, detail="Account not found")
+        return {"account": account.to_dict()}
+
     @app.get("/api/accounts/{account_id}/daily-values")
     async def list_daily_values(account_id: str) -> dict[str, object]:
         values = repository.daily_values(account_id)

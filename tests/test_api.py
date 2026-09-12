@@ -85,6 +85,96 @@ def test_persisted_accounts_survive_an_app_restart(tmp_path) -> None:
     assert latest_refresh.json()["refresh"]["status"] == "success"
 
 
+def test_account_detail_uses_persisted_account_metadata_and_holdings(tmp_path) -> None:
+    refreshed_at = datetime(2026, 9, 12, 14, 0, tzinfo=UTC)
+    client = create_client(tmp_path, clock=lambda: refreshed_at)
+    client.post("/api/refresh")
+
+    response = client.get("/api/accounts/schwab-taxable-demo")
+
+    assert response.status_code == 200
+    account = response.json()["account"]
+    assert account["label"] == "Schwab Taxable ••••4821"
+    assert account["provider"] == "Schwab"
+    assert account["account_type"] == "taxable_brokerage"
+    assert account["currency"] == "USD"
+    assert account["refreshed_at"] == "2026-09-12T14:00:00+00:00"
+    assert account["as_of"] == "2026-08-29"
+    assert account["balances"] == {
+        "market_value": "4799.97",
+        "cost_basis": "4383.00",
+        "currency": "USD",
+    }
+    assert account["positions"][0]["gain_loss"] == "60.00"
+
+
+def test_account_detail_preserves_empty_and_unavailable_values(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
+    repository = PortfolioRepository(database_url)
+    refreshed_at = datetime(2020, 1, 2, tzinfo=UTC)
+    empty_account = Account(
+        id="empty-account",
+        provider="Fixture",
+        label="Empty ••••0001",
+        account_type="taxable_brokerage",
+        currency="USD",
+    )
+    unavailable_account = Account(
+        id="unavailable-account",
+        provider="Fixture",
+        label="Unavailable ••••0002",
+        account_type="roth_ira",
+        currency="USD",
+    )
+    repository.save_refresh(
+        [
+            HoldingsSnapshot(
+                account=empty_account,
+                as_of=date(2020, 1, 2),
+                positions=(),
+            ),
+            HoldingsSnapshot(
+                account=unavailable_account,
+                as_of=date(2020, 1, 2),
+                positions=(
+                    Position(
+                        account_id=unavailable_account.id,
+                        symbol="UNKNOWN",
+                        name="Unavailable values fund",
+                        asset_class="fund",
+                        quantity=Decimal("1"),
+                        current_price=None,
+                        market_value=None,
+                        cost_basis=None,
+                        currency="USD",
+                    ),
+                ),
+            ),
+        ],
+        refreshed_at,
+        refreshed_at,
+        date(2020, 1, 2),
+    )
+    client = TestClient(
+        create_app(FixturePortfolioProvider(), database_url=database_url)
+    )
+
+    empty = client.get("/api/accounts/empty-account")
+    unavailable = client.get("/api/accounts/unavailable-account")
+
+    assert empty.status_code == 200
+    assert empty.json()["account"]["positions"] == []
+    assert empty.json()["account"]["balances"]["market_value"] == "0"
+    assert unavailable.status_code == 200
+    detail = unavailable.json()["account"]
+    assert detail["refreshed_at"] == "2020-01-02T00:00:00+00:00"
+    assert detail["balances"]["market_value"] is None
+    assert detail["balances"]["cost_basis"] is None
+    assert detail["positions"][0]["current_price"] is None
+    assert detail["positions"][0]["cost_basis"] is None
+    assert detail["positions"][0]["gain_loss"] is None
+
+
 def test_refresh_replaces_the_same_new_york_daily_snapshot(tmp_path) -> None:
     times = iter(
         [

@@ -32,7 +32,19 @@ export type Position = {
   current_price: string | null;
   market_value: string | null;
   cost_basis: string | null;
+  gain_loss: string | null;
   currency: string;
+};
+
+export type AccountDetail = Account & {
+  refreshed_at: string;
+  as_of: string | null;
+  balances: {
+    market_value: string | null;
+    cost_basis: string | null;
+    currency: string;
+  };
+  positions: Position[];
 };
 
 async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -54,6 +66,10 @@ export function getAccounts(): Promise<AccountsResponse> {
 
 export function getAccountPositions(accountId: string): Promise<{ positions: Position[] }> {
   return getJson(`/api/accounts/${encodeURIComponent(accountId)}/positions`);
+}
+
+export function getAccount(accountId: string): Promise<{ account: AccountDetail }> {
+  return getJson(`/api/accounts/${encodeURIComponent(accountId)}`);
 }
 
 export function getLatestRefresh(): Promise<{ refresh: RefreshResult | null }> {
