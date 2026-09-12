@@ -31,7 +31,7 @@ def create_app(
         return {"status": "ok"}
 
     @app.get("/api/accounts")
-    async def list_accounts() -> dict[str, list[dict[str, str]]]:
+    async def list_accounts() -> dict[str, list[dict[str, str | bool]]]:
         accounts = repository.list_accounts()
         return {"accounts": [account.to_dict() for account in accounts]}
 
@@ -55,7 +55,7 @@ def create_app(
         return {"refresh": result.to_dict() if result is not None else None}
 
     @app.post("/api/refresh")
-    async def refresh_portfolio() -> dict[str, dict[str, int | str | None]]:
+    async def refresh_portfolio() -> dict[str, dict[str, object]]:
         result = await refresh_service.refresh()
         return {"refresh": result.to_dict()}
 

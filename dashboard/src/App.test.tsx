@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
 
@@ -26,6 +26,8 @@ function renderApp() {
 }
 
 describe("App", () => {
+  afterEach(cleanup);
+
   beforeEach(() => {
     vi.clearAllMocks();
     api.getHealth.mockResolvedValue({ status: "ok" });
@@ -43,6 +45,8 @@ describe("App", () => {
         daily_snapshots_recorded: 2,
         error_code: null,
         error_message: null,
+        provider_outcomes: [],
+        warnings: [],
       },
     });
   });
@@ -95,6 +99,8 @@ describe("App", () => {
         daily_snapshots_recorded: 1,
         error_code: null,
         error_message: null,
+        provider_outcomes: [],
+        warnings: [],
       },
     });
 
@@ -102,5 +108,66 @@ describe("App", () => {
 
     expect(await screen.findByText(/Last saved refresh: success/)).toBeTruthy();
     expect(await screen.findByText(/9.123456789123456789 shares/)).toBeTruthy();
+  });
+
+  it("discloses stale provider data after a partial refresh", async () => {
+    api.refreshPortfolio.mockResolvedValue({
+      refresh: {
+        id: 2,
+        status: "partial",
+        started_at: "2026-09-12T15:00:00+00:00",
+        completed_at: "2026-09-12T15:00:01+00:00",
+        accounts_refreshed: 1,
+        positions_refreshed: 5,
+        daily_snapshots_recorded: 1,
+        error_code: null,
+        error_message: null,
+        provider_outcomes: [],
+        warnings: ["Schwab data is stale; last successful data is shown."],
+      },
+    });
+
+    renderApp();
+    fireEvent.click(await screen.findByRole("button", { name: "Refresh portfolio" }));
+
+    expect(await screen.findByText(/Refresh partial/)).toBeTruthy();
+    expect(await screen.findByText("Schwab data is stale; last successful data is shown.")).toBeTruthy();
+  });
+
+  it("keeps saved data visible with a failed refresh warning", async () => {
+    api.getAccounts.mockResolvedValue({
+      accounts: [
+        {
+          id: "schwab-taxable-demo",
+          provider: "Schwab",
+          label: "Schwab Taxable ••••4821",
+          account_type: "taxable_brokerage",
+          currency: "USD",
+          is_stale: true,
+          source_refreshed_at: "2026-09-12T14:00:01+00:00",
+        },
+      ],
+    });
+    api.getLatestRefresh.mockResolvedValue({
+      refresh: {
+        id: 2,
+        status: "failed",
+        started_at: "2026-09-12T15:00:00+00:00",
+        completed_at: "2026-09-12T15:00:01+00:00",
+        accounts_refreshed: 0,
+        positions_refreshed: 0,
+        daily_snapshots_recorded: 0,
+        error_code: "provider_error",
+        error_message: "Fixture provider is unavailable",
+        provider_outcomes: [],
+        warnings: ["Schwab data is stale; last successful data is shown."],
+      },
+    });
+
+    renderApp();
+
+    expect(await screen.findByText(/Last saved refresh: failed/)).toBeTruthy();
+    expect(await screen.findByText(/Stale data from/)).toBeTruthy();
+    expect(await screen.findByText("Schwab data is stale; last successful data is shown.")).toBeTruthy();
   });
 });
