@@ -107,6 +107,30 @@ def test_refresh_replaces_the_same_new_york_daily_snapshot(tmp_path) -> None:
     assert values[0].recorded_at == datetime(2026, 9, 12, 20, 1, tzinfo=UTC)
 
 
+def test_refresh_does_not_fabricate_missing_new_york_daily_snapshots(tmp_path) -> None:
+    times = iter(
+        [
+            datetime(2026, 9, 12, 4, 0, tzinfo=UTC),
+            datetime(2026, 9, 12, 4, 1, tzinfo=UTC),
+            datetime(2026, 9, 14, 4, 0, tzinfo=UTC),
+            datetime(2026, 9, 14, 4, 1, tzinfo=UTC),
+        ]
+    )
+    client = create_client(tmp_path, clock=lambda: next(times))
+
+    client.post("/api/refresh")
+    client.post("/api/refresh")
+
+    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    values = repository.daily_values("schwab-taxable-demo")
+
+    assert values is not None
+    assert [value.snapshot_date for value in values] == [
+        date(2026, 9, 12),
+        date(2026, 9, 14),
+    ]
+
+
 def test_database_preserves_high_precision_decimals(tmp_path) -> None:
     database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
     repository = PortfolioRepository(database_url)
