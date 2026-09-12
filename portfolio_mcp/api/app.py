@@ -1,7 +1,8 @@
 from collections.abc import Callable
-from datetime import datetime
+from datetime import date, datetime
+from typing import Annotated
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -53,6 +54,36 @@ def create_app(
     async def latest_refresh() -> dict[str, object]:
         result = repository.latest_refresh()
         return {"refresh": result.to_dict() if result is not None else None}
+
+    @app.get("/api/activity")
+    async def list_activity(
+        account_id: str | None = None,
+        provider: str | None = None,
+        transaction_type: Annotated[str | None, Query(alias="type")] = None,
+        symbol: str | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> dict[str, object]:
+        if start_date is not None and end_date is not None and start_date > end_date:
+            raise HTTPException(
+                status_code=422, detail="start_date must be on or before end_date"
+            )
+        activities, total = repository.list_activities(
+            account_id=account_id,
+            provider=provider,
+            transaction_type=transaction_type,
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+            offset=offset,
+        )
+        return {
+            "activities": [activity.to_dict() for activity in activities],
+            "pagination": {"limit": limit, "offset": offset, "total": total},
+        }
 
     @app.post("/api/refresh")
     async def refresh_portfolio() -> dict[str, dict[str, int | str | None]]:

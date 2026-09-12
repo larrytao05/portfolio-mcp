@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 
@@ -62,6 +62,7 @@ class Transaction:
     amount: Decimal
     fees: Decimal
     currency: str
+    occurred_at: datetime | None = None
 
     def to_dict(self) -> dict[str, str | None]:
         return {
@@ -74,6 +75,9 @@ class Transaction:
             "amount": str(self.amount),
             "fees": str(self.fees),
             "currency": self.currency,
+            "occurred_at": (
+                self.occurred_at.isoformat() if self.occurred_at is not None else None
+            ),
         }
 
 

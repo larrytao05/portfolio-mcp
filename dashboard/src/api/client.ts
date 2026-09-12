@@ -35,6 +35,33 @@ export type Position = {
   currency: string;
 };
 
+export type Activity = {
+  id: number;
+  account: { id: string; label: string };
+  provider: string;
+  occurred_on: string;
+  occurred_at: string | null;
+  type: string;
+  symbol: string | null;
+  description: string;
+  quantity: string | null;
+  amount: string;
+  fees: string;
+  currency: string;
+  imported_at: string;
+};
+
+export type ActivityFilters = {
+  account_id?: string;
+  provider?: string;
+  type?: string;
+  symbol?: string;
+  start_date?: string;
+  end_date?: string;
+  limit?: number;
+  offset?: number;
+};
+
 async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.ok) {
@@ -62,4 +89,18 @@ export function getLatestRefresh(): Promise<{ refresh: RefreshResult | null }> {
 
 export function refreshPortfolio(): Promise<{ refresh: RefreshResult }> {
   return getJson("/api/refresh", { method: "POST" });
+}
+
+export function getActivity(filters: ActivityFilters = {}): Promise<{
+  activities: Activity[];
+  pagination: { limit: number; offset: number; total: number };
+}> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined && value !== "") {
+      params.set(key, String(value));
+    }
+  }
+  const query = params.toString();
+  return getJson(`/api/activity${query ? `?${query}` : ""}`);
 }
