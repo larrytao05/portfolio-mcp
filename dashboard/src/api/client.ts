@@ -4,6 +4,8 @@ export type Account = {
   label: string;
   account_type: string;
   currency: string;
+  is_stale: boolean;
+  source_refreshed_at: string;
 };
 
 type AccountsResponse = {
@@ -20,6 +22,17 @@ export type RefreshResult = {
   daily_snapshots_recorded: number;
   error_code: string | null;
   error_message: string | null;
+  provider_outcomes: ProviderRefreshOutcome[];
+  warnings: string[];
+};
+
+export type ProviderRefreshOutcome = {
+  provider: string;
+  status: string;
+  accounts_refreshed: number;
+  stale_accounts: number;
+  excluded_accounts: number;
+  warning: string | null;
 };
 
 export type Position = {
@@ -33,6 +46,8 @@ export type Position = {
   market_value: string | null;
   cost_basis: string | null;
   currency: string;
+  is_stale: boolean;
+  source_refreshed_at: string;
 };
 
 async function getJson<T>(path: string, init?: RequestInit): Promise<T> {

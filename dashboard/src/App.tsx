@@ -32,6 +32,7 @@ export function App() {
       ]);
     },
   });
+  const displayedRefresh = refresh.data?.refresh ?? latestRefresh.data?.refresh;
 
   return (
     <main>
@@ -41,11 +42,24 @@ export function App() {
         <p>
           API status: {health.isPending ? "checking" : health.data?.status ?? "unavailable"}
         </p>
-        {latestRefresh.data?.refresh && (
-          <p>
-            Last saved refresh: {latestRefresh.data.refresh.status} at{" "}
-            {new Date(latestRefresh.data.refresh.completed_at).toLocaleString()}.
-          </p>
+        {displayedRefresh && (
+          <>
+            <p>
+              {refresh.data ? "Refresh" : "Last saved refresh:"} {displayedRefresh.status} at{" "}
+              {new Date(displayedRefresh.completed_at).toLocaleString()}.
+              {refresh.data && (
+                <>
+                  {" "}Saved {displayedRefresh.accounts_refreshed} accounts and{" "}
+                  {displayedRefresh.positions_refreshed} positions.
+                </>
+              )}
+            </p>
+            {displayedRefresh.warnings.map((warning) => (
+              <p key={warning} role="alert">
+                {warning}
+              </p>
+            ))}
+          </>
         )}
         <button
           disabled={refresh.isPending}
@@ -55,12 +69,6 @@ export function App() {
           {refresh.isPending ? "Refreshing…" : "Refresh portfolio"}
         </button>
         {refresh.isError && <p>Refresh failed. Your saved data is unchanged.</p>}
-        {refresh.data && (
-          <p>
-            Refresh completed at {new Date(refresh.data.refresh.completed_at).toLocaleString()}.
-            Saved {refresh.data.refresh.accounts_refreshed} accounts and {refresh.data.refresh.positions_refreshed} positions.
-          </p>
-        )}
       </header>
 
       <section aria-labelledby="accounts-heading">
@@ -75,6 +83,11 @@ export function App() {
               return (
                 <li key={account.id}>
                   {account.provider} · {account.label} · {account.account_type}
+                  {account.is_stale && (
+                    <p role="alert">
+                      Stale data from {new Date(account.source_refreshed_at).toLocaleString()}.
+                    </p>
+                  )}
                   {accountPositions?.isPending && <p>Loading saved positions…</p>}
                   {accountPositions?.isError && <p>Saved positions are unavailable.</p>}
                   {accountPositions?.data && (
@@ -83,6 +96,7 @@ export function App() {
                         <li key={position.symbol}>
                           {position.symbol} · {position.quantity} shares ·{" "}
                           {position.market_value ?? "value unavailable"} {position.currency}
+                          {position.is_stale && " (stale)"}
                         </li>
                       ))}
                     </ul>
