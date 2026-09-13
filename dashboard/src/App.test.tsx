@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
 import type { Position } from "./api/client";
@@ -43,6 +43,8 @@ function savedAccount(positions: Position[] = []) {
 }
 
 describe("App", () => {
+  afterEach(cleanup);
+
   beforeEach(() => {
     vi.clearAllMocks();
     api.getHealth.mockResolvedValue({ status: "ok" });
@@ -167,5 +169,63 @@ describe("App", () => {
 
     expect(await screen.findByText("This account has no saved holdings.")).toBeTruthy();
     expect(screen.getByText(/Stale saved data/)).toBeTruthy();
+  });
+
+  it("sorts fractional and negative holding values numerically", async () => {
+    api.getAccounts.mockResolvedValue({
+      accounts: [
+        {
+          id: "schwab-taxable-demo",
+          provider: "Schwab",
+          label: "Schwab Taxable ••••4821",
+          account_type: "taxable_brokerage",
+          currency: "USD",
+        },
+      ],
+    });
+    api.getAccount.mockResolvedValue(
+      savedAccount([
+        {
+          account_id: "schwab-taxable-demo",
+          as_of: "2026-09-12",
+          symbol: "HIGH",
+          name: "High fractional holding",
+          asset_class: "equity",
+          quantity: "2.9",
+          current_price: "1",
+          market_value: "1",
+          cost_basis: "1",
+          gain_loss: "1",
+          currency: "USD",
+        },
+        {
+          account_id: "schwab-taxable-demo",
+          as_of: "2026-09-12",
+          symbol: "LOW",
+          name: "Low fractional holding",
+          asset_class: "equity",
+          quantity: "2.10",
+          current_price: "1",
+          market_value: "1",
+          cost_basis: "1",
+          gain_loss: "-1.5",
+          currency: "USD",
+        },
+      ]),
+    );
+
+    renderApp();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Sort by Quantity" }));
+    expect(screen.getAllByRole("row").slice(1).map((row) => row.textContent)).toEqual([
+      expect.stringContaining("LOW"),
+      expect.stringContaining("HIGH"),
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sort by Gain/loss" }));
+    expect(screen.getAllByRole("row").slice(1).map((row) => row.textContent)).toEqual([
+      expect.stringContaining("LOW"),
+      expect.stringContaining("HIGH"),
+    ]);
   });
 });

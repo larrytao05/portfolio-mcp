@@ -31,11 +31,105 @@ function isStale(refreshedAt: string) {
   return Date.now() - new Date(refreshedAt).getTime() > 24 * 60 * 60 * 1000;
 }
 
-function compareValues(left: string | null, right: string | null) {
+function compareDecimalValues(left: string | null, right: string | null) {
   if (left === right) return 0;
   if (left === null) return 1;
   if (right === null) return -1;
-  return left.localeCompare(right, undefined, { numeric: true });
+
+  const leftNegative = left.startsWith("-");
+  const rightNegative = right.startsWith("-");
+  if (leftNegative !== rightNegative) return leftNegative ? -1 : 1;
+
+  const comparison = compareUnsignedDecimals(
+    leftNegative ? left.slice(1) : left,
+    rightNegative ? right.slice(1) : right,
+  );
+  return leftNegative ? -comparison : comparison;
+}
+
+function compareUnsignedDecimals(left: string, right: string) {
+  const [leftWhole = "", leftFraction = ""] = left.split(".");
+  const [rightWhole = "", rightFraction = ""] = right.split(".");
+  const normalizedLeftWhole = leftWhole.replace(/^0+/, "") || "0";
+  const normalizedRightWhole = rightWhole.replace(/^0+/, "") || "0";
+  if (normalizedLeftWhole.length !== normalizedRightWhole.length) {
+    return normalizedLeftWhole.length - normalizedRightWhole.length;
+  }
+  if (normalizedLeftWhole !== normalizedRightWhole) {
+    return normalizedLeftWhole.localeCompare(normalizedRightWhole);
+  }
+  return leftFraction.padEnd(Math.max(leftFraction.length, rightFraction.length), "0").localeCompare(
+    rightFraction.padEnd(Math.max(leftFraction.length, rightFraction.length), "0"),
+  );
+}
+
+function AccountSummary({ account }: { account: AccountDetail }) {
+  return (
+    <dl>
+      <dt>Provider</dt>
+      <dd>{account.provider}</dd>
+      <dt>Account type</dt>
+      <dd>{account.account_type}</dd>
+      <dt>Currency</dt>
+      <dd>{account.currency}</dd>
+      <dt>Market value</dt>
+      <dd>{displayValue(account.balances.market_value, account.balances.currency)}</dd>
+      <dt>Cost basis</dt>
+      <dd>{displayValue(account.balances.cost_basis, account.balances.currency)}</dd>
+      <dt>Freshness</dt>
+      <dd>
+        {isStale(account.refreshed_at) ? "Stale saved data — " : "Saved data — "}
+        {new Date(account.refreshed_at).toLocaleString()}
+      </dd>
+      <dt>Holdings as of</dt>
+      <dd>{account.as_of ?? "Unavailable"}</dd>
+    </dl>
+  );
+}
+
+function HoldingsTable({
+  holdings,
+  sort,
+  updateSort,
+}: {
+  holdings: Position[];
+  sort: { field: SortField; direction: SortDirection };
+  updateSort: (field: SortField) => void;
+}) {
+  return (
+    <table>
+      <thead>
+        <tr>
+          {(Object.keys(sortLabels) as SortField[]).map((field) => (
+            <th key={field} scope="col">
+              <button
+                aria-label={`Sort by ${sortLabels[field]}`}
+                aria-sort={sort.field === field ? sort.direction : "none"}
+                onClick={() => updateSort(field)}
+                type="button"
+              >
+                {sortLabels[field]}
+              </button>
+            </th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {holdings.map((position) => (
+          <tr key={position.symbol}>
+            <td>
+              {position.symbol} — {position.name} ({position.asset_class})
+            </td>
+            <td>{position.quantity}</td>
+            <td>{displayValue(position.current_price, position.currency)}</td>
+            <td>{displayValue(position.market_value, position.currency)}</td>
+            <td>{displayValue(position.cost_basis, position.currency)}</td>
+            <td>{displayValue(position.gain_loss, position.currency)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
 }
 
 function AccountHoldings({ account }: { account: AccountDetail }) {
@@ -63,7 +157,7 @@ function AccountHoldings({ account }: { account: AccountDetail }) {
       .sort((left, right) => {
         const comparison = sort.field === "symbol"
           ? left.symbol.localeCompare(right.symbol)
-          : compareValues(left[sort.field], right[sort.field]);
+          : compareDecimalValues(left[sort.field], right[sort.field]);
         return sort.direction === "ascending" ? comparison : -comparison;
       });
   }, [account.positions, assetClass, filter, sort]);
@@ -81,25 +175,7 @@ function AccountHoldings({ account }: { account: AccountDetail }) {
   return (
     <article aria-labelledby={`account-${account.id}`}>
       <h3 id={`account-${account.id}`}>{account.label}</h3>
-      <dl>
-        <dt>Provider</dt>
-        <dd>{account.provider}</dd>
-        <dt>Account type</dt>
-        <dd>{account.account_type}</dd>
-        <dt>Currency</dt>
-        <dd>{account.currency}</dd>
-        <dt>Market value</dt>
-        <dd>{displayValue(account.balances.market_value, account.balances.currency)}</dd>
-        <dt>Cost basis</dt>
-        <dd>{displayValue(account.balances.cost_basis, account.balances.currency)}</dd>
-        <dt>Freshness</dt>
-        <dd>
-          {isStale(account.refreshed_at) ? "Stale saved data — " : "Saved data — "}
-          {new Date(account.refreshed_at).toLocaleString()}
-        </dd>
-        <dt>Holdings as of</dt>
-        <dd>{account.as_of ?? "Unavailable"}</dd>
-      </dl>
+      <AccountSummary account={account} />
 
       <h4>Holdings</h4>
       <label>
@@ -126,38 +202,7 @@ function AccountHoldings({ account }: { account: AccountDetail }) {
       ) : holdings.length === 0 ? (
         <p>No saved holdings match these filters.</p>
       ) : (
-        <table>
-          <thead>
-            <tr>
-              {(Object.keys(sortLabels) as SortField[]).map((field) => (
-                <th key={field} scope="col">
-                  <button
-                    aria-label={`Sort by ${sortLabels[field]}`}
-                    aria-sort={sort.field === field ? sort.direction : "none"}
-                    onClick={() => updateSort(field)}
-                    type="button"
-                  >
-                    {sortLabels[field]}
-                  </button>
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {holdings.map((position: Position) => (
-              <tr key={position.symbol}>
-                <td>
-                  {position.symbol} — {position.name} ({position.asset_class})
-                </td>
-                <td>{position.quantity}</td>
-                <td>{displayValue(position.current_price, position.currency)}</td>
-                <td>{displayValue(position.market_value, position.currency)}</td>
-                <td>{displayValue(position.cost_basis, position.currency)}</td>
-                <td>{displayValue(position.gain_loss, position.currency)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <HoldingsTable holdings={holdings} sort={sort} updateSort={updateSort} />
       )}
     </article>
   );
