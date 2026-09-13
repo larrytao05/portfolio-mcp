@@ -126,4 +126,37 @@ describe("App", () => {
       ),
     );
   });
+
+  it("shows populated activity and navigates between pages", async () => {
+    api.getActivity.mockImplementation(({ offset = 0 }) => Promise.resolve({
+      activities: [
+        {
+          id: offset + 1,
+          account: { id: "schwab-taxable-demo", label: "Schwab Taxable ••••4821" },
+          provider: "Schwab",
+          occurred_on: "2026-09-12",
+          occurred_at: "2026-09-12T14:00:00+00:00",
+          type: "TRADE",
+          symbol: offset === 0 ? "VTI" : "VXUS",
+          description: "Fixture trade",
+          quantity: "1",
+          amount: "100",
+          fees: "0",
+          currency: "USD",
+          imported_at: "2026-09-12T14:01:00+00:00",
+        },
+      ],
+      pagination: { limit: 50, offset, total: 51 },
+    }));
+
+    renderApp();
+
+    expect(await screen.findByText(/VTI/)).toBeTruthy();
+    expect(screen.getByText("Showing 1-50 of 51")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Next activity page" }));
+    expect(await screen.findByText(/VXUS/)).toBeTruthy();
+    expect(screen.getByText("Showing 51-51 of 51")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Previous activity page" }));
+    expect(await screen.findByText(/VTI/)).toBeTruthy();
+  });
 });

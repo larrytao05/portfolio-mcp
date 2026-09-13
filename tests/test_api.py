@@ -140,6 +140,8 @@ def test_persisted_accounts_survive_an_app_restart(tmp_path) -> None:
     assert daily_values.json()["daily_values"][0]["value"] == "4799.97"
     latest_refresh = second_client.get("/api/refreshes/latest")
     assert latest_refresh.json()["refresh"]["status"] == "success"
+    activity = second_client.get("/api/activity")
+    assert activity.json()["pagination"]["total"] == 6
 
 
 def test_refresh_replaces_the_same_new_york_daily_snapshot(tmp_path) -> None:
