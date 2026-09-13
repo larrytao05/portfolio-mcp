@@ -32,6 +32,7 @@ export function App() {
       ]);
     },
   });
+  const displayedRefresh = refresh.data?.refresh ?? latestRefresh.data?.refresh;
 
   return (
     <main>
@@ -41,13 +42,19 @@ export function App() {
         <p>
           API status: {health.isPending ? "checking" : health.data?.status ?? "unavailable"}
         </p>
-        {latestRefresh.data?.refresh && (
+        {displayedRefresh && (
           <>
             <p>
-              Last saved refresh: {latestRefresh.data.refresh.status} at{" "}
-              {new Date(latestRefresh.data.refresh.completed_at).toLocaleString()}.
+              {refresh.data ? "Refresh" : "Last saved refresh:"} {displayedRefresh.status} at{" "}
+              {new Date(displayedRefresh.completed_at).toLocaleString()}.
+              {refresh.data && (
+                <>
+                  {" "}Saved {displayedRefresh.accounts_refreshed} accounts and{" "}
+                  {displayedRefresh.positions_refreshed} positions.
+                </>
+              )}
             </p>
-            {latestRefresh.data.refresh.warnings.map((warning) => (
+            {displayedRefresh.warnings.map((warning) => (
               <p key={warning} role="alert">
                 {warning}
               </p>
@@ -62,21 +69,6 @@ export function App() {
           {refresh.isPending ? "Refreshing…" : "Refresh portfolio"}
         </button>
         {refresh.isError && <p>Refresh failed. Your saved data is unchanged.</p>}
-        {refresh.data && (
-          <>
-            <p>
-              Refresh {refresh.data.refresh.status} at{" "}
-              {new Date(refresh.data.refresh.completed_at).toLocaleString()}. Saved{" "}
-              {refresh.data.refresh.accounts_refreshed} accounts and{" "}
-              {refresh.data.refresh.positions_refreshed} positions.
-            </p>
-            {refresh.data.refresh.warnings.map((warning) => (
-              <p key={warning} role="alert">
-                {warning}
-              </p>
-            ))}
-          </>
-        )}
       </header>
 
       <section aria-labelledby="accounts-heading">

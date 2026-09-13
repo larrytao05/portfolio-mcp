@@ -134,7 +134,7 @@ describe("App", () => {
     expect(await screen.findByText("Schwab data is stale; last successful data is shown.")).toBeTruthy();
   });
 
-  it("keeps saved data visible with a failed refresh warning", async () => {
+  it("keeps saved data visible after a failed refresh", async () => {
     api.getAccounts.mockResolvedValue({
       accounts: [
         {
@@ -163,10 +163,26 @@ describe("App", () => {
         warnings: ["Schwab data is stale; last successful data is shown."],
       },
     });
+    api.refreshPortfolio.mockResolvedValue({
+      refresh: {
+        id: 2,
+        status: "failed",
+        started_at: "2026-09-12T15:00:00+00:00",
+        completed_at: "2026-09-12T15:00:01+00:00",
+        accounts_refreshed: 0,
+        positions_refreshed: 0,
+        daily_snapshots_recorded: 0,
+        error_code: "provider_error",
+        error_message: "Fixture provider is unavailable",
+        provider_outcomes: [],
+        warnings: ["Schwab data is stale; last successful data is shown."],
+      },
+    });
 
     renderApp();
+    fireEvent.click(await screen.findByRole("button", { name: "Refresh portfolio" }));
 
-    expect(await screen.findByText(/Last saved refresh: failed/)).toBeTruthy();
+    expect(await screen.findByText(/Refresh failed/)).toBeTruthy();
     expect(await screen.findByText(/Stale data from/)).toBeTruthy();
     expect(await screen.findByText("Schwab data is stale; last successful data is shown.")).toBeTruthy();
   });

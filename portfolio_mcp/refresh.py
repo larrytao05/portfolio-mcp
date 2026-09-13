@@ -22,21 +22,19 @@ class PortfolioRefreshService:
         try:
             accounts = await self._provider.list_accounts()
         except ProviderError as error:
-            self._repository.save_failed_refresh(
+            return self._repository.save_failed_refresh(
                 started_at,
                 self._as_utc(self._clock()),
                 "provider_error",
                 str(error),
             )
-            raise
         except Exception:
-            self._repository.save_failed_refresh(
+            return self._repository.save_failed_refresh(
                 started_at,
                 self._as_utc(self._clock()),
                 "unexpected_error",
                 "Portfolio refresh failed",
             )
-            raise
 
         snapshots = []
         failed_accounts = []

@@ -297,13 +297,7 @@ class PortfolioRepository:
             outcomes = self._provider_outcomes(
                 snapshots, failed_accounts, stale_account_ids
             )
-            status = (
-                "success"
-                if not failed_accounts
-                else "partial"
-                if snapshots
-                else "failed"
-            )
+            status = self._refresh_status(snapshots, failed_accounts)
 
             run = RefreshRunRecord(
                 started_at=started_at,
@@ -456,6 +450,17 @@ class PortfolioRepository:
             record.is_stale = True
             stale_account_ids.add(account.id)
         return stale_account_ids
+
+    def _refresh_status(
+        self,
+        snapshots: list[HoldingsSnapshot],
+        failed_accounts: list[Account],
+    ) -> str:
+        if not failed_accounts:
+            return "success"
+        if snapshots:
+            return "partial"
+        return "failed"
 
     def _mark_all_accounts_stale(self, session: Session) -> list[AccountRecord]:
         records = list(session.scalars(select(AccountRecord)))

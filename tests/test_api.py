@@ -212,13 +212,8 @@ def test_failed_refresh_is_persisted_without_replacing_saved_data(tmp_path) -> N
 
     response = failing_client.post("/api/refresh")
 
-    assert response.status_code == 502
-    assert response.json() == {
-        "error": {
-            "code": "provider_error",
-            "message": "Fixture provider is unavailable",
-        }
-    }
+    assert response.status_code == 200
+    assert response.json()["refresh"]["status"] == "failed"
     assert len(failing_client.get("/api/accounts").json()["accounts"]) == 2
     latest = failing_client.get("/api/refreshes/latest").json()["refresh"]
     assert latest["status"] == "failed"
