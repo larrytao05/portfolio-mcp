@@ -3,13 +3,17 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
+import type { Position } from "./api/client";
 
 const api = vi.hoisted(() => ({
-  getAccountPositions: vi.fn(),
+  getAccount: vi.fn(),
+  getActivity: vi.fn(),
   getAccounts: vi.fn(),
   getHealth: vi.fn(),
   getLatestRefresh: vi.fn(),
+  getQuote: vi.fn(),
   refreshPortfolio: vi.fn(),
+  searchInstruments: vi.fn(),
 }));
 
 vi.mock("./api/client", () => api);
@@ -25,6 +29,22 @@ function renderApp() {
   );
 }
 
+function savedAccount(positions: Position[] = []) {
+  return {
+    account: {
+      id: "schwab-taxable-demo",
+      provider: "Schwab",
+      label: "Schwab Taxable ••••4821",
+      account_type: "taxable_brokerage",
+      currency: "USD",
+      refreshed_at: "2026-09-12T14:00:01+00:00",
+      as_of: "2026-09-12",
+      balances: { market_value: "3041.12", cost_basis: "2781.00", currency: "USD" },
+      positions,
+    },
+  };
+}
+
 describe("App", () => {
   afterEach(cleanup);
 
@@ -32,8 +52,14 @@ describe("App", () => {
     vi.clearAllMocks();
     api.getHealth.mockResolvedValue({ status: "ok" });
     api.getAccounts.mockResolvedValue({ accounts: [] });
-    api.getAccountPositions.mockResolvedValue({ positions: [] });
+    api.getAccount.mockResolvedValue(savedAccount());
+    api.getActivity.mockResolvedValue({
+      activities: [],
+      pagination: { limit: 50, offset: 0, total: 0 },
+    });
     api.getLatestRefresh.mockResolvedValue({ refresh: null });
+    api.searchInstruments.mockResolvedValue({ instruments: [] });
+    api.getQuote.mockResolvedValue({ quote: null });
     api.refreshPortfolio.mockResolvedValue({
       refresh: {
         id: 1,
@@ -60,7 +86,7 @@ describe("App", () => {
     expect(await screen.findByText(/Saved 2 accounts and 9 positions/)).toBeTruthy();
   });
 
-  it("shows portfolio data saved by an earlier app session", async () => {
+  it("shows saved account details and lets holdings be filtered", async () => {
     api.getAccounts.mockResolvedValue({
       accounts: [
         {
@@ -72,8 +98,8 @@ describe("App", () => {
         },
       ],
     });
-    api.getAccountPositions.mockResolvedValue({
-      positions: [
+    api.getAccount.mockResolvedValue(
+      savedAccount([
         {
           account_id: "schwab-taxable-demo",
           as_of: "2026-09-12",
@@ -84,10 +110,28 @@ describe("App", () => {
           current_price: "333.33",
           market_value: "3041.12",
           cost_basis: "2781.00",
+          gain_loss: "260.12",
           currency: "USD",
+          is_stale: false,
+          source_refreshed_at: "2026-09-12T14:00:01+00:00",
         },
-      ],
-    });
+        {
+          account_id: "schwab-taxable-demo",
+          as_of: "2026-09-12",
+          symbol: "MISSING",
+          name: "Missing price fund",
+          asset_class: "fund",
+          quantity: "1",
+          current_price: null,
+          market_value: null,
+          cost_basis: null,
+          gain_loss: null,
+          currency: "USD",
+          is_stale: false,
+          source_refreshed_at: "2026-09-12T14:00:01+00:00",
+        },
+      ]),
+    );
     api.getLatestRefresh.mockResolvedValue({
       refresh: {
         id: 1,
@@ -95,7 +139,7 @@ describe("App", () => {
         started_at: "2026-09-12T14:00:00+00:00",
         completed_at: "2026-09-12T14:00:01+00:00",
         accounts_refreshed: 1,
-        positions_refreshed: 1,
+        positions_refreshed: 2,
         daily_snapshots_recorded: 1,
         error_code: null,
         error_message: null,
@@ -106,8 +150,104 @@ describe("App", () => {
 
     renderApp();
 
-    expect(await screen.findByText(/Last saved refresh: success/)).toBeTruthy();
-    expect(await screen.findByText(/9.123456789123456789 shares/)).toBeTruthy();
+    expect(await screen.findByText("Schwab Taxable ••••4821")).toBeTruthy();
+    expect(await screen.findByText(/9.123456789123456789/)).toBeTruthy();
+    expect(screen.getAllByText("Unavailable")).toHaveLength(4);
+    fireEvent.change(screen.getByLabelText("Filter holdings"), {
+      target: { value: "VTI" },
+    });
+    expect(screen.queryByText(/MISSING — Missing price fund/)).toBeNull();
+    expect(screen.getByText(/VTI — Vanguard Total Stock Market ETF/)).toBeTruthy();
+  });
+
+  it("shows an empty account and marks stale saved data", async () => {
+    api.getAccounts.mockResolvedValue({
+      accounts: [
+        {
+          id: "schwab-taxable-demo",
+          provider: "Schwab",
+          label: "Schwab Taxable ••••4821",
+          account_type: "taxable_brokerage",
+          currency: "USD",
+        },
+      ],
+    });
+    api.getAccount.mockResolvedValue({
+      account: {
+        ...savedAccount().account,
+        refreshed_at: "2020-01-02T00:00:00+00:00",
+        as_of: null,
+        balances: { market_value: "0", cost_basis: "0", currency: "USD" },
+        positions: [],
+      },
+    });
+
+    renderApp();
+
+    expect(await screen.findByText("This account has no saved holdings.")).toBeTruthy();
+    expect(screen.getByText(/Stale saved data/)).toBeTruthy();
+  });
+
+  it("sorts fractional and negative holding values numerically", async () => {
+    api.getAccounts.mockResolvedValue({
+      accounts: [
+        {
+          id: "schwab-taxable-demo",
+          provider: "Schwab",
+          label: "Schwab Taxable ••••4821",
+          account_type: "taxable_brokerage",
+          currency: "USD",
+        },
+      ],
+    });
+    api.getAccount.mockResolvedValue(
+      savedAccount([
+        {
+          account_id: "schwab-taxable-demo",
+          as_of: "2026-09-12",
+          symbol: "HIGH",
+          name: "High fractional holding",
+          asset_class: "equity",
+          quantity: "2.9",
+          current_price: "1",
+          market_value: "1",
+          cost_basis: "1",
+          gain_loss: "1",
+          currency: "USD",
+          is_stale: false,
+          source_refreshed_at: "2026-09-12T14:00:01+00:00",
+        },
+        {
+          account_id: "schwab-taxable-demo",
+          as_of: "2026-09-12",
+          symbol: "LOW",
+          name: "Low fractional holding",
+          asset_class: "equity",
+          quantity: "2.10",
+          current_price: "1",
+          market_value: "1",
+          cost_basis: "1",
+          gain_loss: "-1.5",
+          currency: "USD",
+          is_stale: false,
+          source_refreshed_at: "2026-09-12T14:00:01+00:00",
+        },
+      ]),
+    );
+
+    renderApp();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Sort by Quantity" }));
+    expect(screen.getAllByRole("row").slice(1).map((row) => row.textContent)).toEqual([
+      expect.stringContaining("LOW"),
+      expect.stringContaining("HIGH"),
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sort by Gain/loss" }));
+    expect(screen.getAllByRole("row").slice(1).map((row) => row.textContent)).toEqual([
+      expect.stringContaining("LOW"),
+      expect.stringContaining("HIGH"),
+    ]);
   });
 
   it("discloses stale provider data after a partial refresh", async () => {
@@ -185,5 +325,116 @@ describe("App", () => {
     expect(await screen.findByText(/Refresh failed/)).toBeTruthy();
     expect(await screen.findByText(/Stale data from/)).toBeTruthy();
     expect(await screen.findByText("Schwab data is stale; last successful data is shown.")).toBeTruthy();
+  });
+
+  it("shows an empty filtered activity feed", async () => {
+    renderApp();
+
+    expect(await screen.findByText("No activity matches these filters.")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Activity symbol"), {
+      target: { value: "NOT-A-SYMBOL" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Apply activity filters" }));
+
+    await waitFor(() =>
+      expect(api.getActivity).toHaveBeenLastCalledWith(
+        expect.objectContaining({ symbol: "NOT-A-SYMBOL" }),
+      ),
+    );
+  });
+
+  it("shows populated activity and navigates between pages", async () => {
+    api.getActivity.mockImplementation(({ offset = 0 }) => Promise.resolve({
+      activities: [
+        {
+          id: offset + 1,
+          account: { id: "schwab-taxable-demo", label: "Schwab Taxable ••••4821" },
+          provider: "Schwab",
+          occurred_on: "2026-09-12",
+          occurred_at: "2026-09-12T14:00:00+00:00",
+          type: "TRADE",
+          symbol: offset === 0 ? "VTI" : "VXUS",
+          description: "Fixture trade",
+          quantity: "1",
+          amount: "100",
+          fees: "0",
+          currency: "USD",
+          imported_at: "2026-09-12T14:01:00+00:00",
+        },
+      ],
+      pagination: { limit: 50, offset, total: 51 },
+    }));
+
+    renderApp();
+
+    expect(await screen.findByText(/VTI/)).toBeTruthy();
+    expect(screen.getByText("Showing 1-50 of 51")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Next activity page" }));
+    expect(await screen.findByText(/VXUS/)).toBeTruthy();
+    expect(screen.getByText("Showing 51-51 of 51")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Previous activity page" }));
+    expect(await screen.findByText(/VTI/)).toBeTruthy();
+  });
+
+  it("shows no-match and unavailable quote states", async () => {
+    api.searchInstruments
+      .mockResolvedValueOnce({ instruments: [] })
+      .mockResolvedValueOnce({
+        instruments: [
+          {
+            id: "us-fund:FIXTURE_UNAVAILABLE",
+            symbol: "FIXTURE_UNAVAILABLE",
+            name: "Fixture Unavailable Price Fund",
+            asset_class: "mutual_fund",
+            exchange: null,
+            currency: "USD",
+          },
+        ],
+      });
+    api.getQuote.mockResolvedValue({
+      quote: {
+        instrument: {
+          id: "us-fund:FIXTURE_UNAVAILABLE",
+          symbol: "FIXTURE_UNAVAILABLE",
+          name: "Fixture Unavailable Price Fund",
+          asset_class: "mutual_fund",
+          exchange: null,
+          currency: "USD",
+        },
+        source: "fixture_market_data",
+        observed_at: "2026-09-12T20:00:00+00:00",
+        last_price: null,
+        bid_price: null,
+        ask_price: null,
+        currency: "USD",
+      },
+    });
+    renderApp();
+
+    const input = screen.getByLabelText("Search instruments");
+    fireEvent.change(input, { target: { value: "not-a-symbol" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    expect(await screen.findByText("No instruments found.")).toBeTruthy();
+
+    fireEvent.change(input, { target: { value: "unavailable" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: /FIXTURE_UNAVAILABLE/ }),
+    );
+
+    expect(await screen.findByText("Canonical identity: us-fund:FIXTURE_UNAVAILABLE")).toBeTruthy();
+    expect(await screen.findByText("Source: fixture_market_data")).toBeTruthy();
+    expect(await screen.findByText(/Last price: unavailable USD/)).toBeTruthy();
+    expect(await screen.findByText(/Observed:/)).toBeTruthy();
+  });
+
+  it("shows a safe message when a provider-backed search fails", async () => {
+    api.searchInstruments.mockRejectedValue(new Error("provider failure"));
+    renderApp();
+
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    expect(await screen.findByText("Instrument search is unavailable.")).toBeTruthy();
   });
 });

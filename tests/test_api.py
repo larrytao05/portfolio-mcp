@@ -5,8 +5,8 @@ from fastapi.testclient import TestClient
 
 from portfolio_mcp.api import create_app
 from portfolio_mcp.database import PortfolioRepository
-from portfolio_mcp.fixtures import FixturePortfolioProvider
-from portfolio_mcp.models import Account, HoldingsSnapshot, Position
+from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
+from portfolio_mcp.models import Account, HoldingsSnapshot, Instrument, Position
 from portfolio_mcp.provider import ProviderUnavailableError
 
 
@@ -20,6 +20,11 @@ class PartiallyFailingFixtureProvider(FixturePortfolioProvider):
         if account_id == "schwab-taxable-demo":
             raise ProviderUnavailableError("Schwab fixture data is unavailable")
         return await super().get_holdings(account_id)
+
+
+class FailingMarketDataProvider(FixtureMarketDataProvider):
+    async def search_instruments(self, query: str) -> list[Instrument]:
+        raise ProviderUnavailableError("Market data provider is unavailable")
 
 
 def create_client(tmp_path, clock=None) -> TestClient:
@@ -83,6 +88,63 @@ def test_refresh_persists_accounts(tmp_path) -> None:
     }
 
 
+def test_refresh_imports_a_reverse_chronological_activity_feed(tmp_path) -> None:
+    client = create_client(tmp_path)
+
+    client.post("/api/refresh")
+
+    response = client.get("/api/activity?limit=2")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["pagination"] == {"limit": 2, "offset": 0, "total": 6}
+    assert [activity["occurred_on"] for activity in body["activities"]] == [
+        "2026-08-20",
+        "2026-08-14",
+    ]
+    activity = body["activities"][0]
+    assert activity["account"] == {
+        "id": "fidelity-roth-demo",
+        "label": "Fidelity Roth IRA ••••9046",
+    }
+    assert activity["provider"] == "Fidelity"
+    assert activity["imported_at"].endswith("+00:00")
+    assert "provider_transaction_id" not in activity
+    assert "raw" not in activity
+
+
+def test_activity_imports_are_idempotent_and_filterable(tmp_path) -> None:
+    client = create_client(tmp_path)
+
+    client.post("/api/refresh")
+    client.post("/api/refresh")
+
+    response = client.get(
+        "/api/activity?account_id=schwab-taxable-demo&provider=Schwab"
+        "&type=buy&symbol=NVDA&start_date=2026-08-01&end_date=2026-08-01"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["pagination"]["total"] == 1
+    assert (
+        response.json()["activities"][0]["description"] == "Bought NVIDIA Corporation"
+    )
+
+
+def test_activity_returns_an_empty_page_when_nothing_matches(tmp_path) -> None:
+    client = create_client(tmp_path)
+
+    client.post("/api/refresh")
+
+    response = client.get("/api/activity?symbol=NOT-A-SYMBOL")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "activities": [],
+        "pagination": {"limit": 50, "offset": 0, "total": 0},
+    }
+
+
 def test_persisted_accounts_survive_an_app_restart(tmp_path) -> None:
     database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
     first_client = TestClient(
@@ -103,6 +165,98 @@ def test_persisted_accounts_survive_an_app_restart(tmp_path) -> None:
     assert daily_values.json()["daily_values"][0]["value"] == "4799.97"
     latest_refresh = second_client.get("/api/refreshes/latest")
     assert latest_refresh.json()["refresh"]["status"] == "success"
+    activity = second_client.get("/api/activity")
+    assert activity.json()["pagination"]["total"] == 6
+
+
+def test_account_detail_uses_persisted_account_metadata_and_holdings(tmp_path) -> None:
+    refreshed_at = datetime(2026, 9, 12, 14, 0, tzinfo=UTC)
+    client = create_client(tmp_path, clock=lambda: refreshed_at)
+    client.post("/api/refresh")
+
+    response = client.get("/api/accounts/schwab-taxable-demo")
+
+    assert response.status_code == 200
+    account = response.json()["account"]
+    assert account["label"] == "Schwab Taxable ••••4821"
+    assert account["provider"] == "Schwab"
+    assert account["account_type"] == "taxable_brokerage"
+    assert account["currency"] == "USD"
+    assert account["refreshed_at"] == "2026-09-12T14:00:00+00:00"
+    assert account["as_of"] == "2026-08-29"
+    assert account["balances"] == {
+        "market_value": "4799.97",
+        "cost_basis": "4383.00",
+        "currency": "USD",
+    }
+    assert account["positions"][0]["gain_loss"] == "60.00"
+
+
+def test_account_detail_preserves_empty_and_unavailable_values(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
+    repository = PortfolioRepository(database_url)
+    refreshed_at = datetime(2020, 1, 2, tzinfo=UTC)
+    empty_account = Account(
+        id="empty-account",
+        provider="Fixture",
+        label="Empty ••••0001",
+        account_type="taxable_brokerage",
+        currency="USD",
+    )
+    unavailable_account = Account(
+        id="unavailable-account",
+        provider="Fixture",
+        label="Unavailable ••••0002",
+        account_type="roth_ira",
+        currency="USD",
+    )
+    repository.save_refresh(
+        [
+            HoldingsSnapshot(
+                account=empty_account,
+                as_of=date(2020, 1, 2),
+                positions=(),
+            ),
+            HoldingsSnapshot(
+                account=unavailable_account,
+                as_of=date(2020, 1, 2),
+                positions=(
+                    Position(
+                        account_id=unavailable_account.id,
+                        symbol="UNKNOWN",
+                        name="Unavailable values fund",
+                        asset_class="fund",
+                        quantity=Decimal("1"),
+                        current_price=None,
+                        market_value=None,
+                        cost_basis=None,
+                        currency="USD",
+                    ),
+                ),
+            ),
+        ],
+        refreshed_at,
+        refreshed_at,
+        date(2020, 1, 2),
+    )
+    client = TestClient(
+        create_app(FixturePortfolioProvider(), database_url=database_url)
+    )
+
+    empty = client.get("/api/accounts/empty-account")
+    unavailable = client.get("/api/accounts/unavailable-account")
+
+    assert empty.status_code == 200
+    assert empty.json()["account"]["positions"] == []
+    assert empty.json()["account"]["balances"]["market_value"] == "0"
+    assert unavailable.status_code == 200
+    detail = unavailable.json()["account"]
+    assert detail["refreshed_at"] == "2020-01-02T00:00:00+00:00"
+    assert detail["balances"]["market_value"] is None
+    assert detail["balances"]["cost_basis"] is None
+    assert detail["positions"][0]["current_price"] is None
+    assert detail["positions"][0]["cost_basis"] is None
+    assert detail["positions"][0]["gain_loss"] is None
 
 
 def test_refresh_replaces_the_same_new_york_daily_snapshot(tmp_path) -> None:
@@ -319,3 +473,59 @@ def test_partial_refresh_discloses_a_provider_without_saved_data(tmp_path) -> No
         account["provider"]
         for account in client.get("/api/accounts").json()["accounts"]
     } == {"Fidelity"}
+
+
+def test_search_instruments_returns_an_empty_list_for_no_match(tmp_path) -> None:
+    client = create_client(tmp_path)
+
+    response = client.get("/api/instruments/search", params={"query": "not-a-symbol"})
+
+    assert response.status_code == 200
+    assert response.json() == {"instruments": []}
+
+
+def test_quote_preserves_unavailable_market_data_fields(tmp_path) -> None:
+    client = create_client(tmp_path)
+
+    response = client.get("/api/instruments/us-fund:FIXTURE_UNAVAILABLE/quote")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "quote": {
+            "instrument": {
+                "id": "us-fund:FIXTURE_UNAVAILABLE",
+                "symbol": "FIXTURE_UNAVAILABLE",
+                "name": "Fixture Unavailable Price Fund",
+                "asset_class": "mutual_fund",
+                "exchange": None,
+                "currency": "USD",
+            },
+            "source": "fixture_market_data",
+            "observed_at": "2026-09-12T20:00:00+00:00",
+            "last_price": None,
+            "bid_price": None,
+            "ask_price": None,
+            "currency": "USD",
+        }
+    }
+
+
+def test_market_data_provider_failure_has_a_safe_api_response(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
+    client = TestClient(
+        create_app(
+            FixturePortfolioProvider(),
+            market_data_provider=FailingMarketDataProvider(),
+            database_url=database_url,
+        )
+    )
+
+    response = client.get("/api/instruments/search", params={"query": "VTI"})
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "error": {
+            "code": "provider_error",
+            "message": "Market data provider is unavailable",
+        }
+    }

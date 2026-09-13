@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
 from portfolio_mcp.database import PortfolioRepository, RefreshResult
@@ -38,11 +38,19 @@ class PortfolioRefreshService:
 
         snapshots = []
         failed_accounts = []
+        transactions = []
         for account in accounts:
             try:
                 snapshots.append(await self._provider.get_holdings(account.id))
             except Exception:
                 failed_accounts.append(account)
+            try:
+                history = await self._provider.get_transactions(
+                    account.id, date(1970, 1, 1), started_at.date()
+                )
+                transactions.extend(history.transactions)
+            except Exception:
+                pass
         completed_at = self._as_utc(self._clock())
         snapshot_date = started_at.astimezone(ZoneInfo("America/New_York")).date()
         return self._repository.save_refresh(
@@ -51,6 +59,7 @@ class PortfolioRefreshService:
             completed_at,
             snapshot_date,
             failed_accounts,
+            transactions,
         )
 
     def _as_utc(self, value: datetime) -> datetime:

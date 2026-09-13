@@ -20,7 +20,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 from sqlalchemy.types import TypeDecorator
 
 from alembic import command
-from portfolio_mcp.models import Account, HoldingsSnapshot, Position
+from portfolio_mcp.models import Account, HoldingsSnapshot, Position, Transaction
 
 
 class Base(DeclarativeBase):
@@ -127,6 +127,25 @@ class RefreshProviderOutcomeRecord(Base):
     warning: Mapped[str | None] = mapped_column(String(256))
 
 
+class ActivityRecord(Base):
+    __tablename__ = "activities"
+    __table_args__ = (UniqueConstraint("account_id", "provider_transaction_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), nullable=False)
+    provider_transaction_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    occurred_on: Mapped[date] = mapped_column(Date, nullable=False)
+    occurred_at: Mapped[datetime | None] = mapped_column(UtcTimestamp())
+    transaction_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbol: Mapped[str | None] = mapped_column(String(32))
+    description: Mapped[str] = mapped_column(String(512), nullable=False)
+    quantity: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    amount: Mapped[Decimal] = mapped_column(ExactDecimal(), nullable=False)
+    fees: Mapped[Decimal] = mapped_column(ExactDecimal(), nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), nullable=False)
+    imported_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+
+
 @dataclass(frozen=True)
 class StoredPosition:
     position: Position
@@ -135,12 +154,19 @@ class StoredPosition:
     source_refreshed_at: datetime
 
     def to_dict(self) -> dict[str, str | bool | None]:
+        gain_loss = (
+            self.position.market_value - self.position.cost_basis
+            if self.position.market_value is not None
+            and self.position.cost_basis is not None
+            else None
+        )
         return {
             "account_id": self.position.account_id,
             "as_of": self.as_of.isoformat(),
             "is_stale": self.is_stale,
             "source_refreshed_at": self.source_refreshed_at.isoformat(),
             **self.position.to_dict(),
+            "gain_loss": str(gain_loss) if gain_loss is not None else None,
         }
 
 
@@ -176,6 +202,54 @@ class ProviderRefreshOutcome:
             "excluded_accounts": self.excluded_accounts,
             "warning": self.warning,
         }
+
+
+@dataclass(frozen=True)
+class AccountDetail:
+    account: Account
+    refreshed_at: datetime
+    as_of: date | None
+    positions: tuple[StoredPosition, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        market_values = [
+            stored.position.market_value
+            for stored in self.positions
+            if stored.position.market_value is not None
+        ]
+        cost_bases = [
+            stored.position.cost_basis
+            for stored in self.positions
+            if stored.position.cost_basis is not None
+        ]
+        currencies_match = all(
+            stored.position.currency == self.account.currency
+            for stored in self.positions
+        )
+        return {
+            "id": self.account.id,
+            "provider": self.account.provider,
+            "label": self.account.label,
+            "account_type": self.account.account_type,
+            "currency": self.account.currency,
+            "refreshed_at": self.refreshed_at.isoformat(),
+            "as_of": self.as_of.isoformat() if self.as_of is not None else None,
+            "balances": {
+                "market_value": self._total_if_complete(
+                    market_values, currencies_match
+                ),
+                "cost_basis": self._total_if_complete(cost_bases, currencies_match),
+                "currency": self.account.currency,
+            },
+            "positions": [position.to_dict() for position in self.positions],
+        }
+
+    def _total_if_complete(
+        self, values: list[Decimal], currencies_match: bool
+    ) -> str | None:
+        if not currencies_match or len(values) != len(self.positions):
+            return None
+        return str(sum(values, start=Decimal("0")))
 
 
 @dataclass(frozen=True)
@@ -280,6 +354,34 @@ class PortfolioRepository:
             )
             return [self._stored_position(record, account) for record in records]
 
+    def account_detail(self, account_id: str) -> AccountDetail | None:
+        with self._sessions() as session:
+            account = session.get(AccountRecord, account_id)
+            if account is None:
+                return None
+            records = list(
+                session.scalars(
+                    select(PositionRecord)
+                    .where(PositionRecord.account_id == account_id)
+                    .order_by(PositionRecord.symbol)
+                )
+            )
+            positions = tuple(
+                self._stored_position(record, account) for record in records
+            )
+            return AccountDetail(
+                account=Account(
+                    id=account.id,
+                    provider=account.provider,
+                    label=account.label,
+                    account_type=account.account_type,
+                    currency=account.currency,
+                ),
+                refreshed_at=account.refreshed_at,
+                as_of=positions[0].as_of if positions else None,
+                positions=positions,
+            )
+
     def save_refresh(
         self,
         snapshots: list[HoldingsSnapshot],
@@ -287,11 +389,13 @@ class PortfolioRepository:
         completed_at: datetime,
         snapshot_date: date,
         failed_accounts: list[Account] | None = None,
+        transactions: list[Transaction] | None = None,
     ) -> "RefreshResult":
         failed_accounts = failed_accounts or []
         with self._sessions.begin() as session:
             for snapshot in snapshots:
                 self._save_snapshot(session, snapshot, completed_at, snapshot_date)
+            self._save_transactions(session, transactions or [], completed_at)
 
             stale_account_ids = self._mark_failed_accounts(session, failed_accounts)
             outcomes = self._provider_outcomes(
@@ -373,6 +477,49 @@ class PortfolioRepository:
             return self._refresh_result(
                 record, self._outcomes_for_refresh(session, record.id)
             )
+
+    def list_activities(
+        self,
+        *,
+        account_id: str | None = None,
+        provider: str | None = None,
+        transaction_type: str | None = None,
+        symbol: str | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list["Activity"], int]:
+        with self._sessions() as session:
+            query = select(ActivityRecord, AccountRecord).join(
+                AccountRecord, ActivityRecord.account_id == AccountRecord.id
+            )
+            if account_id is not None:
+                query = query.where(ActivityRecord.account_id == account_id)
+            if provider is not None:
+                query = query.where(AccountRecord.provider == provider)
+            if transaction_type is not None:
+                query = query.where(ActivityRecord.transaction_type == transaction_type)
+            if symbol is not None:
+                query = query.where(ActivityRecord.symbol == symbol)
+            if start_date is not None:
+                query = query.where(ActivityRecord.occurred_on >= start_date)
+            if end_date is not None:
+                query = query.where(ActivityRecord.occurred_on <= end_date)
+
+            total = len(session.execute(query).all())
+            records = session.execute(
+                query.order_by(
+                    ActivityRecord.occurred_on.desc(),
+                    ActivityRecord.occurred_at.desc(),
+                    ActivityRecord.id.desc(),
+                )
+                .offset(offset)
+                .limit(limit)
+            ).all()
+            return [
+                self._activity(activity, account) for activity, account in records
+            ], total
 
     def _save_snapshot(
         self,
@@ -596,6 +743,33 @@ class PortfolioRepository:
             for record in records
         )
 
+    def _save_transactions(
+        self, session: Session, transactions: list[Transaction], imported_at: datetime
+    ) -> None:
+        for transaction in transactions:
+            record = session.scalar(
+                select(ActivityRecord).where(
+                    ActivityRecord.account_id == transaction.account_id,
+                    ActivityRecord.provider_transaction_id == transaction.id,
+                )
+            )
+            if record is None:
+                record = ActivityRecord(
+                    account_id=transaction.account_id,
+                    provider_transaction_id=transaction.id,
+                    imported_at=imported_at,
+                )
+                session.add(record)
+            record.occurred_on = transaction.occurred_on
+            record.occurred_at = transaction.occurred_at
+            record.transaction_type = transaction.transaction_type
+            record.symbol = transaction.symbol
+            record.description = transaction.description
+            record.quantity = transaction.quantity
+            record.amount = transaction.amount
+            record.fees = transaction.fees
+            record.currency = transaction.currency
+
     def _stored_position(
         self, record: PositionRecord, account: AccountRecord
     ) -> StoredPosition:
@@ -633,3 +807,58 @@ class PortfolioRepository:
             error_message=record.error_message,
             provider_outcomes=outcomes,
         )
+
+    def _activity(self, record: ActivityRecord, account: AccountRecord) -> "Activity":
+        return Activity(
+            id=record.id,
+            account_id=account.id,
+            account_label=account.label,
+            provider=account.provider,
+            occurred_on=record.occurred_on,
+            occurred_at=record.occurred_at,
+            transaction_type=record.transaction_type,
+            symbol=record.symbol,
+            description=record.description,
+            quantity=record.quantity,
+            amount=record.amount,
+            fees=record.fees,
+            currency=record.currency,
+            imported_at=record.imported_at,
+        )
+
+
+@dataclass(frozen=True)
+class Activity:
+    id: int
+    account_id: str
+    account_label: str
+    provider: str
+    occurred_on: date
+    occurred_at: datetime | None
+    transaction_type: str
+    symbol: str | None
+    description: str
+    quantity: Decimal | None
+    amount: Decimal
+    fees: Decimal
+    currency: str
+    imported_at: datetime
+
+    def to_dict(self) -> dict[str, int | str | None | dict[str, str]]:
+        return {
+            "id": self.id,
+            "account": {"id": self.account_id, "label": self.account_label},
+            "provider": self.provider,
+            "occurred_on": self.occurred_on.isoformat(),
+            "occurred_at": (
+                self.occurred_at.isoformat() if self.occurred_at is not None else None
+            ),
+            "type": self.transaction_type,
+            "symbol": self.symbol,
+            "description": self.description,
+            "quantity": str(self.quantity) if self.quantity is not None else None,
+            "amount": str(self.amount),
+            "fees": str(self.fees),
+            "currency": self.currency,
+            "imported_at": self.imported_at.isoformat(),
+        }

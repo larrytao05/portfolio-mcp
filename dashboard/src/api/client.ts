@@ -45,9 +45,67 @@ export type Position = {
   current_price: string | null;
   market_value: string | null;
   cost_basis: string | null;
+  gain_loss: string | null;
   currency: string;
   is_stale: boolean;
   source_refreshed_at: string;
+};
+
+export type AccountDetail = Account & {
+  refreshed_at: string;
+  as_of: string | null;
+  balances: {
+    market_value: string | null;
+    cost_basis: string | null;
+    currency: string;
+  };
+  positions: Position[];
+};
+
+export type Activity = {
+  id: number;
+  account: { id: string; label: string };
+  provider: string;
+  occurred_on: string;
+  occurred_at: string | null;
+  type: string;
+  symbol: string | null;
+  description: string;
+  quantity: string | null;
+  amount: string;
+  fees: string;
+  currency: string;
+  imported_at: string;
+};
+
+export type ActivityFilters = {
+  account_id?: string;
+  provider?: string;
+  type?: string;
+  symbol?: string;
+  start_date?: string;
+  end_date?: string;
+  limit?: number;
+  offset?: number;
+};
+
+export type Instrument = {
+  id: string;
+  symbol: string;
+  name: string;
+  asset_class: string;
+  exchange: string | null;
+  currency: string | null;
+};
+
+export type Quote = {
+  instrument: Instrument;
+  source: string;
+  observed_at: string;
+  last_price: string | null;
+  bid_price: string | null;
+  ask_price: string | null;
+  currency: string | null;
 };
 
 async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -71,10 +129,36 @@ export function getAccountPositions(accountId: string): Promise<{ positions: Pos
   return getJson(`/api/accounts/${encodeURIComponent(accountId)}/positions`);
 }
 
+export function getAccount(accountId: string): Promise<{ account: AccountDetail }> {
+  return getJson(`/api/accounts/${encodeURIComponent(accountId)}`);
+}
+
 export function getLatestRefresh(): Promise<{ refresh: RefreshResult | null }> {
   return getJson("/api/refreshes/latest");
 }
 
 export function refreshPortfolio(): Promise<{ refresh: RefreshResult }> {
   return getJson("/api/refresh", { method: "POST" });
+}
+
+export function getActivity(filters: ActivityFilters = {}): Promise<{
+  activities: Activity[];
+  pagination: { limit: number; offset: number; total: number };
+}> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined && value !== "") {
+      params.set(key, String(value));
+    }
+  }
+  const query = params.toString();
+  return getJson(`/api/activity${query ? `?${query}` : ""}`);
+}
+
+export function searchInstruments(query: string): Promise<{ instruments: Instrument[] }> {
+  return getJson(`/api/instruments/search?query=${encodeURIComponent(query)}`);
+}
+
+export function getQuote(instrumentId: string): Promise<{ quote: Quote }> {
+  return getJson(`/api/instruments/${encodeURIComponent(instrumentId)}/quote`);
 }
