@@ -7,6 +7,7 @@ import type { Position } from "./api/client";
 
 const api = vi.hoisted(() => ({
   getAccount: vi.fn(),
+  getActivity: vi.fn(),
   getAccounts: vi.fn(),
   getHealth: vi.fn(),
   getLatestRefresh: vi.fn(),
@@ -50,6 +51,10 @@ describe("App", () => {
     api.getHealth.mockResolvedValue({ status: "ok" });
     api.getAccounts.mockResolvedValue({ accounts: [] });
     api.getAccount.mockResolvedValue(savedAccount());
+    api.getActivity.mockResolvedValue({
+      activities: [],
+      pagination: { limit: 50, offset: 0, total: 0 },
+    });
     api.getLatestRefresh.mockResolvedValue({ refresh: null });
     api.refreshPortfolio.mockResolvedValue({
       refresh: {
@@ -103,6 +108,8 @@ describe("App", () => {
           cost_basis: "2781.00",
           gain_loss: "260.12",
           currency: "USD",
+          is_stale: false,
+          source_refreshed_at: "2026-09-12T14:00:01+00:00",
         },
         {
           account_id: "schwab-taxable-demo",
@@ -116,6 +123,8 @@ describe("App", () => {
           cost_basis: null,
           gain_loss: null,
           currency: "USD",
+          is_stale: false,
+          source_refreshed_at: "2026-09-12T14:00:01+00:00",
         },
       ]),
     );
@@ -201,6 +210,8 @@ describe("App", () => {
           cost_basis: "1",
           gain_loss: "1",
           currency: "USD",
+          is_stale: false,
+          source_refreshed_at: "2026-09-12T14:00:01+00:00",
         },
         {
           account_id: "schwab-taxable-demo",
@@ -214,6 +225,8 @@ describe("App", () => {
           cost_basis: "1",
           gain_loss: "-1.5",
           currency: "USD",
+          is_stale: false,
+          source_refreshed_at: "2026-09-12T14:00:01+00:00",
         },
       ]),
     );
@@ -308,5 +321,54 @@ describe("App", () => {
     expect(await screen.findByText(/Refresh failed/)).toBeTruthy();
     expect(await screen.findByText(/Stale data from/)).toBeTruthy();
     expect(await screen.findByText("Schwab data is stale; last successful data is shown.")).toBeTruthy();
+  });
+
+  it("shows an empty filtered activity feed", async () => {
+    renderApp();
+
+    expect(await screen.findByText("No activity matches these filters.")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Activity symbol"), {
+      target: { value: "NOT-A-SYMBOL" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Apply activity filters" }));
+
+    await waitFor(() =>
+      expect(api.getActivity).toHaveBeenLastCalledWith(
+        expect.objectContaining({ symbol: "NOT-A-SYMBOL" }),
+      ),
+    );
+  });
+
+  it("shows populated activity and navigates between pages", async () => {
+    api.getActivity.mockImplementation(({ offset = 0 }) => Promise.resolve({
+      activities: [
+        {
+          id: offset + 1,
+          account: { id: "schwab-taxable-demo", label: "Schwab Taxable ••••4821" },
+          provider: "Schwab",
+          occurred_on: "2026-09-12",
+          occurred_at: "2026-09-12T14:00:00+00:00",
+          type: "TRADE",
+          symbol: offset === 0 ? "VTI" : "VXUS",
+          description: "Fixture trade",
+          quantity: "1",
+          amount: "100",
+          fees: "0",
+          currency: "USD",
+          imported_at: "2026-09-12T14:01:00+00:00",
+        },
+      ],
+      pagination: { limit: 50, offset, total: 51 },
+    }));
+
+    renderApp();
+
+    expect(await screen.findByText(/VTI/)).toBeTruthy();
+    expect(screen.getByText("Showing 1-50 of 51")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Next activity page" }));
+    expect(await screen.findByText(/VXUS/)).toBeTruthy();
+    expect(screen.getByText("Showing 51-51 of 51")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Previous activity page" }));
+    expect(await screen.findByText(/VTI/)).toBeTruthy();
   });
 });

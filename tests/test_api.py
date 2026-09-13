@@ -83,6 +83,63 @@ def test_refresh_persists_accounts(tmp_path) -> None:
     }
 
 
+def test_refresh_imports_a_reverse_chronological_activity_feed(tmp_path) -> None:
+    client = create_client(tmp_path)
+
+    client.post("/api/refresh")
+
+    response = client.get("/api/activity?limit=2")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["pagination"] == {"limit": 2, "offset": 0, "total": 6}
+    assert [activity["occurred_on"] for activity in body["activities"]] == [
+        "2026-08-20",
+        "2026-08-14",
+    ]
+    activity = body["activities"][0]
+    assert activity["account"] == {
+        "id": "fidelity-roth-demo",
+        "label": "Fidelity Roth IRA ••••9046",
+    }
+    assert activity["provider"] == "Fidelity"
+    assert activity["imported_at"].endswith("+00:00")
+    assert "provider_transaction_id" not in activity
+    assert "raw" not in activity
+
+
+def test_activity_imports_are_idempotent_and_filterable(tmp_path) -> None:
+    client = create_client(tmp_path)
+
+    client.post("/api/refresh")
+    client.post("/api/refresh")
+
+    response = client.get(
+        "/api/activity?account_id=schwab-taxable-demo&provider=Schwab"
+        "&type=buy&symbol=NVDA&start_date=2026-08-01&end_date=2026-08-01"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["pagination"]["total"] == 1
+    assert (
+        response.json()["activities"][0]["description"] == "Bought NVIDIA Corporation"
+    )
+
+
+def test_activity_returns_an_empty_page_when_nothing_matches(tmp_path) -> None:
+    client = create_client(tmp_path)
+
+    client.post("/api/refresh")
+
+    response = client.get("/api/activity?symbol=NOT-A-SYMBOL")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "activities": [],
+        "pagination": {"limit": 50, "offset": 0, "total": 0},
+    }
+
+
 def test_persisted_accounts_survive_an_app_restart(tmp_path) -> None:
     database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
     first_client = TestClient(
@@ -103,6 +160,8 @@ def test_persisted_accounts_survive_an_app_restart(tmp_path) -> None:
     assert daily_values.json()["daily_values"][0]["value"] == "4799.97"
     latest_refresh = second_client.get("/api/refreshes/latest")
     assert latest_refresh.json()["refresh"]["status"] == "success"
+    activity = second_client.get("/api/activity")
+    assert activity.json()["pagination"]["total"] == 6
 
 
 def test_account_detail_uses_persisted_account_metadata_and_holdings(tmp_path) -> None:
