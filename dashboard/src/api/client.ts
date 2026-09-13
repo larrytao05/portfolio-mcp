@@ -89,6 +89,25 @@ export type ActivityFilters = {
   offset?: number;
 };
 
+export type Instrument = {
+  id: string;
+  symbol: string;
+  name: string;
+  asset_class: string;
+  exchange: string | null;
+  currency: string | null;
+};
+
+export type Quote = {
+  instrument: Instrument;
+  source: string;
+  observed_at: string;
+  last_price: string | null;
+  bid_price: string | null;
+  ask_price: string | null;
+  currency: string | null;
+};
+
 async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.ok) {
@@ -134,4 +153,12 @@ export function getActivity(filters: ActivityFilters = {}): Promise<{
   }
   const query = params.toString();
   return getJson(`/api/activity${query ? `?${query}` : ""}`);
+}
+
+export function searchInstruments(query: string): Promise<{ instruments: Instrument[] }> {
+  return getJson(`/api/instruments/search?query=${encodeURIComponent(query)}`);
+}
+
+export function getQuote(instrumentId: string): Promise<{ quote: Quote }> {
+  return getJson(`/api/instruments/${encodeURIComponent(instrumentId)}/quote`);
 }

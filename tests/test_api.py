@@ -5,8 +5,8 @@ from fastapi.testclient import TestClient
 
 from portfolio_mcp.api import create_app
 from portfolio_mcp.database import PortfolioRepository
-from portfolio_mcp.fixtures import FixturePortfolioProvider
-from portfolio_mcp.models import Account, HoldingsSnapshot, Position
+from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
+from portfolio_mcp.models import Account, HoldingsSnapshot, Instrument, Position
 from portfolio_mcp.provider import ProviderUnavailableError
 
 
@@ -20,6 +20,11 @@ class PartiallyFailingFixtureProvider(FixturePortfolioProvider):
         if account_id == "schwab-taxable-demo":
             raise ProviderUnavailableError("Schwab fixture data is unavailable")
         return await super().get_holdings(account_id)
+
+
+class FailingMarketDataProvider(FixtureMarketDataProvider):
+    async def search_instruments(self, query: str) -> list[Instrument]:
+        raise ProviderUnavailableError("Market data provider is unavailable")
 
 
 def create_client(tmp_path, clock=None) -> TestClient:
@@ -468,3 +473,59 @@ def test_partial_refresh_discloses_a_provider_without_saved_data(tmp_path) -> No
         account["provider"]
         for account in client.get("/api/accounts").json()["accounts"]
     } == {"Fidelity"}
+
+
+def test_search_instruments_returns_an_empty_list_for_no_match(tmp_path) -> None:
+    client = create_client(tmp_path)
+
+    response = client.get("/api/instruments/search", params={"query": "not-a-symbol"})
+
+    assert response.status_code == 200
+    assert response.json() == {"instruments": []}
+
+
+def test_quote_preserves_unavailable_market_data_fields(tmp_path) -> None:
+    client = create_client(tmp_path)
+
+    response = client.get("/api/instruments/us-fund:FIXTURE_UNAVAILABLE/quote")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "quote": {
+            "instrument": {
+                "id": "us-fund:FIXTURE_UNAVAILABLE",
+                "symbol": "FIXTURE_UNAVAILABLE",
+                "name": "Fixture Unavailable Price Fund",
+                "asset_class": "mutual_fund",
+                "exchange": None,
+                "currency": "USD",
+            },
+            "source": "fixture_market_data",
+            "observed_at": "2026-09-12T20:00:00+00:00",
+            "last_price": None,
+            "bid_price": None,
+            "ask_price": None,
+            "currency": "USD",
+        }
+    }
+
+
+def test_market_data_provider_failure_has_a_safe_api_response(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
+    client = TestClient(
+        create_app(
+            FixturePortfolioProvider(),
+            market_data_provider=FailingMarketDataProvider(),
+            database_url=database_url,
+        )
+    )
+
+    response = client.get("/api/instruments/search", params={"query": "VTI"})
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "error": {
+            "code": "provider_error",
+            "message": "Market data provider is unavailable",
+        }
+    }

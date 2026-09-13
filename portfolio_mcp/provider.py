@@ -1,7 +1,13 @@
 from datetime import date
 from typing import Protocol
 
-from portfolio_mcp.models import Account, HoldingsSnapshot, TransactionHistory
+from portfolio_mcp.models import (
+    Account,
+    HoldingsSnapshot,
+    Instrument,
+    Quote,
+    TransactionHistory,
+)
 
 
 class ProviderError(ValueError):
@@ -38,6 +44,10 @@ class AccountNotFoundError(ProviderError):
     pass
 
 
+class InstrumentNotFoundError(ProviderError):
+    pass
+
+
 class PortfolioProvider(Protocol):
     """The read-only seam between MCP tools and a portfolio data adapter.
 
@@ -53,3 +63,15 @@ class PortfolioProvider(Protocol):
     async def get_transactions(
         self, account_id: str, start_date: date, end_date: date
     ) -> TransactionHistory: ...
+
+
+class MarketDataProvider(Protocol):
+    """The read-only seam for normalized instrument discovery and quotes.
+
+    Search returns no items for an unknown query. Quote price fields are nullable
+    when the source recognizes an instrument but cannot currently provide them.
+    """
+
+    async def search_instruments(self, query: str) -> list[Instrument]: ...
+
+    async def get_quote(self, instrument_id: str) -> Quote: ...
