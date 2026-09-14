@@ -31,8 +31,8 @@ cd dashboard && npm install && npm run dev
 ```
 
 The API listens on `127.0.0.1:8000`; Vite proxies `/api` requests from the
-frontend development server. This starts fixture data by default. To use a
-configured SnapTrade provider, start the API with:
+frontend development server. Portfolio and market-data providers use fixture
+data by default. To load a configured provider from `.env`, start the API with:
 
 ```sh
 uv run --env-file .env uvicorn api_main:app --reload
@@ -66,3 +66,22 @@ uv run python main.py
 
 Use `PORTFOLIO_PROVIDER=fixture` to return to fictional data. Never commit
 `.env` or share credential values.
+
+## Schwab market-data configuration
+
+The instrument-search and quote workflow uses fixture data unless explicitly
+configured otherwise. After completing Schwab's approved production OAuth flow,
+add the locally stored credentials and select the Schwab adapter:
+
+```sh
+MARKET_DATA_PROVIDER=schwab
+SCHWAB_CLIENT_ID=
+SCHWAB_CLIENT_SECRET=
+SCHWAB_REFRESH_TOKEN=
+```
+
+Start the API with `uv run --env-file .env uvicorn api_main:app --reload`.
+This enables only read-only Schwab instrument search and quote requests; it
+does not place, preview, cancel, or modify orders. Leave
+`MARKET_DATA_PROVIDER=fixture` for offline development and tests. Never
+commit `.env` or share credential values.
