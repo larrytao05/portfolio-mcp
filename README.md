@@ -1,15 +1,25 @@
-# Portfolio MCP
+# Portfolio Dashboard
 
-Local, read-only MCP server for viewing brokerage accounts, holdings, and
-transactions. Currently the only implemented provider is SnapTrade. It has 
-been tested using Schwab and Fidelity accounts so far.
+A local, read-only portfolio dashboard for viewing brokerage accounts,
+holdings, transaction activity, and market quotes. It pairs a React frontend
+with a FastAPI backend and SQLite storage, with fixture data available for
+offline development.
 
-## Provider contract
+The dashboard lets you refresh portfolio data, explore account holdings, filter
+and page through saved activity, and search instruments and view quotes. It
+currently supports SnapTrade for portfolio data and Schwab for market data;
+both integrations are strictly read-only.
 
-Every read-only provider adapter implements three operations: list accounts,
-get a holdings snapshot, and get a date-bounded transaction history. Account
-labels must be safe to display, returned transactions are newest first, and a
-missing price, market value, or cost basis is represented as `null`.
+## Architecture
+
+- `dashboard/` contains the React frontend.
+- `api_main.py` starts the FastAPI API used by the dashboard.
+- `portfolio_mcp/` contains the provider adapters, application logic, and API.
+
+Portfolio providers list accounts, retrieve holdings snapshots, and return
+date-bounded transaction history. Account labels are safe to display,
+transactions are newest first, and a missing price, market value, or cost basis
+is represented as `null`.
 
 ## Run and verify
 
