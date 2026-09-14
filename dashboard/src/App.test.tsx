@@ -1,5 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
@@ -39,7 +45,11 @@ function savedAccount(positions: Position[] = []) {
       currency: "USD",
       refreshed_at: "2026-09-12T14:00:01+00:00",
       as_of: "2026-09-12",
-      balances: { market_value: "3041.12", cost_basis: "2781.00", currency: "USD" },
+      balances: {
+        market_value: "3041.12",
+        cost_basis: "2781.00",
+        currency: "USD",
+      },
       positions,
     },
   };
@@ -80,10 +90,96 @@ describe("App", () => {
   it("refreshes persisted portfolio data from the dashboard", async () => {
     renderApp();
 
-    fireEvent.click(await screen.findByRole("button", { name: "Refresh portfolio" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Refresh portfolio" }),
+    );
 
     await waitFor(() => expect(api.refreshPortfolio).toHaveBeenCalledOnce());
-    expect(await screen.findByText(/Saved 2 accounts and 9 positions/)).toBeTruthy();
+    expect(
+      await screen.findByText(/Saved 2 accounts and 9 positions/),
+    ).toBeTruthy();
+  });
+
+  it("does not show a missing record or search loading while queries are inactive", async () => {
+    api.getLatestRefresh.mockReturnValue(new Promise(() => {}));
+    renderApp();
+    expect(await screen.findByText("Loading saved record…")).toBeTruthy();
+    expect(screen.queryByText("No saved record yet")).toBeNull();
+    expect(screen.queryByText("Searching instruments…")).toBeNull();
+    expect(screen.queryByText("Loading quote…")).toBeNull();
+  });
+
+  it("keeps saved account identity visible when detail loading fails", async () => {
+    api.getAccounts.mockResolvedValue({
+      accounts: [
+        {
+          ...savedAccount().account,
+          is_stale: false,
+          source_refreshed_at: new Date().toISOString(),
+        },
+      ],
+    });
+    api.getAccount.mockRejectedValue(new Error("unavailable"));
+    renderApp();
+    expect(
+      await screen.findByText(/Saved account details are unavailable/),
+    ).toBeTruthy();
+    expect(
+      screen.getByText("Schwab Taxable ••••4821", { selector: "strong" }),
+    ).toBeTruthy();
+  });
+
+  it("shows persisted coverage and warnings before any refresh action", async () => {
+    api.getLatestRefresh.mockResolvedValue({
+      refresh: {
+        id: 8,
+        status: "partial",
+        completed_at: new Date().toISOString(),
+        accounts_refreshed: 1,
+        positions_refreshed: 2,
+        provider_outcomes: [
+          {
+            provider: "Schwab",
+            accounts_refreshed: 1,
+            stale_accounts: 1,
+            excluded_accounts: 2,
+          },
+        ],
+        warnings: ["Two accounts could not be imported."],
+      },
+    });
+    renderApp();
+    expect(
+      await screen.findByText("Two accounts could not be imported."),
+    ).toBeTruthy();
+    expect(screen.getByText(/1 refreshed, 1 stale, 2 excluded/)).toBeTruthy();
+    expect(api.refreshPortfolio).not.toHaveBeenCalled();
+  });
+
+  it("marks an old successful refresh as stale", async () => {
+    api.getLatestRefresh.mockResolvedValue({
+      refresh: {
+        id: 8,
+        status: "success",
+        completed_at: "2020-01-01T00:00:00Z",
+        accounts_refreshed: 0,
+        positions_refreshed: 0,
+        provider_outcomes: [],
+        warnings: [],
+      },
+    });
+    renderApp();
+    expect(await screen.findByText("Saved record is stale")).toBeTruthy();
+    expect(screen.queryByText("Saved record is current")).toBeNull();
+  });
+
+  it("reports unavailable refresh status instead of claiming an empty record", async () => {
+    api.getLatestRefresh.mockRejectedValue(new Error("unavailable"));
+    renderApp();
+    expect(
+      await screen.findByText(/Saved record status is unavailable/),
+    ).toBeTruthy();
+    expect(screen.queryByText("No saved record yet")).toBeNull();
   });
 
   it("shows saved account details and lets holdings be filtered", async () => {
@@ -150,14 +246,19 @@ describe("App", () => {
 
     renderApp();
 
-    expect(await screen.findByText("Schwab Taxable ••••4821")).toBeTruthy();
+    expect(
+      await screen.findByText("Schwab Taxable ••••4821", {
+        selector: "strong",
+      }),
+    ).toBeTruthy();
     expect(await screen.findByText(/9.123456789123456789/)).toBeTruthy();
     expect(screen.getAllByText("Unavailable")).toHaveLength(4);
     fireEvent.change(screen.getByLabelText("Filter holdings"), {
       target: { value: "VTI" },
     });
-    expect(screen.queryByText(/MISSING — Missing price fund/)).toBeNull();
-    expect(screen.getByText(/VTI — Vanguard Total Stock Market ETF/)).toBeTruthy();
+    expect(screen.queryByText("MISSING", { selector: "strong" })).toBeNull();
+    expect(screen.getByText("VTI", { selector: "strong" })).toBeTruthy();
+    expect(screen.getByText(/Vanguard Total Stock Market ETF/)).toBeTruthy();
   });
 
   it("shows an empty account and marks stale saved data", async () => {
@@ -184,8 +285,10 @@ describe("App", () => {
 
     renderApp();
 
-    expect(await screen.findByText("This account has no saved holdings.")).toBeTruthy();
-    expect(screen.getByText(/Stale saved data/)).toBeTruthy();
+    expect(
+      await screen.findByText("This account has no saved holdings."),
+    ).toBeTruthy();
+    expect(screen.getAllByText(/Stale saved data/).length).toBeGreaterThan(0);
   });
 
   it("sorts fractional and negative holding values numerically", async () => {
@@ -237,14 +340,26 @@ describe("App", () => {
 
     renderApp();
 
-    fireEvent.click(await screen.findByRole("button", { name: "Sort by Quantity" }));
-    expect(screen.getAllByRole("row").slice(1).map((row) => row.textContent)).toEqual([
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Sort by Quantity" }),
+    );
+    expect(
+      screen
+        .getAllByRole("row")
+        .slice(1)
+        .map((row) => row.textContent),
+    ).toEqual([
       expect.stringContaining("LOW"),
       expect.stringContaining("HIGH"),
     ]);
 
     fireEvent.click(screen.getByRole("button", { name: "Sort by Gain/loss" }));
-    expect(screen.getAllByRole("row").slice(1).map((row) => row.textContent)).toEqual([
+    expect(
+      screen
+        .getAllByRole("row")
+        .slice(1)
+        .map((row) => row.textContent),
+    ).toEqual([
       expect.stringContaining("LOW"),
       expect.stringContaining("HIGH"),
     ]);
@@ -268,10 +383,16 @@ describe("App", () => {
     });
 
     renderApp();
-    fireEvent.click(await screen.findByRole("button", { name: "Refresh portfolio" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Refresh portfolio" }),
+    );
 
     expect(await screen.findByText(/Refresh partial/)).toBeTruthy();
-    expect(await screen.findByText("Schwab data is stale; last successful data is shown.")).toBeTruthy();
+    expect(
+      await screen.findByText(
+        "Schwab data is stale; last successful data is shown.",
+      ),
+    ).toBeTruthy();
   });
 
   it("keeps saved data visible after a failed refresh", async () => {
@@ -320,21 +441,35 @@ describe("App", () => {
     });
 
     renderApp();
-    fireEvent.click(await screen.findByRole("button", { name: "Refresh portfolio" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Refresh portfolio" }),
+    );
 
-    expect(await screen.findByText(/Refresh failed/)).toBeTruthy();
-    expect(await screen.findByText(/Stale data from/)).toBeTruthy();
-    expect(await screen.findByText("Schwab data is stale; last successful data is shown.")).toBeTruthy();
+    expect(
+      (await screen.findAllByText(/Refresh failed/)).length,
+    ).toBeGreaterThan(0);
+    expect(
+      (await screen.findAllByText(/Stale saved data/)).length,
+    ).toBeGreaterThan(0);
+    expect(
+      await screen.findByText(
+        "Schwab data is stale; last successful data is shown.",
+      ),
+    ).toBeTruthy();
   });
 
   it("shows an empty filtered activity feed", async () => {
     renderApp();
 
-    expect(await screen.findByText("No activity matches these filters.")).toBeTruthy();
+    expect(
+      await screen.findByText("No activity matches these filters."),
+    ).toBeTruthy();
     fireEvent.change(screen.getByLabelText("Activity symbol"), {
       target: { value: "NOT-A-SYMBOL" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Apply activity filters" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Apply activity filters" }),
+    );
 
     await waitFor(() =>
       expect(api.getActivity).toHaveBeenLastCalledWith(
@@ -344,26 +479,31 @@ describe("App", () => {
   });
 
   it("shows populated activity and navigates between pages", async () => {
-    api.getActivity.mockImplementation(({ offset = 0 }) => Promise.resolve({
-      activities: [
-        {
-          id: offset + 1,
-          account: { id: "schwab-taxable-demo", label: "Schwab Taxable ••••4821" },
-          provider: "Schwab",
-          occurred_on: "2026-09-12",
-          occurred_at: "2026-09-12T14:00:00+00:00",
-          type: "TRADE",
-          symbol: offset === 0 ? "VTI" : "VXUS",
-          description: "Fixture trade",
-          quantity: "1",
-          amount: "100",
-          fees: "0",
-          currency: "USD",
-          imported_at: "2026-09-12T14:01:00+00:00",
-        },
-      ],
-      pagination: { limit: 50, offset, total: 51 },
-    }));
+    api.getActivity.mockImplementation(({ offset = 0 }) =>
+      Promise.resolve({
+        activities: [
+          {
+            id: offset + 1,
+            account: {
+              id: "schwab-taxable-demo",
+              label: "Schwab Taxable ••••4821",
+            },
+            provider: "Schwab",
+            occurred_on: "2026-09-12",
+            occurred_at: "2026-09-12T14:00:00+00:00",
+            type: "TRADE",
+            symbol: offset === 0 ? "VTI" : "VXUS",
+            description: "Fixture trade",
+            quantity: "1",
+            amount: "100",
+            fees: "0",
+            currency: "USD",
+            imported_at: "2026-09-12T14:01:00+00:00",
+          },
+        ],
+        pagination: { limit: 50, offset, total: 51 },
+      }),
+    );
 
     renderApp();
 
@@ -372,7 +512,9 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Next activity page" }));
     expect(await screen.findByText(/VXUS/)).toBeTruthy();
     expect(screen.getByText("Showing 51-51 of 51")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Previous activity page" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Previous activity page" }),
+    );
     expect(await screen.findByText(/VTI/)).toBeTruthy();
   });
 
@@ -415,7 +557,7 @@ describe("App", () => {
     fireEvent.change(input, { target: { value: "not-a-symbol" } });
     fireEvent.click(screen.getByRole("button", { name: "Search" }));
 
-    expect(await screen.findByText("No instruments found.")).toBeTruthy();
+    expect(await screen.findByText(/No instruments found\./)).toBeTruthy();
 
     fireEvent.change(input, { target: { value: "unavailable" } });
     fireEvent.click(screen.getByRole("button", { name: "Search" }));
@@ -423,9 +565,14 @@ describe("App", () => {
       await screen.findByRole("button", { name: /FIXTURE_UNAVAILABLE/ }),
     );
 
-    expect(await screen.findByText("Canonical identity: us-fund:FIXTURE_UNAVAILABLE")).toBeTruthy();
-    expect(await screen.findByText("Source: fixture_market_data")).toBeTruthy();
-    expect(await screen.findByText(/Last price: unavailable USD/)).toBeTruthy();
+    const quote = await screen.findByRole("article", {
+      name: "Instrument quote",
+    });
+    expect(quote.textContent).toContain(
+      "Canonical identity: us-fund:FIXTURE_UNAVAILABLE",
+    );
+    expect(quote.textContent).toContain("Source: fixture_market_data");
+    expect(quote.textContent).toContain("unavailable USD");
     expect(await screen.findByText(/Observed:/)).toBeTruthy();
   });
 
@@ -435,6 +582,12 @@ describe("App", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Search" }));
 
-    expect(await screen.findByText("Instrument search is unavailable.")).toBeTruthy();
+    expect(
+      await screen.findByText(/Instrument search is unavailable\./),
+    ).toBeTruthy();
+    api.searchInstruments.mockResolvedValue({ instruments: [] });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    expect(await screen.findByText(/No instruments found\./)).toBeTruthy();
+    expect(api.searchInstruments).toHaveBeenCalledTimes(2);
   });
 });
