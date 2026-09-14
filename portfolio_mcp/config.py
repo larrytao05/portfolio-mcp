@@ -27,3 +27,32 @@ class SnapTradeSettings:
             client_id=source["SNAPTRADE_CLIENT_ID"],
             consumer_key=source["SNAPTRADE_CONSUMER_KEY"],
         )
+
+
+@dataclass(frozen=True)
+class SchwabMarketDataSettings:
+    client_id: str
+    client_secret: str
+    refresh_token: str
+
+    @classmethod
+    def from_environment(
+        cls, environment: Mapping[str, str] | None = None
+    ) -> "SchwabMarketDataSettings":
+        source = os.environ if environment is None else environment
+        required = (
+            "SCHWAB_CLIENT_ID",
+            "SCHWAB_CLIENT_SECRET",
+            "SCHWAB_REFRESH_TOKEN",
+        )
+        missing = [name for name in required if not source.get(name)]
+        if missing:
+            raise ProviderConfigurationError(
+                f"Missing required Schwab configuration: {', '.join(missing)}"
+            )
+
+        return cls(
+            client_id=source["SCHWAB_CLIENT_ID"],
+            client_secret=source["SCHWAB_CLIENT_SECRET"],
+            refresh_token=source["SCHWAB_REFRESH_TOKEN"],
+        )
