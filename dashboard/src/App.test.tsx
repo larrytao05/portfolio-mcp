@@ -19,6 +19,8 @@ const api = vi.hoisted(() => ({
   getAccounts: vi.fn(),
   getHealth: vi.fn(),
   getLatestRefresh: vi.fn(),
+  getOverview: vi.fn(),
+  getOverviewHistory: vi.fn(),
   getQuote: vi.fn(),
   refreshPortfolio: vi.fn(),
   searchInstruments: vi.fn(),
@@ -72,6 +74,28 @@ describe("App", () => {
     api.getLatestRefresh.mockResolvedValue({ refresh: null });
     api.searchInstruments.mockResolvedValue({ instruments: [] });
     api.getQuote.mockResolvedValue({ quote: null });
+    api.getOverview.mockResolvedValue({
+      overview: {
+        total_known_usd_value: null,
+        cash_usd: null,
+        buying_power_usd: null,
+        as_of: null,
+        refreshed_at: null,
+        status: "empty",
+        accounts: [],
+        allocations: {
+          account: { group_by: "account", denominator: "0", slices: [], included_count: 0, excluded_count: 0 },
+          asset_class: { group_by: "asset_class", denominator: "0", slices: [], included_count: 0, excluded_count: 0 },
+        },
+        gain_loss: { unrealized_gain_loss: null, cost_basis: null, market_value: null, included_count: 0, excluded_count: 0 },
+        exclusions: [],
+        warnings: [],
+        history: { points: [], currencies: [] },
+      },
+    });
+    api.getOverviewHistory.mockResolvedValue({
+      history: { points: [], currencies: [] },
+    });
     api.createOrderDraft.mockResolvedValue({ draft: null });
     api.confirmOrderDraft.mockResolvedValue({ order: null });
     api.refreshPortfolio.mockResolvedValue({
@@ -668,5 +692,216 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Search" }));
     expect(await screen.findByText(/No instruments found\./)).toBeTruthy();
     expect(api.searchInstruments).toHaveBeenCalledTimes(2);
+  });
+
+  it("renders fresh overview with total known USD value, asset class allocations, and gain/loss", async () => {
+    api.getOverview.mockResolvedValue({
+      overview: {
+        total_known_usd_value: "125000.50",
+        cash_usd: "25000.50",
+        buying_power_usd: "25000.50",
+        as_of: "2026-09-15",
+        refreshed_at: "2026-09-15T18:00:00Z",
+        status: "fresh",
+        accounts: [
+          {
+            account_id: "schwab-taxable-demo",
+            label: "Schwab Taxable ••••4821",
+            provider: "Schwab",
+            account_type: "taxable_brokerage",
+            currency: "USD",
+            market_value: "125000.50",
+            is_stale: false,
+            percentage_of_total: "1.0000",
+          },
+        ],
+        allocations: {
+          account: {
+            group_by: "account",
+            denominator: "125000.50",
+            slices: [
+              {
+                key: "schwab-taxable-demo",
+                label: "Schwab Taxable ••••4821",
+                amount: "125000.50",
+                percentage: "1.0000",
+                position_count: 10,
+              },
+            ],
+            included_count: 10,
+            excluded_count: 0,
+          },
+          asset_class: {
+            group_by: "asset_class",
+            denominator: "125000.50",
+            slices: [
+              {
+                key: "equity",
+                label: "Equities",
+                amount: "100000.00",
+                percentage: "0.8000",
+                position_count: 8,
+              },
+              {
+                key: "cash",
+                label: "Cash",
+                amount: "25000.50",
+                percentage: "0.2000",
+                position_count: 2,
+              },
+            ],
+            included_count: 10,
+            excluded_count: 0,
+          },
+        },
+        gain_loss: {
+          unrealized_gain_loss: "15000.25",
+          cost_basis: "110000.25",
+          market_value: "125000.50",
+          included_count: 8,
+          excluded_count: 2,
+        },
+        exclusions: [],
+        warnings: [],
+        history: { points: [], currencies: ["USD"] },
+      },
+    });
+
+    renderApp();
+
+    expect((await screen.findAllByText("125,000.50 USD")).length).toBeGreaterThan(0);
+    expect(screen.getByText("fresh", { selector: ".status" })).toBeTruthy();
+    expect(screen.getByText(/As of 2026-09-15/)).toBeTruthy();
+    expect(screen.getByText("Equities")).toBeTruthy();
+    expect(screen.getByText("100,000.00 USD")).toBeTruthy();
+    expect(screen.getByText(/80\.00%/)).toBeTruthy();
+    expect(screen.getByText("15,000.25 USD")).toBeTruthy();
+    expect(screen.getByText("110,000.25 USD")).toBeTruthy();
+    expect(screen.getByText(/8 of 10 positions with cost basis/)).toBeTruthy();
+  });
+
+  it("renders partial/stale overview with warnings and exclusions callout", async () => {
+    api.getOverview.mockResolvedValue({
+      overview: {
+        total_known_usd_value: "50000.00",
+        cash_usd: null,
+        buying_power_usd: null,
+        as_of: "2026-09-15",
+        refreshed_at: "2026-09-15T18:00:00Z",
+        status: "partial",
+        accounts: [],
+        allocations: {
+          account: { group_by: "account", denominator: "50000.00", slices: [], included_count: 1, excluded_count: 2 },
+          asset_class: { group_by: "asset_class", denominator: "50000.00", slices: [], included_count: 1, excluded_count: 2 },
+        },
+        gain_loss: { unrealized_gain_loss: null, cost_basis: null, market_value: null, included_count: 0, excluded_count: 3 },
+        exclusions: [
+          {
+            reason: "unsupported_currency",
+            symbol: "BNS.TO",
+            account_id: "cad-account",
+            details: "Holding in CAD is excluded from USD total",
+          },
+          {
+            reason: "missing_market_value",
+            symbol: "PRIVATE_FUND",
+            account_id: "schwab-taxable-demo",
+            details: "Missing market quote from provider",
+          },
+          {
+            reason: "provider_failed",
+            symbol: null,
+            account_id: "fidelity-demo",
+            details: "Fidelity provider authentication failed",
+          },
+        ],
+        warnings: ["Provider Schwab sync incomplete; previous records retained."],
+        history: { points: [], currencies: ["USD"] },
+      },
+    });
+
+    renderApp();
+
+    expect(await screen.findByText("Provider Schwab sync incomplete; previous records retained.")).toBeTruthy();
+    expect(screen.getByText("partial", { selector: ".status" })).toBeTruthy();
+    expect(screen.getByText("Exclusions & Limitations")).toBeTruthy();
+    expect(screen.getByText(/BNS\.TO/)).toBeTruthy();
+    expect(screen.getByText(/Holding in CAD is excluded from USD total/)).toBeTruthy();
+    expect(screen.getByText(/PRIVATE_FUND/)).toBeTruthy();
+    expect(screen.getByText(/Missing market quote from provider/)).toBeTruthy();
+    expect(screen.getByText(/Fidelity provider authentication failed/)).toBeTruthy();
+  });
+
+  it("renders empty overview state gracefully", async () => {
+    api.getOverview.mockResolvedValue({
+      overview: {
+        total_known_usd_value: null,
+        cash_usd: null,
+        buying_power_usd: null,
+        as_of: null,
+        refreshed_at: null,
+        status: "empty",
+        accounts: [],
+        allocations: {
+          account: { group_by: "account", denominator: "0", slices: [], included_count: 0, excluded_count: 0 },
+          asset_class: { group_by: "asset_class", denominator: "0", slices: [], included_count: 0, excluded_count: 0 },
+        },
+        gain_loss: { unrealized_gain_loss: null, cost_basis: null, market_value: null, included_count: 0, excluded_count: 0 },
+        exclusions: [],
+        warnings: [],
+        history: { points: [], currencies: [] },
+      },
+    });
+
+    renderApp();
+
+    expect(await screen.findByText(/No accounts refreshed yet/)).toBeTruthy();
+  });
+
+  it("renders recorded daily history preserving date gaps", async () => {
+    api.getOverview.mockResolvedValue({
+      overview: {
+        total_known_usd_value: "10500.00",
+        cash_usd: null,
+        buying_power_usd: null,
+        as_of: "2026-09-14",
+        refreshed_at: "2026-09-14T18:00:00Z",
+        status: "fresh",
+        accounts: [],
+        allocations: {
+          account: { group_by: "account", denominator: "10500.00", slices: [], included_count: 2, excluded_count: 0 },
+          asset_class: { group_by: "asset_class", denominator: "10500.00", slices: [], included_count: 2, excluded_count: 0 },
+        },
+        gain_loss: { unrealized_gain_loss: null, cost_basis: null, market_value: null, included_count: 0, excluded_count: 0 },
+        exclusions: [],
+        warnings: [],
+        history: {
+          points: [
+            {
+              snapshot_date: "2026-09-10",
+              value: "10000.00",
+              currency: "USD",
+              accounts_count: 2,
+            },
+            {
+              snapshot_date: "2026-09-14",
+              value: "10500.00",
+              currency: "USD",
+              accounts_count: 2,
+            },
+          ],
+          currencies: ["USD"],
+        },
+      },
+    });
+
+    renderApp();
+
+    expect(await screen.findByText("Recorded Value History (Not Investment Return)")).toBeTruthy();
+    expect(screen.getByText("2026-09-10")).toBeTruthy();
+    expect(screen.getByText("10,000.00 USD")).toBeTruthy();
+    expect(screen.getByText("2026-09-14")).toBeTruthy();
+    expect(screen.getAllByText("10,500.00 USD").length).toBeGreaterThan(0);
+    expect(screen.getByText(/Gap in recorded history/)).toBeTruthy();
   });
 });
