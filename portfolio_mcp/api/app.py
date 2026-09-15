@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from portfolio_mcp.database import PortfolioRepository
 from portfolio_mcp.execution import ExecutionProvider, FixtureExecutionProvider
 from portfolio_mcp.fixtures import FixtureMarketDataProvider
+from portfolio_mcp.overview import OverviewService
 from portfolio_mcp.provider import (
     InstrumentNotFoundError,
     MarketDataProvider,
@@ -67,6 +68,7 @@ def create_app(
     submission_service = OrderSubmissionService(
         repository, execution, service_clock, validator
     )
+    overview_service = OverviewService(repository)
     app = FastAPI(title="Portfolio Dashboard API")
     app.add_middleware(
         CORSMiddleware,
@@ -78,6 +80,16 @@ def create_app(
     @app.get("/api/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/api/overview")
+    async def get_overview() -> dict[str, object]:
+        overview = overview_service.get_overview()
+        return {"overview": overview.to_dict()}
+
+    @app.get("/api/overview/history")
+    async def get_overview_history() -> dict[str, object]:
+        history = overview_service.get_history()
+        return {"history": history.to_dict()}
 
     @app.get("/api/accounts")
     async def list_accounts() -> dict[str, list[dict[str, str | bool]]]:
