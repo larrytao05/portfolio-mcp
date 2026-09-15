@@ -1,12 +1,14 @@
 from collections.abc import Callable
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from portfolio_mcp.database import PortfolioRepository
+from portfolio_mcp.execution import ExecutionProvider, FixtureExecutionProvider
 from portfolio_mcp.fixtures import FixtureMarketDataProvider
 from portfolio_mcp.provider import (
     InstrumentNotFoundError,
@@ -15,18 +17,56 @@ from portfolio_mcp.provider import (
     ProviderError,
 )
 from portfolio_mcp.refresh import PortfolioRefreshService
+from portfolio_mcp.trading_service import (
+    OrderDraftService,
+    OrderSubmissionService,
+    SubmissionValidator,
+    TradingValidationError,
+    fixture_submission_validator,
+)
+
+
+class CreateOrderDraftRequest(BaseModel):
+    account_id: str
+    instrument_id: str
+    side: str
+    order_type: str
+    quantity: str
+    limit_price: str | None = None
+
+
+class ConfirmOrderDraftRequest(BaseModel):
+    expected_fingerprint: str
+    confirmed: bool
 
 
 def create_app(
     provider: PortfolioProvider,
     *,
     market_data_provider: MarketDataProvider | None = None,
+    execution_provider: ExecutionProvider | None = None,
+    submission_validator: SubmissionValidator | None = None,
     database_url: str = "sqlite:///portfolio.db",
     clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
     repository = PortfolioRepository(database_url)
     refresh_service = PortfolioRefreshService(provider, repository, clock)
     market_data = market_data_provider or FixtureMarketDataProvider()
+    service_clock = clock or (lambda: datetime.now(UTC))
+    execution = (
+        execution_provider
+        if execution_provider is not None
+        else FixtureExecutionProvider()
+    )
+    validator = submission_validator
+    if validator is None:
+        if type(execution) is not FixtureExecutionProvider:
+            raise ValueError("A final trading policy validator is required")
+        validator = fixture_submission_validator(provider)
+    draft_service = OrderDraftService(repository, provider, market_data, service_clock)
+    submission_service = OrderSubmissionService(
+        repository, execution, service_clock, validator
+    )
     app = FastAPI(title="Portfolio Dashboard API")
     app.add_middleware(
         CORSMiddleware,
@@ -110,6 +150,34 @@ def create_app(
         quote = await market_data.get_quote(instrument_id)
         return {"quote": quote.to_dict()}
 
+    @app.post("/api/order-drafts")
+    async def create_order_draft(request: CreateOrderDraftRequest) -> dict[str, object]:
+        draft = await draft_service.create(**request.model_dump())
+        return {"draft": draft.to_dict()}
+
+    @app.get("/api/order-drafts/{draft_id}")
+    async def get_order_draft(draft_id: str) -> dict[str, object]:
+        draft = repository.order_draft(draft_id)
+        if draft is None:
+            raise HTTPException(status_code=404, detail="Order draft not found")
+        return {"draft": draft.to_dict()}
+
+    @app.post("/api/order-drafts/{draft_id}/confirm")
+    async def confirm_order_draft(
+        draft_id: str, request: ConfirmOrderDraftRequest
+    ) -> dict[str, object]:
+        order = await submission_service.confirm(
+            draft_id, request.expected_fingerprint, request.confirmed
+        )
+        return {"order": order.to_dict()}
+
+    @app.get("/api/orders/{order_id}")
+    async def get_order(order_id: str) -> dict[str, object]:
+        order = repository.order(order_id)
+        if order is None:
+            raise HTTPException(status_code=404, detail="Order not found")
+        return {"order": order.to_dict()}
+
     @app.post("/api/refresh")
     async def refresh_portfolio() -> dict[str, dict[str, object]]:
         result = await refresh_service.refresh()
@@ -129,6 +197,15 @@ def create_app(
         return JSONResponse(
             status_code=502,
             content={"error": {"code": "provider_error", "message": str(error)}},
+        )
+
+    @app.exception_handler(TradingValidationError)
+    async def trading_validation_error(
+        _: Request, error: TradingValidationError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content={"error": {"code": error.code, "message": str(error)}},
         )
 
     return app
