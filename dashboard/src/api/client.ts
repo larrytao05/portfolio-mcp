@@ -140,6 +140,88 @@ export type Order = {
   result: { code: string | null; message: string | null };
 };
 
+export type OverviewAccountContribution = {
+  account_id: string;
+  label: string;
+  provider: string;
+  account_type: string;
+  currency: string;
+  market_value: string | null;
+  is_stale: boolean;
+  percentage_of_total: string | null;
+};
+
+export type AllocationSlice = {
+  key: string;
+  label: string;
+  amount: string;
+  percentage: string;
+  position_count: number;
+};
+
+export type AllocationGroup = {
+  group_by: string;
+  denominator: string;
+  slices: AllocationSlice[];
+  included_count: number;
+  excluded_count: number;
+};
+
+export type GainLossCoverage = {
+  unrealized_gain_loss: string | null;
+  cost_basis: string | null;
+  market_value: string | null;
+  included_count: number;
+  excluded_count: number;
+};
+
+export type OverviewExclusion = {
+  reason: string;
+  symbol: string | null;
+  account_id: string | null;
+  details: string;
+};
+
+export type DailyRecordedPoint = {
+  snapshot_date: string;
+  value: string;
+  currency: string;
+  accounts_count: number;
+};
+
+export type RecordedHistory = {
+  points: DailyRecordedPoint[];
+  currencies: string[];
+};
+
+export type PortfolioOverview = {
+  total_known_usd_value: string | null;
+  cash_usd?: string | null;
+  buying_power_usd?: string | null;
+  as_of: string | null;
+  refreshed_at: string | null;
+  status: "fresh" | "stale" | "partial" | "empty" | string;
+  accounts: OverviewAccountContribution[];
+  allocations: {
+    account?: AllocationGroup;
+    asset_class?: AllocationGroup;
+    [key: string]: AllocationGroup | undefined;
+  };
+  gain_loss: GainLossCoverage;
+  exclusions: OverviewExclusion[];
+  warnings: string[];
+  history: RecordedHistory;
+};
+
+export type OverviewResponse = {
+  overview: PortfolioOverview;
+};
+
+export type HistoryResponse = {
+  history: RecordedHistory | DailyRecordedPoint[];
+};
+
+
 async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.ok) {
@@ -219,4 +301,12 @@ export function confirmOrderDraft(
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ expected_fingerprint: expectedFingerprint, confirmed: true }),
   });
+}
+
+export function getOverview(): Promise<OverviewResponse> {
+  return getJson("/api/overview");
+}
+
+export function getOverviewHistory(): Promise<HistoryResponse> {
+  return getJson("/api/overview/history");
 }
