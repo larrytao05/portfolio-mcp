@@ -108,6 +108,38 @@ export type Quote = {
   currency: string | null;
 };
 
+export type OrderDraft = {
+  id: string;
+  account: { id: string; label: string; provider: string };
+  instrument: { id: string; symbol: string; name: string; asset_class: string };
+  instruction: {
+    side: string;
+    type: string;
+    quantity: string;
+    limit_price: string | null;
+    time_in_force: string;
+  };
+  quote: {
+    observed_at: string | null;
+    last_price: string | null;
+    bid_price: string | null;
+    ask_price: string | null;
+    source: string | null;
+  };
+  warnings: string[];
+  fingerprint: string;
+  created_at: string;
+  expires_at: string;
+};
+
+export type Order = {
+  id: string;
+  draft_id: string;
+  fingerprint: string;
+  state: "ACCEPTED" | "REJECTED" | "UNKNOWN" | string;
+  result: { code: string | null; message: string | null };
+};
+
 async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.ok) {
@@ -161,4 +193,30 @@ export function searchInstruments(query: string): Promise<{ instruments: Instrum
 
 export function getQuote(instrumentId: string): Promise<{ quote: Quote }> {
   return getJson(`/api/instruments/${encodeURIComponent(instrumentId)}/quote`);
+}
+
+export function createOrderDraft(input: {
+  account_id: string;
+  instrument_id: string;
+  side: string;
+  order_type: string;
+  quantity: string;
+  limit_price?: string | null;
+}): Promise<{ draft: OrderDraft }> {
+  return getJson("/api/order-drafts", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export function confirmOrderDraft(
+  draftId: string,
+  expectedFingerprint: string,
+): Promise<{ order: Order }> {
+  return getJson(`/api/order-drafts/${encodeURIComponent(draftId)}/confirm`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ expected_fingerprint: expectedFingerprint, confirmed: true }),
+  });
 }

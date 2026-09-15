@@ -15,10 +15,14 @@ import {
   getHealth,
   getLatestRefresh,
   getQuote,
+  confirmOrderDraft,
+  createOrderDraft,
   refreshPortfolio,
   searchInstruments,
   type Account,
   type ActivityFilters,
+  type Order,
+  type OrderDraft,
 } from "./api/client";
 
 type SortField =
@@ -678,6 +682,7 @@ function Navigation() {
         ["accounts", "Accounts"],
         ["activity", "Activity"],
         ["market-data", "Market data"],
+        ["trade", "Trade"],
       ].map(([id, label]) => (
         <a
           key={id}
@@ -688,6 +693,145 @@ function Navigation() {
         </a>
       ))}
     </nav>
+  );
+}
+
+function outcomeMessage(order: Order | null): string | null {
+  if (order === null) return null;
+  if (order.state === "UNKNOWN") {
+    return "The outcome is unknown. Reconciliation is required; do not resubmit.";
+  }
+  if (order.state === "REJECTED") {
+    return "Fake execution rejected the order. Review the result before creating a new draft.";
+  }
+  if (order.state === "ACCEPTED") {
+    return "Fake execution accepted the order.";
+  }
+  if (order.state === "PARTIALLY_FILLED") {
+    return "Fake execution partially filled the order. Monitor the remaining quantity.";
+  }
+  if (order.state === "FILLED") {
+    return "Fake execution filled the order.";
+  }
+  return null;
+}
+
+function TradeSection({ accounts }: { accounts: Account[] }) {
+  const [draft, setDraft] = useState<OrderDraft | null>(null);
+  const [order, setOrder] = useState<Order | null>(null);
+  const [form, setForm] = useState({
+    account_id: "",
+    instrument_id: "us-etf:VTI",
+    side: "buy",
+    order_type: "limit",
+    quantity: "1",
+    limit_price: "333.33",
+  });
+  const createDraft = useMutation({
+    mutationFn: createOrderDraft,
+    onSuccess: ({ draft: nextDraft }) => {
+      setDraft(nextDraft);
+      setOrder(null);
+    },
+  });
+  const confirm = useMutation({
+    mutationFn: () =>
+      draft === null
+        ? Promise.reject(new Error("No draft to confirm"))
+        : confirmOrderDraft(draft.id, draft.fingerprint),
+    onSuccess: ({ order: nextOrder }) => setOrder(nextOrder),
+  });
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    createDraft.mutate({
+      ...form,
+      limit_price: form.order_type === "limit" ? form.limit_price : null,
+    });
+  }
+  const outcome = outcomeMessage(order);
+  return (
+    <section className="content-section" id="trade" aria-labelledby="trade-heading">
+      <div className="section-heading">
+        <div>
+          <h2 id="trade-heading">Trade review</h2>
+          <p className="muted">Orders use the offline fake execution provider.</p>
+        </div>
+      </div>
+      <form className="filter-bar" onSubmit={submit}>
+        <label>
+          Account
+          <select
+            aria-label="Trade account"
+            required
+            value={form.account_id}
+            onChange={(event) => setForm({ ...form, account_id: event.target.value })}
+          >
+            <option value="">Select an account</option>
+            {accounts.map((account) => (
+              <option key={account.id} value={account.id}>{account.label}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Canonical instrument ID
+          <input aria-label="Canonical instrument ID" value={form.instrument_id} onChange={(event) => setForm({ ...form, instrument_id: event.target.value })} required />
+        </label>
+        <label>
+          Side
+          <select aria-label="Trade side" value={form.side} onChange={(event) => setForm({ ...form, side: event.target.value })}>
+            <option value="buy">Buy</option>
+            <option value="sell">Sell</option>
+          </select>
+        </label>
+        <label>
+          Type
+          <select aria-label="Trade type" value={form.order_type} onChange={(event) => setForm({ ...form, order_type: event.target.value })}>
+            <option value="limit">Limit</option>
+            <option value="market">Market</option>
+          </select>
+        </label>
+        <label>
+          Whole shares
+          <input aria-label="Trade quantity" inputMode="decimal" value={form.quantity} onChange={(event) => setForm({ ...form, quantity: event.target.value })} required />
+        </label>
+        {form.order_type === "limit" && (
+          <label>
+            Limit price
+            <input aria-label="Limit price" inputMode="decimal" value={form.limit_price} onChange={(event) => setForm({ ...form, limit_price: event.target.value })} required />
+          </label>
+        )}
+        <button type="submit" disabled={createDraft.isPending || accounts.length === 0}>
+          {createDraft.isPending ? "Creating draft…" : "Review fake order"}
+        </button>
+      </form>
+      {createDraft.isError && <p className="inline-alert" role="alert">Unable to create a safe order draft.</p>}
+      {draft !== null && (
+        <article className="quote-card" aria-label="Order review">
+          <div>
+            <h3>Confirm fake order</h3>
+            <p>
+              Fake execution provider · {draft.account.label} · {draft.instruction.side.toUpperCase()} {draft.instruction.quantity} {draft.instruction.type.toUpperCase()} · {draft.instruction.limit_price ?? "market price"}
+            </p>
+            <dl>
+              <div><dt>Instrument</dt><dd>{draft.instrument.name} ({draft.instrument.symbol})</dd></div>
+              <div><dt>Canonical instrument ID</dt><dd>{draft.instrument.id}</dd></div>
+              <div><dt>Time in force</dt><dd>{draft.instruction.time_in_force.toUpperCase()}</dd></div>
+              <div><dt>Quote</dt><dd>Last {draft.quote.last_price ?? "unavailable"} · Bid {draft.quote.bid_price ?? "unavailable"} · Ask {draft.quote.ask_price ?? "unavailable"}</dd></div>
+              <div><dt>Quote source</dt><dd>{draft.quote.source ?? "unavailable"}</dd></div>
+              <div><dt>Quote observed</dt><dd>{draft.quote.observed_at === null ? "unavailable" : new Date(draft.quote.observed_at).toLocaleString()}</dd></div>
+              <div><dt>Expires</dt><dd>{new Date(draft.expires_at).toLocaleString()}</dd></div>
+              <div><dt>Fingerprint</dt><dd>{draft.fingerprint}</dd></div>
+            </dl>
+            {draft.warnings.length > 0 && <p>Warnings: {draft.warnings.join(", ")}</p>}
+          </div>
+          <button type="button" disabled={confirm.isPending || order !== null} onClick={() => confirm.mutate()}>
+            {confirm.isPending ? "Confirming…" : "Confirm fake order"}
+          </button>
+        </article>
+      )}
+      {confirm.isError && <p className="inline-alert" role="alert">Confirmation was not accepted. Create a new draft if it expired or changed.</p>}
+      {outcome !== null && <p className={order?.state === "UNKNOWN" ? "inline-alert" : "state"} role="status">{outcome}</p>}
+    </section>
   );
 }
 
@@ -859,6 +1003,7 @@ export function App() {
         </div>
         <ActivitySection accounts={accounts.data?.accounts ?? []} />
         <MarketDataSection />
+        <TradeSection accounts={accounts.data?.accounts ?? []} />
       </main>
     </div>
   );

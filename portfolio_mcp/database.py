@@ -1,7 +1,9 @@
+import json
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
+from uuid import uuid4
 
 from alembic.config import Config
 from sqlalchemy import (
@@ -16,10 +18,12 @@ from sqlalchemy import (
     select,
 )
 from sqlalchemy.engine import Engine, create_engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sqlalchemy.types import TypeDecorator
 
 from alembic import command
+from portfolio_mcp.execution import OrderState, require_transition
 from portfolio_mcp.models import Account, HoldingsSnapshot, Position, Transaction
 
 
@@ -144,6 +148,75 @@ class ActivityRecord(Base):
     fees: Mapped[Decimal] = mapped_column(ExactDecimal(), nullable=False)
     currency: Mapped[str] = mapped_column(String(8), nullable=False)
     imported_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+
+
+class OrderDraftRecord(Base):
+    __tablename__ = "order_drafts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    account_label: Mapped[str] = mapped_column(String(256), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    instrument_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    instrument_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    asset_class: Mapped[str] = mapped_column(String(64), nullable=False)
+    side: Mapped[str] = mapped_column(String(8), nullable=False)
+    order_type: Mapped[str] = mapped_column(String(8), nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(ExactDecimal(), nullable=False)
+    limit_price: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    quote_observed_at: Mapped[datetime | None] = mapped_column(UtcTimestamp())
+    quote_last_price: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    quote_bid_price: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    quote_ask_price: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    quote_source: Mapped[str | None] = mapped_column(String(64))
+    warnings: Mapped[str] = mapped_column(Text, nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+
+
+class OrderRecord(Base):
+    __tablename__ = "orders"
+    __table_args__ = (
+        UniqueConstraint("draft_id"),
+        UniqueConstraint("client_order_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    draft_id: Mapped[str] = mapped_column(ForeignKey("order_drafts.id"), nullable=False)
+    client_order_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    account_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    account_label: Mapped[str] = mapped_column(String(256), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    instrument_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    side: Mapped[str] = mapped_column(String(8), nullable=False)
+    order_type: Mapped[str] = mapped_column(String(8), nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(ExactDecimal(), nullable=False)
+    limit_price: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    broker_order_id: Mapped[str | None] = mapped_column(String(128))
+    result_code: Mapped[str | None] = mapped_column(String(64))
+    result_message: Mapped[str | None] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+
+class OrderAuthorizationRecord(Base):
+    __tablename__ = "order_authorizations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    draft_id: Mapped[str] = mapped_column(ForeignKey("order_drafts.id"), nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    expected_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    account_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    actor: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+    consumed_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
 
 
 @dataclass(frozen=True)
@@ -321,6 +394,172 @@ class PortfolioRepository:
         self._sessions = sessionmaker(
             create_engine_for(database_url), expire_on_commit=False
         )
+
+    def save_order_draft(self, draft: "OrderDraft") -> None:
+        with self._sessions.begin() as session:
+            session.add(
+                OrderDraftRecord(
+                    id=draft.id,
+                    account_id=draft.account_id,
+                    account_label=draft.account_label,
+                    provider=draft.provider,
+                    instrument_id=draft.instrument_id,
+                    symbol=draft.symbol,
+                    instrument_name=draft.instrument_name,
+                    asset_class=draft.asset_class,
+                    side=draft.side,
+                    order_type=draft.order_type,
+                    quantity=draft.quantity,
+                    limit_price=draft.limit_price,
+                    quote_observed_at=draft.quote_observed_at,
+                    quote_last_price=draft.quote_last_price,
+                    quote_bid_price=draft.quote_bid_price,
+                    quote_ask_price=draft.quote_ask_price,
+                    quote_source=draft.quote_source,
+                    warnings=json.dumps(draft.warnings),
+                    fingerprint=draft.fingerprint,
+                    created_at=draft.created_at,
+                    expires_at=draft.expires_at,
+                )
+            )
+
+    def order_draft(self, draft_id: str) -> "OrderDraft | None":
+        with self._sessions() as session:
+            record = session.get(OrderDraftRecord, draft_id)
+            return self._order_draft(record) if record is not None else None
+
+    def begin_order_submission(
+        self, draft: "OrderDraft", now: datetime
+    ) -> tuple["StoredOrder", bool]:
+        order_id = str(uuid4())
+        client_order_id = str(uuid4())
+        try:
+            with self._sessions.begin() as session:
+                existing = session.scalar(
+                    select(OrderRecord).where(OrderRecord.draft_id == draft.id)
+                )
+                if existing is not None:
+                    return self._stored_order(existing), False
+                session.add(
+                    OrderAuthorizationRecord(
+                        id=str(uuid4()),
+                        draft_id=draft.id,
+                        action="submit",
+                        expected_fingerprint=draft.fingerprint,
+                        account_id=draft.account_id,
+                        actor="dashboard-owner",
+                        created_at=now,
+                        expires_at=draft.expires_at,
+                        consumed_at=now,
+                    )
+                )
+                record = OrderRecord(
+                    id=order_id,
+                    draft_id=draft.id,
+                    client_order_id=client_order_id,
+                    fingerprint=draft.fingerprint,
+                    account_id=draft.account_id,
+                    account_label=draft.account_label,
+                    provider=draft.provider,
+                    instrument_id=draft.instrument_id,
+                    symbol=draft.symbol,
+                    side=draft.side,
+                    order_type=draft.order_type,
+                    quantity=draft.quantity,
+                    limit_price=draft.limit_price,
+                    state=OrderState.SUBMITTING,
+                    created_at=now,
+                    updated_at=now,
+                    version=1,
+                )
+                session.add(record)
+                session.flush()
+                return self._stored_order(record), True
+        except IntegrityError:
+            with self._sessions() as session:
+                existing = session.scalar(
+                    select(OrderRecord).where(OrderRecord.draft_id == draft.id)
+                )
+                if existing is None:
+                    raise
+                return self._stored_order(existing), False
+
+    def order(self, order_id: str) -> "StoredOrder | None":
+        with self._sessions() as session:
+            record = session.get(OrderRecord, order_id)
+            return self._stored_order(record) if record is not None else None
+
+    def order_for_draft(self, draft_id: str) -> "StoredOrder | None":
+        with self._sessions() as session:
+            record = session.scalar(
+                select(OrderRecord).where(OrderRecord.draft_id == draft_id)
+            )
+            return self._stored_order(record) if record is not None else None
+
+    def authorization_for_draft(
+        self, draft_id: str
+    ) -> "StoredOrderAuthorization | None":
+        with self._sessions() as session:
+            record = session.scalar(
+                select(OrderAuthorizationRecord)
+                .where(OrderAuthorizationRecord.draft_id == draft_id)
+                .order_by(OrderAuthorizationRecord.created_at.desc())
+            )
+            return self._stored_authorization(record) if record is not None else None
+
+    def recover_stranded_submissions(self, now: datetime) -> int:
+        with self._sessions.begin() as session:
+            records = list(
+                session.scalars(
+                    select(OrderRecord).where(
+                        OrderRecord.state == OrderState.SUBMITTING
+                    )
+                )
+            )
+            for record in records:
+                record.state = OrderState.UNKNOWN
+                record.result_code = "unknown"
+                record.result_message = (
+                    "Order outcome is unknown. Reconciliation is required."
+                )
+                record.updated_at = now
+                record.version += 1
+            return len(records)
+
+    def has_stranded_submissions(self) -> bool:
+        with self._sessions() as session:
+            return (
+                session.scalar(
+                    select(OrderRecord.id)
+                    .where(OrderRecord.state == OrderState.SUBMITTING)
+                    .limit(1)
+                )
+                is not None
+            )
+
+    def finish_order_submission(
+        self,
+        order_id: str,
+        state: OrderState,
+        now: datetime,
+        *,
+        broker_order_id: str | None = None,
+        result_code: str | None = None,
+        result_message: str | None = None,
+    ) -> "StoredOrder":
+        with self._sessions.begin() as session:
+            record = session.get(OrderRecord, order_id)
+            if record is None:
+                raise ValueError("Order not found")
+            require_transition(OrderState(record.state), state)
+            record.state = state
+            record.broker_order_id = broker_order_id
+            record.result_code = result_code
+            record.result_message = result_message
+            record.updated_at = now
+            record.version += 1
+            session.flush()
+            return self._stored_order(record)
 
     def list_accounts(self) -> list[StoredAccount]:
         with self._sessions() as session:
@@ -520,6 +759,70 @@ class PortfolioRepository:
             return [
                 self._activity(activity, account) for activity, account in records
             ], total
+
+    def _order_draft(self, record: OrderDraftRecord) -> "OrderDraft":
+        return OrderDraft(
+            id=record.id,
+            account_id=record.account_id,
+            account_label=record.account_label,
+            provider=record.provider,
+            instrument_id=record.instrument_id,
+            symbol=record.symbol,
+            instrument_name=record.instrument_name,
+            asset_class=record.asset_class,
+            side=record.side,
+            order_type=record.order_type,
+            quantity=record.quantity,
+            limit_price=record.limit_price,
+            quote_observed_at=record.quote_observed_at,
+            quote_last_price=record.quote_last_price,
+            quote_bid_price=record.quote_bid_price,
+            quote_ask_price=record.quote_ask_price,
+            quote_source=record.quote_source,
+            warnings=tuple(json.loads(record.warnings)),
+            fingerprint=record.fingerprint,
+            created_at=record.created_at,
+            expires_at=record.expires_at,
+        )
+
+    def _stored_order(self, record: OrderRecord) -> "StoredOrder":
+        return StoredOrder(
+            id=record.id,
+            draft_id=record.draft_id,
+            client_order_id=record.client_order_id,
+            fingerprint=record.fingerprint,
+            account_id=record.account_id,
+            account_label=record.account_label,
+            provider=record.provider,
+            instrument_id=record.instrument_id,
+            symbol=record.symbol,
+            side=record.side,
+            order_type=record.order_type,
+            quantity=record.quantity,
+            limit_price=record.limit_price,
+            state=OrderState(record.state),
+            broker_order_id=record.broker_order_id,
+            result_code=record.result_code,
+            result_message=record.result_message,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+            version=record.version,
+        )
+
+    def _stored_authorization(
+        self, record: OrderAuthorizationRecord
+    ) -> "StoredOrderAuthorization":
+        return StoredOrderAuthorization(
+            id=record.id,
+            draft_id=record.draft_id,
+            action=record.action,
+            expected_fingerprint=record.expected_fingerprint,
+            account_id=record.account_id,
+            actor=record.actor,
+            created_at=record.created_at,
+            expires_at=record.expires_at,
+            consumed_at=record.consumed_at,
+        )
 
     def _save_snapshot(
         self,
@@ -862,3 +1165,145 @@ class Activity:
             "currency": self.currency,
             "imported_at": self.imported_at.isoformat(),
         }
+
+
+@dataclass(frozen=True)
+class OrderDraft:
+    id: str
+    account_id: str
+    account_label: str
+    provider: str
+    instrument_id: str
+    symbol: str
+    instrument_name: str
+    asset_class: str
+    side: str
+    order_type: str
+    quantity: Decimal
+    limit_price: Decimal | None
+    quote_observed_at: datetime | None
+    quote_last_price: Decimal | None
+    quote_bid_price: Decimal | None
+    quote_ask_price: Decimal | None
+    quote_source: str | None
+    warnings: tuple[str, ...]
+    fingerprint: str
+    created_at: datetime
+    expires_at: datetime
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "account": {
+                "id": self.account_id,
+                "label": self.account_label,
+                "provider": self.provider,
+            },
+            "instrument": {
+                "id": self.instrument_id,
+                "symbol": self.symbol,
+                "name": self.instrument_name,
+                "asset_class": self.asset_class,
+            },
+            "instruction": {
+                "side": self.side,
+                "type": self.order_type,
+                "quantity": str(self.quantity),
+                "limit_price": (
+                    str(self.limit_price) if self.limit_price is not None else None
+                ),
+                "time_in_force": "day",
+            },
+            "quote": {
+                "observed_at": (
+                    self.quote_observed_at.isoformat()
+                    if self.quote_observed_at is not None
+                    else None
+                ),
+                "last_price": (
+                    str(self.quote_last_price)
+                    if self.quote_last_price is not None
+                    else None
+                ),
+                "bid_price": (
+                    str(self.quote_bid_price)
+                    if self.quote_bid_price is not None
+                    else None
+                ),
+                "ask_price": (
+                    str(self.quote_ask_price)
+                    if self.quote_ask_price is not None
+                    else None
+                ),
+                "source": self.quote_source,
+            },
+            "warnings": list(self.warnings),
+            "fingerprint": self.fingerprint,
+            "created_at": self.created_at.isoformat(),
+            "expires_at": self.expires_at.isoformat(),
+        }
+
+
+@dataclass(frozen=True)
+class StoredOrder:
+    id: str
+    draft_id: str
+    client_order_id: str
+    fingerprint: str
+    account_id: str
+    account_label: str
+    provider: str
+    instrument_id: str
+    symbol: str
+    side: str
+    order_type: str
+    quantity: Decimal
+    limit_price: Decimal | None
+    state: OrderState
+    broker_order_id: str | None
+    result_code: str | None
+    result_message: str | None
+    created_at: datetime
+    updated_at: datetime
+    version: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "draft_id": self.draft_id,
+            "fingerprint": self.fingerprint,
+            "account": {"id": self.account_id, "label": self.account_label},
+            "provider": self.provider,
+            "instrument": {"id": self.instrument_id, "symbol": self.symbol},
+            "instruction": {
+                "side": self.side,
+                "type": self.order_type,
+                "quantity": str(self.quantity),
+                "limit_price": (
+                    str(self.limit_price) if self.limit_price is not None else None
+                ),
+                "time_in_force": "day",
+            },
+            "state": self.state,
+            "broker_order_id": self.broker_order_id,
+            "result": {
+                "code": self.result_code,
+                "message": self.result_message,
+            },
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "version": self.version,
+        }
+
+
+@dataclass(frozen=True)
+class StoredOrderAuthorization:
+    id: str
+    draft_id: str
+    action: str
+    expected_fingerprint: str
+    account_id: str
+    actor: str
+    created_at: datetime
+    expires_at: datetime
+    consumed_at: datetime

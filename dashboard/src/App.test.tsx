@@ -12,6 +12,8 @@ import { App } from "./App";
 import type { Position } from "./api/client";
 
 const api = vi.hoisted(() => ({
+  confirmOrderDraft: vi.fn(),
+  createOrderDraft: vi.fn(),
   getAccount: vi.fn(),
   getActivity: vi.fn(),
   getAccounts: vi.fn(),
@@ -70,6 +72,8 @@ describe("App", () => {
     api.getLatestRefresh.mockResolvedValue({ refresh: null });
     api.searchInstruments.mockResolvedValue({ instruments: [] });
     api.getQuote.mockResolvedValue({ quote: null });
+    api.createOrderDraft.mockResolvedValue({ draft: null });
+    api.confirmOrderDraft.mockResolvedValue({ order: null });
     api.refreshPortfolio.mockResolvedValue({
       refresh: {
         id: 1,
@@ -98,6 +102,81 @@ describe("App", () => {
     expect(
       await screen.findByText(/Saved 2 accounts and 9 positions/),
     ).toBeTruthy();
+  });
+
+  it.each([
+    ["UNKNOWN", /Reconciliation is required/],
+    ["PARTIALLY_FILLED", /partially filled the order/],
+    ["FILLED", /filled the order/],
+  ])("reviews and confirms a fake order with %s outcome", async (state, message) => {
+    api.getAccounts.mockResolvedValue({
+      accounts: [
+        {
+          ...savedAccount().account,
+          is_stale: false,
+          source_refreshed_at: new Date().toISOString(),
+        },
+      ],
+    });
+    api.createOrderDraft.mockResolvedValue({
+      draft: {
+        id: "draft-1",
+        account: {
+          id: "schwab-taxable-demo",
+          label: "Schwab Taxable ••••4821",
+          provider: "Schwab",
+        },
+        instrument: {
+          id: "us-etf:VTI",
+          symbol: "VTI",
+          name: "Vanguard Total Stock Market ETF",
+          asset_class: "equity_etf",
+        },
+        instruction: {
+          side: "buy",
+          type: "limit",
+          quantity: "1",
+          limit_price: "333.33",
+          time_in_force: "day",
+        },
+        quote: { observed_at: null, last_price: null, bid_price: null, ask_price: null, source: null },
+        warnings: ["preview_unavailable", "impact_unavailable"],
+        fingerprint: "safe-fingerprint",
+        created_at: "2026-09-12T20:00:00Z",
+        expires_at: "2026-09-12T20:05:00Z",
+      },
+    });
+    api.confirmOrderDraft.mockResolvedValue({
+      order: {
+        id: "order-1",
+        draft_id: "draft-1",
+        fingerprint: "safe-fingerprint",
+        state,
+        result: { code: state.toLowerCase(), message: state },
+      },
+    });
+    renderApp();
+
+    await waitFor(() =>
+      expect(
+        screen.getAllByRole("option", { name: "Schwab Taxable ••••4821" }),
+      ).toHaveLength(2),
+    );
+    fireEvent.change(await screen.findByLabelText("Trade account"), {
+      target: { value: "schwab-taxable-demo" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review fake order" }));
+    await waitFor(() => expect(api.createOrderDraft).toHaveBeenCalledOnce());
+    expect(await screen.findByRole("button", { name: "Confirm fake order" })).toBeTruthy();
+    expect(screen.getAllByText("Canonical instrument ID")).toHaveLength(2);
+    expect(screen.getByText("us-etf:VTI")).toBeTruthy();
+    expect(screen.getByText("Time in force")).toBeTruthy();
+    expect(screen.getByText(/Fake execution provider/)).toBeTruthy();
+    expect(screen.getByText(/preview_unavailable/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm fake order" }));
+    await waitFor(() => expect(api.confirmOrderDraft).toHaveBeenCalledWith("draft-1", "safe-fingerprint"));
+    expect(await screen.findByText(message)).toBeTruthy();
+    if (state === "UNKNOWN") expect(screen.queryByText(/retry/i)).toBeNull();
   });
 
   it("does not show a missing record or search loading while queries are inactive", async () => {
