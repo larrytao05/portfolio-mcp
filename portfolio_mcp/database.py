@@ -706,6 +706,41 @@ class PortfolioRepository:
                 for record in records
             ]
 
+    def all_daily_values(self) -> list[DailyAccountValue]:
+        with self._sessions() as session:
+            records = session.scalars(
+                select(DailyAccountValueRecord).order_by(
+                    DailyAccountValueRecord.snapshot_date,
+                    DailyAccountValueRecord.account_id,
+                )
+            )
+            return [
+                DailyAccountValue(
+                    account_id=record.account_id,
+                    snapshot_date=record.snapshot_date,
+                    value=record.value,
+                    currency=record.currency,
+                    recorded_at=record.recorded_at,
+                )
+                for record in records
+            ]
+
+    def all_positions(self) -> list[StoredPosition]:
+        with self._sessions() as session:
+            account_records = {
+                acc.id: acc for acc in session.scalars(select(AccountRecord))
+            }
+            records = session.scalars(
+                select(PositionRecord).order_by(
+                    PositionRecord.account_id, PositionRecord.symbol
+                )
+            )
+            return [
+                self._stored_position(record, account_records[record.account_id])
+                for record in records
+                if record.account_id in account_records
+            ]
+
     def latest_refresh(self) -> RefreshResult | None:
         with self._sessions() as session:
             record = session.scalar(
