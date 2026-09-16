@@ -1,9 +1,46 @@
-from collections.abc import Iterable
+from collections import defaultdict
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 
-from portfolio_mcp.database import PortfolioRepository
+from portfolio_mcp.database import (
+    DailyAccountValue,
+    PortfolioRepository,
+    RefreshResult,
+    StoredAccount,
+    StoredPosition,
+)
+from portfolio_mcp.models import Position
+
+
+def _sum_decimals(items: Iterable[Decimal | None]) -> Decimal:
+    return sum((x for x in items if x is not None), start=Decimal("0"))
+
+
+def _format_label(key: str) -> str:
+    return key.replace("_", " ").title()
+
+
+def _derive_security_type(asset_class: str) -> str:
+    normalized = asset_class.lower().replace("-", "_").strip()
+    if "etf" in normalized:
+        return "etf"
+    if "mutual_fund" in normalized or "fund" in normalized:
+        return "mutual_fund"
+    if "equity" in normalized or "stock" in normalized:
+        return "equity"
+    if "bond" in normalized:
+        return "bond"
+    if "commodity" in normalized:
+        return "commodity"
+    if "option" in normalized:
+        return "option"
+    if "crypto" in normalized:
+        return "crypto"
+    if "cash" in normalized:
+        return "cash"
+    return "other"
 
 
 @dataclass(frozen=True)
@@ -99,7 +136,7 @@ class OverviewExclusion:
     account_id: str | None
     details: str
 
-    def to_dict(self) -> dict[str, object]:
+    def to_dict(self) -> dict[str, str | None]:
         return {
             "reason": self.reason,
             "symbol": self.symbol,
@@ -114,20 +151,23 @@ class DailyRecordedPoint:
     value: Decimal
     currency: str
     accounts_count: int
+    accounts_total: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "date": self.snapshot_date.isoformat(),
             "snapshot_date": self.snapshot_date.isoformat(),
             "value": str(self.value),
             "currency": self.currency,
             "accounts_count": self.accounts_count,
+            "accounts_total": self.accounts_total,
         }
 
 
 @dataclass(frozen=True)
 class RecordedHistory:
     points: tuple[DailyRecordedPoint, ...]
-    currencies: tuple[str, ...]
+    currencies: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -174,27 +214,6 @@ class PortfolioOverview:
         }
 
 
-def _sum_decimals(values: Iterable[Decimal | None]) -> Decimal:
-    total = Decimal("0")
-    for v in values:
-        if v is not None:
-            total += v
-    return total
-
-
-def _format_asset_class_label(asset_class: str) -> str:
-    labels = {
-        "equity": "Equity",
-        "equity_etf": "Equity ETF",
-        "bond_etf": "Bond ETF",
-        "commodity_etf": "Commodity ETF",
-        "cash": "Cash",
-        "crypto": "Cryptocurrency",
-        "mutual_fund": "Mutual Fund",
-    }
-    return labels.get(asset_class, asset_class.replace("_", " ").title())
-
-
 class OverviewService:
     def __init__(self, repository: PortfolioRepository) -> None:
         self._repository = repository
@@ -202,75 +221,136 @@ class OverviewService:
     def get_overview(self) -> PortfolioOverview:
         stored_accounts = self._repository.list_accounts()
         if not stored_accounts:
-            return PortfolioOverview(
-                total_known_usd_value=None,
-                cash_usd=None,
-                buying_power_usd=None,
-                as_of=None,
-                refreshed_at=None,
-                status="empty",
-                accounts=(),
-                allocations={
-                    "account": AllocationGroup(
-                        group_by="account",
-                        denominator=Decimal("0"),
-                        slices=(),
-                        included_count=0,
-                        excluded_count=0,
-                    ),
-                    "asset_class": AllocationGroup(
-                        group_by="asset_class",
-                        denominator=Decimal("0"),
-                        slices=(),
-                        included_count=0,
-                        excluded_count=0,
-                    ),
-                },
-                gain_loss=GainLossCoverage(
-                    unrealized_gain_loss=None,
-                    cost_basis=None,
-                    market_value=None,
-                    included_count=0,
-                    excluded_count=0,
-                ),
-                exclusions=(),
-                warnings=(),
-                history=RecordedHistory(points=(), currencies=()),
-            )
+            return self._empty_overview()
 
         stored_positions = self._repository.all_positions()
         latest_refresh = self._repository.latest_refresh()
         all_daily = self._repository.all_daily_values()
 
-        # Determine status
-        if all(a.is_stale for a in stored_accounts) or (
-            latest_refresh and latest_refresh.status == "failed"
-        ):
-            status = "stale"
-        elif any(a.is_stale for a in stored_accounts) or (
-            latest_refresh and latest_refresh.status == "partial"
-        ):
-            status = "partial"
-        else:
-            status = "fresh"
-
-        # Determine refreshed_at and as_of
+        status = self._determine_status(stored_accounts, latest_refresh)
+        as_of = max((p.as_of for p in stored_positions), default=None)
         refreshed_at = (
             latest_refresh.completed_at
             if latest_refresh
             else max(a.source_refreshed_at for a in stored_accounts)
         )
-        as_of = max((p.as_of for p in stored_positions), default=None)
 
-        # Classify positions
+        fresh_usd_positions, exclusions, gain_loss_positions = self._classify_positions(
+            stored_positions, stored_accounts
+        )
+
+        all_accounts_stale = all(a.is_stale for a in stored_accounts)
+        total_known_usd: Decimal | None = (
+            None
+            if all_accounts_stale
+            else _sum_decimals(p.position.market_value for p in fresh_usd_positions)
+        )
+
+        cash_usd = self._calculate_cash_usd(fresh_usd_positions)
+        account_contributions, account_slices = self._calculate_contributions(
+            stored_accounts, stored_positions, fresh_usd_positions, total_known_usd
+        )
+
+        allocations = self._calculate_allocations(
+            fresh_usd_positions,
+            account_slices,
+            total_known_usd,
+            len(stored_positions) - len(fresh_usd_positions),
+        )
+
+        gain_loss = self._calculate_gain_loss(
+            gain_loss_positions, len(stored_positions)
+        )
+        warnings = self._collect_warnings(stored_accounts, latest_refresh)
+        history = self._build_history(all_daily, len(stored_accounts))
+
+        return PortfolioOverview(
+            total_known_usd_value=total_known_usd,
+            cash_usd=cash_usd,
+            buying_power_usd=None,
+            as_of=as_of,
+            refreshed_at=refreshed_at,
+            status=status,
+            accounts=tuple(account_contributions),
+            allocations=allocations,
+            gain_loss=gain_loss,
+            exclusions=tuple(exclusions),
+            warnings=warnings,
+            history=history,
+        )
+
+    def get_history(self) -> RecordedHistory:
+        accounts = self._repository.list_accounts()
+        all_daily = self._repository.all_daily_values()
+        return self._build_history(all_daily, len(accounts))
+
+    def _empty_overview(self) -> PortfolioOverview:
+        empty_alloc = {
+            "account": AllocationGroup("account", Decimal("0"), (), 0, 0),
+            "asset_class": AllocationGroup("asset_class", Decimal("0"), (), 0, 0),
+            "security_type": AllocationGroup("security_type", Decimal("0"), (), 0, 0),
+        }
+        empty_gl = GainLossCoverage(None, None, None, 0, 0)
+        return PortfolioOverview(
+            total_known_usd_value=None,
+            cash_usd=None,
+            buying_power_usd=None,
+            as_of=None,
+            refreshed_at=None,
+            status="empty",
+            accounts=(),
+            allocations=empty_alloc,
+            gain_loss=empty_gl,
+            exclusions=(),
+            warnings=(),
+            history=RecordedHistory(points=(), currencies=()),
+        )
+
+    def _determine_status(
+        self,
+        stored_accounts: list[StoredAccount],
+        latest_refresh: RefreshResult | None,
+    ) -> str:
+        if all(a.is_stale for a in stored_accounts) or (
+            latest_refresh and latest_refresh.status == "failed"
+        ):
+            return "stale"
+        if any(a.is_stale for a in stored_accounts) or (
+            latest_refresh and latest_refresh.status == "partial"
+        ):
+            return "partial"
+        return "fresh"
+
+    def _classify_positions(
+        self,
+        stored_positions: list[StoredPosition],
+        stored_accounts: list[StoredAccount],
+    ) -> tuple[list[StoredPosition], list[OverviewExclusion], list[StoredPosition]]:
+        stale_account_ids = {a.account.id for a in stored_accounts if a.is_stale}
+        account_labels = {a.account.id: a.account.label for a in stored_accounts}
+
         exclusions: list[OverviewExclusion] = []
-        included_positions = []
-        gain_loss_positions = []
-
-        total_positions_count = len(stored_positions)
+        fresh_usd_positions: list[StoredPosition] = []
+        gain_loss_positions: list[StoredPosition] = []
 
         for stored_pos in stored_positions:
             pos = stored_pos.position
+
+            if pos.account_id in stale_account_ids:
+                label = account_labels.get(pos.account_id, pos.account_id)
+                exclusions.append(
+                    OverviewExclusion(
+                        reason="stale_account",
+                        symbol=pos.symbol,
+                        account_id=pos.account_id,
+                        details=(
+                            f"Holding in stale account '{label}' is excluded "
+                            "from totals."
+                        ),
+                    )
+                )
+                continue
+
             if pos.currency != "USD":
                 exclusions.append(
                     OverviewExclusion(
@@ -299,8 +379,7 @@ class OverviewService:
                 )
                 continue
 
-            # Position is valid USD holding with known market value
-            included_positions.append(stored_pos)
+            fresh_usd_positions.append(stored_pos)
 
             if pos.cost_basis is None:
                 exclusions.append(
@@ -317,51 +396,65 @@ class OverviewService:
             else:
                 gain_loss_positions.append(stored_pos)
 
-        # Aggregate total USD value
-        total_known_usd = _sum_decimals(
-            p.position.market_value for p in included_positions
-        )
+        return fresh_usd_positions, exclusions, gain_loss_positions
 
-        # Cash USD
+    def _calculate_cash_usd(
+        self, fresh_usd_positions: list[StoredPosition]
+    ) -> Decimal | None:
         cash_positions = [
             p
-            for p in included_positions
+            for p in fresh_usd_positions
             if p.position.asset_class.lower() in ("cash", "cash_equivalent")
             or p.position.symbol.upper() in ("CASH", "USD")
         ]
-        cash_usd = (
-            sum((p.position.market_value for p in cash_positions), start=Decimal("0"))
-            if cash_positions
-            else None
-        )
+        if not cash_positions:
+            return None
+        return _sum_decimals(p.position.market_value for p in cash_positions)
 
-        # Per-account contribution
-        account_contributions = []
-        account_slices = []
-        total_excluded_for_allocations = total_positions_count - len(included_positions)
+    def _calculate_contributions(
+        self,
+        stored_accounts: list[StoredAccount],
+        stored_positions: list[StoredPosition],
+        fresh_usd_positions: list[StoredPosition],
+        total_known_usd: Decimal | None,
+    ) -> tuple[list[OverviewAccountContribution], list[AllocationSlice]]:
+        account_contributions: list[OverviewAccountContribution] = []
+        account_slices: list[AllocationSlice] = []
 
         for stored_acc in stored_accounts:
             acc = stored_acc.account
-            acc_positions = [
-                p for p in included_positions if p.position.account_id == acc.id
+            all_acc_positions = [
+                p for p in stored_positions if p.position.account_id == acc.id
             ]
-            if acc_positions or any(
-                p.position.account_id == acc.id for p in stored_positions
-            ):
-                acc_val = sum(
-                    (p.position.market_value for p in acc_positions), start=Decimal("0")
-                )
-            else:
-                acc_val = None
+            fresh_acc_positions = [
+                p for p in fresh_usd_positions if p.position.account_id == acc.id
+            ]
 
-            if acc_val is not None and total_known_usd > 0:
-                pct = (acc_val / total_known_usd).quantize(
-                    Decimal("0.0001"), rounding=ROUND_HALF_UP
+            if stored_acc.is_stale:
+                # Retained last-known market value from all stored positions
+                usd_positions = [
+                    p for p in all_acc_positions if p.position.currency == "USD"
+                ]
+                acc_val = (
+                    _sum_decimals(p.position.market_value for p in usd_positions)
+                    if usd_positions
+                    else None
                 )
-            elif total_known_usd == 0:
-                pct = Decimal("0.0000")
-            else:
                 pct = None
+            else:
+                acc_val = (
+                    _sum_decimals(p.position.market_value for p in fresh_acc_positions)
+                    if all_acc_positions
+                    else None
+                )
+                if acc_val is not None and total_known_usd and total_known_usd > 0:
+                    pct = (acc_val / total_known_usd).quantize(
+                        Decimal("0.0001"), rounding=ROUND_HALF_UP
+                    )
+                elif total_known_usd == 0:
+                    pct = Decimal("0.0000")
+                else:
+                    pct = None
 
             account_contributions.append(
                 OverviewAccountContribution(
@@ -376,83 +469,116 @@ class OverviewService:
                 )
             )
 
-            if acc_val is not None and acc_val > 0:
+            if not stored_acc.is_stale and acc_val is not None and acc_val > 0:
                 account_slices.append(
                     AllocationSlice(
                         key=acc.id,
                         label=acc.label,
                         amount=acc_val,
                         percentage=pct if pct is not None else Decimal("0.0000"),
-                        position_count=len(acc_positions),
+                        position_count=len(fresh_acc_positions),
                     )
                 )
 
         account_slices.sort(key=lambda s: (-s.amount, s.label))
+        return account_contributions, account_slices
 
-        # Asset class allocation
-        asset_class_groups: dict[str, list] = {}
-        for p in included_positions:
-            ac = p.position.asset_class
-            asset_class_groups.setdefault(ac, []).append(p)
+    def _build_allocation_group(
+        self,
+        group_by: str,
+        positions: list[StoredPosition],
+        key_fn: Callable[[Position], str],
+        label_fn: Callable[[str], str],
+        denominator: Decimal,
+        excluded_count: int,
+    ) -> AllocationGroup:
+        if not positions or denominator <= 0:
+            return AllocationGroup(
+                group_by=group_by,
+                denominator=denominator,
+                slices=(),
+                included_count=len(positions),
+                excluded_count=excluded_count,
+            )
 
-        asset_class_slices = []
-        for ac, positions in asset_class_groups.items():
-            amount = sum(
-                (p.position.market_value for p in positions), start=Decimal("0")
+        groups: dict[str, list[StoredPosition]] = defaultdict(list)
+        for p in positions:
+            key = key_fn(p.position)
+            groups[key].append(p)
+
+        slices: list[AllocationSlice] = []
+        for key, pos_list in groups.items():
+            amount = _sum_decimals(p.position.market_value for p in pos_list)
+            pct = (amount / denominator).quantize(
+                Decimal("0.0001"), rounding=ROUND_HALF_UP
             )
-            pct = (
-                (amount / total_known_usd).quantize(
-                    Decimal("0.0001"), rounding=ROUND_HALF_UP
-                )
-                if total_known_usd > 0
-                else Decimal("0.0000")
-            )
-            asset_class_slices.append(
+            slices.append(
                 AllocationSlice(
-                    key=ac,
-                    label=_format_asset_class_label(ac),
+                    key=key,
+                    label=label_fn(key),
                     amount=amount,
                     percentage=pct,
-                    position_count=len(positions),
+                    position_count=len(pos_list),
                 )
             )
-        asset_class_slices.sort(key=lambda s: (-s.amount, s.label))
 
-        allocations = {
-            "account": AllocationGroup(
-                group_by="account",
-                denominator=total_known_usd,
-                slices=tuple(account_slices),
-                included_count=len(included_positions),
-                excluded_count=total_excluded_for_allocations,
-            ),
-            "asset_class": AllocationGroup(
-                group_by="asset_class",
-                denominator=total_known_usd,
-                slices=tuple(asset_class_slices),
-                included_count=len(included_positions),
-                excluded_count=total_excluded_for_allocations,
-            ),
+        slices.sort(key=lambda s: (-s.amount, s.label))
+        return AllocationGroup(
+            group_by=group_by,
+            denominator=denominator,
+            slices=tuple(slices),
+            included_count=len(positions),
+            excluded_count=excluded_count,
+        )
+
+    def _calculate_allocations(
+        self,
+        fresh_usd_positions: list[StoredPosition],
+        account_slices: list[AllocationSlice],
+        total_known_usd: Decimal | None,
+        excluded_count: int,
+    ) -> dict[str, AllocationGroup]:
+        denominator = total_known_usd if total_known_usd is not None else Decimal("0")
+
+        account_group = AllocationGroup(
+            group_by="account",
+            denominator=denominator,
+            slices=tuple(account_slices),
+            included_count=len(fresh_usd_positions),
+            excluded_count=excluded_count,
+        )
+
+        asset_class_group = self._build_allocation_group(
+            group_by="asset_class",
+            positions=fresh_usd_positions,
+            key_fn=lambda pos: pos.asset_class,
+            label_fn=_format_label,
+            denominator=denominator,
+            excluded_count=excluded_count,
+        )
+
+        security_type_group = self._build_allocation_group(
+            group_by="security_type",
+            positions=fresh_usd_positions,
+            key_fn=lambda pos: _derive_security_type(pos.asset_class),
+            label_fn=_format_label,
+            denominator=denominator,
+            excluded_count=excluded_count,
+        )
+
+        return {
+            "account": account_group,
+            "asset_class": asset_class_group,
+            "security_type": security_type_group,
         }
 
-        # Gain/Loss coverage
-        if gain_loss_positions:
-            gl_mv = sum(
-                (p.position.market_value for p in gain_loss_positions),
-                start=Decimal("0"),
-            )
-            gl_cb = sum(
-                (p.position.cost_basis for p in gain_loss_positions), start=Decimal("0")
-            )
-            gain_loss = GainLossCoverage(
-                unrealized_gain_loss=gl_mv - gl_cb,
-                cost_basis=gl_cb,
-                market_value=gl_mv,
-                included_count=len(gain_loss_positions),
-                excluded_count=total_positions_count - len(gain_loss_positions),
-            )
-        else:
-            gain_loss = GainLossCoverage(
+    def _calculate_gain_loss(
+        self,
+        gain_loss_positions: list[StoredPosition],
+        total_positions_count: int,
+    ) -> GainLossCoverage:
+        if not gain_loss_positions:
+            return GainLossCoverage(
                 unrealized_gain_loss=None,
                 cost_basis=None,
                 market_value=None,
@@ -460,26 +586,48 @@ class OverviewService:
                 excluded_count=total_positions_count,
             )
 
-        # Warnings
-        warnings_list: list[str] = []
+        gain_loss_market_value = _sum_decimals(
+            p.position.market_value for p in gain_loss_positions
+        )
+        gain_loss_cost_basis = _sum_decimals(
+            p.position.cost_basis for p in gain_loss_positions
+        )
+
+        return GainLossCoverage(
+            unrealized_gain_loss=gain_loss_market_value - gain_loss_cost_basis,
+            cost_basis=gain_loss_cost_basis,
+            market_value=gain_loss_market_value,
+            included_count=len(gain_loss_positions),
+            excluded_count=total_positions_count - len(gain_loss_positions),
+        )
+
+    def _collect_warnings(
+        self,
+        stored_accounts: list[StoredAccount],
+        latest_refresh: RefreshResult | None,
+    ) -> tuple[str, ...]:
+        warnings: list[str] = []
         if latest_refresh:
             for outcome in latest_refresh.provider_outcomes:
                 if outcome.warning:
-                    warnings_list.append(outcome.warning)
+                    warnings.append(outcome.warning)
         if any(a.is_stale for a in stored_accounts):
-            if not any("stale" in w.lower() for w in warnings_list):
-                warnings_list.append("One or more accounts contain stale data.")
+            if not any("stale" in w.lower() for w in warnings):
+                warnings.append("One or more accounts contain stale data.")
+        return tuple(warnings)
 
-        # History
-        # Group by snapshot_date for USD daily snapshots
-        date_groups: dict[date, list] = {}
-        all_currencies = set()
+    def _build_history(
+        self, all_daily: list[DailyAccountValue], total_accounts: int
+    ) -> RecordedHistory:
+        date_groups: dict[date, list[DailyAccountValue]] = defaultdict(list)
+        all_currencies: set[str] = set()
+
         for d in all_daily:
             all_currencies.add(d.currency)
             if d.currency == "USD":
-                date_groups.setdefault(d.snapshot_date, []).append(d)
+                date_groups[d.snapshot_date].append(d)
 
-        history_points = []
+        history_points: list[DailyRecordedPoint] = []
         for snap_date in sorted(date_groups.keys()):
             snaps = date_groups[snap_date]
             tot_val = _sum_decimals(s.value for s in snaps)
@@ -489,23 +637,9 @@ class OverviewService:
                     value=tot_val,
                     currency="USD",
                     accounts_count=len(snaps),
+                    accounts_total=total_accounts,
                 )
             )
 
         currencies = tuple(sorted(all_currencies)) if all_currencies else ()
-        history = RecordedHistory(points=tuple(history_points), currencies=currencies)
-
-        return PortfolioOverview(
-            total_known_usd_value=total_known_usd,
-            cash_usd=cash_usd,
-            buying_power_usd=None,
-            as_of=as_of,
-            refreshed_at=refreshed_at,
-            status=status,
-            accounts=tuple(account_contributions),
-            allocations=allocations,
-            gain_loss=gain_loss,
-            exclusions=tuple(exclusions),
-            warnings=tuple(warnings_list),
-            history=history,
-        )
+        return RecordedHistory(points=tuple(history_points), currencies=currencies)

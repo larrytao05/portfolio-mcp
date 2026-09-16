@@ -31,6 +31,7 @@ def test_empty_portfolio(tmp_path) -> None:
 
     assert "account" in overview.allocations
     assert "asset_class" in overview.allocations
+    assert "security_type" in overview.allocations
     account_alloc = overview.allocations["account"]
     assert isinstance(account_alloc, AllocationGroup)
     assert account_alloc.group_by == "account"
@@ -46,6 +47,14 @@ def test_empty_portfolio(tmp_path) -> None:
     assert asset_alloc.slices == ()
     assert asset_alloc.included_count == 0
     assert asset_alloc.excluded_count == 0
+
+    sec_alloc = overview.allocations["security_type"]
+    assert isinstance(sec_alloc, AllocationGroup)
+    assert sec_alloc.group_by == "security_type"
+    assert sec_alloc.denominator == Decimal("0")
+    assert sec_alloc.slices == ()
+    assert sec_alloc.included_count == 0
+    assert sec_alloc.excluded_count == 0
 
     assert isinstance(overview.gain_loss, GainLossCoverage)
     assert overview.gain_loss.unrealized_gain_loss is None
@@ -195,6 +204,21 @@ def test_multi_account_usd_portfolio(tmp_path) -> None:
     assert asset_map["equity"].percentage == Decimal("0.2000")
     assert asset_map["commodity_etf"].amount == Decimal("1000.00")
     assert asset_map["commodity_etf"].percentage == Decimal("0.1000")
+
+    # Allocations by security type
+    sec_alloc = overview.allocations["security_type"]
+    assert sec_alloc.denominator == Decimal("10000.00")
+    assert sec_alloc.included_count == 4
+    assert sec_alloc.excluded_count == 0
+    assert sum(s.amount for s in sec_alloc.slices) == Decimal("10000.00")
+    assert sum(s.percentage for s in sec_alloc.slices) == Decimal("1.0000")
+    sec_map = {s.key: s for s in sec_alloc.slices}
+    assert sec_map["etf"].amount == Decimal("8000.00")
+    assert sec_map["etf"].percentage == Decimal("0.8000")
+    assert sec_map["etf"].position_count == 3
+    assert sec_map["equity"].amount == Decimal("2000.00")
+    assert sec_map["equity"].percentage == Decimal("0.2000")
+    assert sec_map["equity"].position_count == 1
 
     # Gain loss coverage
     assert overview.gain_loss.unrealized_gain_loss == Decimal("1000.00")
@@ -554,12 +578,20 @@ def test_partial_refresh_and_stale_accounts(tmp_path) -> None:
     overview = service.get_overview()
 
     assert overview.status == "partial"
-    assert overview.total_known_usd_value == Decimal("5000.00")
+    assert overview.total_known_usd_value == Decimal("3000.00")
+    assert overview.allocations["account"].denominator == Decimal("3000.00")
 
     acc_map = {a.account_id: a for a in overview.accounts}
     assert acc_map["acc-schwab"].is_stale is False
+    assert acc_map["acc-schwab"].market_value == Decimal("3000.00")
+    assert acc_map["acc-schwab"].percentage_of_total == Decimal("1.0000")
     assert acc_map["acc-fidelity"].is_stale is True
     assert acc_map["acc-fidelity"].market_value == Decimal("2000.00")
+    assert acc_map["acc-fidelity"].percentage_of_total is None
+
+    stale_exclusions = [e for e in overview.exclusions if e.reason == "stale_account"]
+    assert len(stale_exclusions) == 1
+    assert stale_exclusions[0].account_id == "acc-fidelity"
 
     assert len(overview.warnings) > 0
     assert any("Fidelity" in w or "stale" in w.lower() for w in overview.warnings)
@@ -617,9 +649,13 @@ def test_failed_refresh_all_accounts_stale(tmp_path) -> None:
     overview = service.get_overview()
 
     assert overview.status == "stale"
-    assert overview.total_known_usd_value == Decimal("3000.00")
+    assert overview.total_known_usd_value is None
+    assert overview.allocations["account"].denominator == Decimal("0")
     assert len(overview.accounts) == 1
     assert overview.accounts[0].is_stale is True
+    assert overview.accounts[0].market_value == Decimal("3000.00")
+    assert overview.accounts[0].percentage_of_total is None
+    assert any(e.reason == "stale_account" for e in overview.exclusions)
     assert len(overview.warnings) > 0
     assert any("stale" in w.lower() or "Schwab" in w for w in overview.warnings)
 
