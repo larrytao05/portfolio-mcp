@@ -183,10 +183,13 @@ export type OverviewExclusion = {
 };
 
 export type DailyRecordedPoint = {
-  snapshot_date: string;
+  date?: string;
+  snapshot_date?: string;
   value: string;
   currency: string;
   accounts_count: number;
+  accounts_total?: number;
+  is_complete?: boolean;
 };
 
 export type RecordedHistory = {
@@ -205,6 +208,7 @@ export type PortfolioOverview = {
   allocations: {
     account?: AllocationGroup;
     asset_class?: AllocationGroup;
+    security_type?: AllocationGroup;
     [key: string]: AllocationGroup | undefined;
   };
   gain_loss: GainLossCoverage;
@@ -217,9 +221,10 @@ export type OverviewResponse = {
   overview: PortfolioOverview;
 };
 
-export type HistoryResponse = {
-  history: RecordedHistory | DailyRecordedPoint[];
-};
+export type HistoryResponse =
+  | { history: RecordedHistory | DailyRecordedPoint[] }
+  | DailyRecordedPoint[]
+  | RecordedHistory;
 
 
 async function getJson<T>(path: string, init?: RequestInit): Promise<T> {

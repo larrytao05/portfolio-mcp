@@ -694,7 +694,7 @@ describe("App", () => {
     expect(api.searchInstruments).toHaveBeenCalledTimes(2);
   });
 
-  it("renders fresh overview with total known USD value, asset class allocations, and gain/loss", async () => {
+  it("renders fresh overview with total known USD value, asset class, security type, account contributions, cash, and gain/loss", async () => {
     api.getOverview.mockResolvedValue({
       overview: {
         total_known_usd_value: "125000.50",
@@ -753,6 +753,21 @@ describe("App", () => {
             included_count: 10,
             excluded_count: 0,
           },
+          security_type: {
+            group_by: "security_type",
+            denominator: "125000.50",
+            slices: [
+              {
+                key: "common_stock",
+                label: "Common Stock",
+                amount: "100000.00",
+                percentage: "0.8000",
+                position_count: 8,
+              },
+            ],
+            included_count: 8,
+            excluded_count: 0,
+          },
         },
         gain_loss: {
           unrealized_gain_loss: "15000.25",
@@ -770,17 +785,30 @@ describe("App", () => {
     renderApp();
 
     expect((await screen.findAllByText("125,000.50 USD")).length).toBeGreaterThan(0);
-    expect(screen.getByText("fresh", { selector: ".status" })).toBeTruthy();
+    expect(screen.getAllByText("fresh", { selector: ".status" }).length).toBeGreaterThan(0);
     expect(screen.getByText(/As of 2026-09-15/)).toBeTruthy();
     expect(screen.getByText("Equities")).toBeTruthy();
-    expect(screen.getByText("100,000.00 USD")).toBeTruthy();
-    expect(screen.getByText(/80\.00%/)).toBeTruthy();
+    expect(screen.getAllByText("100,000.00 USD").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("80.00%").length).toBeGreaterThan(0);
     expect(screen.getByText("15,000.25 USD")).toBeTruthy();
     expect(screen.getByText("110,000.25 USD")).toBeTruthy();
     expect(screen.getByText(/8 of 10 positions with cost basis/)).toBeTruthy();
+
+    // Cash and buying power
+    expect(screen.getAllByText("Cash").length).toBeGreaterThan(0);
+    expect(screen.getByText("Buying power")).toBeTruthy();
+    expect(screen.getAllByText("25,000.50 USD").length).toBeGreaterThan(0);
+
+    // Security-type allocation
+    expect(screen.getByText("By Security Type")).toBeTruthy();
+    expect(screen.getByText("Common Stock")).toBeTruthy();
+
+    // Account contributions
+    expect(screen.getByText("Account contributions")).toBeTruthy();
+    expect(screen.getAllByText("100.00%").length).toBeGreaterThan(0);
   });
 
-  it("renders partial/stale overview with warnings and exclusions callout", async () => {
+  it("renders partial/stale overview with warnings, exclusions callout, and stale account contributions", async () => {
     api.getOverview.mockResolvedValue({
       overview: {
         total_known_usd_value: "50000.00",
@@ -789,7 +817,18 @@ describe("App", () => {
         as_of: "2026-09-15",
         refreshed_at: "2026-09-15T18:00:00Z",
         status: "partial",
-        accounts: [],
+        accounts: [
+          {
+            account_id: "fidelity-demo",
+            label: "Fidelity Brokerage ••••9999",
+            provider: "Fidelity",
+            account_type: "taxable_brokerage",
+            currency: "USD",
+            market_value: "10000.00",
+            is_stale: true,
+            percentage_of_total: null,
+          },
+        ],
         allocations: {
           account: { group_by: "account", denominator: "50000.00", slices: [], included_count: 1, excluded_count: 2 },
           asset_class: { group_by: "asset_class", denominator: "50000.00", slices: [], included_count: 1, excluded_count: 2 },
@@ -814,6 +853,12 @@ describe("App", () => {
             account_id: "fidelity-demo",
             details: "Fidelity provider authentication failed",
           },
+          {
+            reason: "stale_account",
+            symbol: null,
+            account_id: "fidelity-demo",
+            details: "Account fidelity-demo is stale; excluded from total",
+          },
         ],
         warnings: ["Provider Schwab sync incomplete; previous records retained."],
         history: { points: [], currencies: ["USD"] },
@@ -830,6 +875,8 @@ describe("App", () => {
     expect(screen.getByText(/PRIVATE_FUND/)).toBeTruthy();
     expect(screen.getByText(/Missing market quote from provider/)).toBeTruthy();
     expect(screen.getByText(/Fidelity provider authentication failed/)).toBeTruthy();
+    expect(screen.getByText(/Account fidelity-demo is stale/)).toBeTruthy();
+    expect(screen.getByText("Excluded (Stale)")).toBeTruthy();
   });
 
   it("renders empty overview state gracefully", async () => {
@@ -858,7 +905,7 @@ describe("App", () => {
     expect(await screen.findByText(/No accounts refreshed yet/)).toBeTruthy();
   });
 
-  it("renders recorded daily history preserving date gaps", async () => {
+  it("renders recorded daily history using #58 date contract preserving date gaps", async () => {
     api.getOverview.mockResolvedValue({
       overview: {
         total_known_usd_value: "10500.00",
@@ -876,23 +923,27 @@ describe("App", () => {
         exclusions: [],
         warnings: [],
         history: {
-          points: [
-            {
-              snapshot_date: "2026-09-10",
-              value: "10000.00",
-              currency: "USD",
-              accounts_count: 2,
-            },
-            {
-              snapshot_date: "2026-09-14",
-              value: "10500.00",
-              currency: "USD",
-              accounts_count: 2,
-            },
-          ],
+          points: [],
           currencies: ["USD"],
         },
       },
+    });
+    // #58 returns {"history": [{"date": "...", "value": "...", "currency": "USD", "accounts_count": 2}]}
+    api.getOverviewHistory.mockResolvedValue({
+      history: [
+        {
+          date: "2026-09-10",
+          value: "10000.00",
+          currency: "USD",
+          accounts_count: 2,
+        },
+        {
+          date: "2026-09-14",
+          value: "10500.00",
+          currency: "USD",
+          accounts_count: 2,
+        },
+      ],
     });
 
     renderApp();

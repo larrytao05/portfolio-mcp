@@ -479,6 +479,25 @@ td.identity-column span {
   color: var(--muted);
   font-size: 13px;
 }
+.overview-cash-metrics {
+  display: flex;
+  gap: 24px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+.overview-metric-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.overview-metric-value {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
 .overview-exclusions {
   background: #fffaf1;
   border: 1px solid #ead9b9;
@@ -561,7 +580,8 @@ td.identity-column span {
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
-.allocations-section {
+.allocations-section,
+.account-contributions-section {
   margin: 28px 0;
 }
 .allocations-grid {
@@ -571,7 +591,8 @@ td.identity-column span {
   margin-top: 16px;
 }
 .allocation-table,
-.history-table {
+.history-table,
+.contributions-table {
   width: 100%;
   border-collapse: collapse;
   font-size: 14px;
@@ -579,15 +600,25 @@ td.identity-column span {
 .allocation-table th,
 .allocation-table td,
 .history-table th,
-.history-table td {
+.history-table td,
+.contributions-table th,
+.contributions-table td {
   padding: 10px 12px;
   border-bottom: 1px solid var(--line);
   text-align: left;
 }
+.contributions-table td span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 2px;
+}
 .allocation-table th.numeric,
 .allocation-table td.numeric,
 .history-table th.numeric,
-.history-table td.numeric {
+.history-table td.numeric,
+.contributions-table th.numeric,
+.contributions-table td.numeric {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }

@@ -9,6 +9,9 @@ import {
   type AccountDetail,
   type AllocationGroup,
   type DailyRecordedPoint,
+  type GainLossCoverage,
+  type OverviewAccountContribution,
+  type OverviewExclusion,
   type PortfolioOverview,
   type Position,
   type RecordedHistory,
@@ -47,8 +50,8 @@ const sortLabels: Record<SortField, string> = {
   cost_basis: "Cost basis",
   gain_loss: "Gain/loss",
 };
-function displayValue(value: string | null, currency?: string) {
-  if (value === null) return "Unavailable";
+function displayValue(value: string | null | undefined, currency?: string) {
+  if (value === null || value === undefined) return "Unavailable";
   const [whole, fraction] = value.split(".");
   const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
   return `${grouped}${fraction === undefined ? "" : `.${fraction}`}${currency ? ` ${currency}` : ""}`;
@@ -676,12 +679,36 @@ function MarketDataSection() {
 }
 
 
-function formatPercentage(percentage: string): string {
-  if (percentage.includes("%")) return percentage;
-  const num = Number(percentage);
-  if (Number.isNaN(num)) return percentage;
-  const pct = num <= 1 && num > 0 ? num * 100 : num;
-  return `${pct.toFixed(2)}%`;
+function formatPercentage(percentage: string | null | undefined): string {
+  if (!percentage) return "0.00%";
+  if (percentage.endsWith("%")) return percentage;
+
+  const isNegative = percentage.startsWith("-");
+  const clean = isNegative ? percentage.slice(1) : percentage;
+  const [whole = "0", fraction = ""] = clean.split(".");
+
+  // If already scaled (e.g. "80.00" or "100"), format without multiplication
+  if (whole.length > 1 || (whole.length === 1 && whole !== "0" && whole !== "1")) {
+    const formattedFrac = fraction ? fraction.slice(0, 2).padEnd(2, "0") : "00";
+    return `${isNegative ? "-" : ""}${whole}.${formattedFrac}%`;
+  }
+
+  // Exact decimal shift by two positions (e.g. "0.8000" -> "80.00%", "1.0000" -> "100.00%")
+  const paddedFraction = fraction.padEnd(2, "0");
+  const shiftWhole = paddedFraction.slice(0, 2);
+  const remainingFraction = paddedFraction.slice(2);
+
+  const rawWhole =
+    whole === "0" ? shiftWhole.replace(/^0+/, "") || "0" : `${whole}${shiftWhole}`;
+  const formattedFraction = remainingFraction
+    ? remainingFraction.slice(0, 2).padEnd(2, "0")
+    : "00";
+
+  return `${isNegative ? "-" : ""}${rawWhole}.${formattedFraction}%`;
+}
+
+function getPointDate(point: DailyRecordedPoint): string {
+  return point.snapshot_date ?? point.date ?? "";
 }
 
 function parseDateUtc(dateStr: string): number {
@@ -706,9 +733,219 @@ function formatExclusionReason(reason: string): string {
       return "Missing cost basis";
     case "provider_failed":
       return "Provider failed";
+    case "stale_account":
+      return "Stale account excluded";
     default:
       return reason.replace(/_/g, " ");
   }
+}
+
+function OverviewHeading() {
+  return (
+    <div className="section-heading">
+      <div>
+        <h2 id="overview-heading">Portfolio overview</h2>
+      </div>
+      <span className="muted">Authoritative aggregate record</span>
+    </div>
+  );
+}
+
+function OverviewSummary({ overview }: { overview: PortfolioOverview }) {
+  const hasCash = overview.cash_usd !== undefined && overview.cash_usd !== null;
+  const hasBuyingPower =
+    overview.buying_power_usd !== undefined &&
+    overview.buying_power_usd !== null;
+
+  return (
+    <div className="overview-strip">
+      <div className="overview-total-card">
+        <span className="eyebrow">Total Known USD Value</span>
+        <div className="overview-headline">
+          <strong className="overview-total-value">
+            {displayValue(overview.total_known_usd_value, "USD")}
+          </strong>
+          <StatusPill status={overview.status} />
+        </div>
+        <div className="overview-metadata">
+          <span>As of {overview.as_of ?? "Unavailable"}</span>
+          {overview.refreshed_at && (
+            <span>
+              {" "}
+              · Saved {new Date(overview.refreshed_at).toLocaleString()}
+            </span>
+          )}
+        </div>
+        {(hasCash || hasBuyingPower) && (
+          <div className="overview-cash-metrics">
+            {hasCash && (
+              <div className="overview-metric-item">
+                <span className="eyebrow">Cash</span>
+                <strong className="overview-metric-value">
+                  {displayValue(overview.cash_usd, "USD")}
+                </strong>
+              </div>
+            )}
+            {hasBuyingPower && (
+              <div className="overview-metric-item">
+                <span className="eyebrow">Buying power</span>
+                <strong className="overview-metric-value">
+                  {displayValue(overview.buying_power_usd, "USD")}
+                </strong>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ExclusionsCallout({
+  exclusions,
+}: {
+  exclusions: OverviewExclusion[];
+}) {
+  return (
+    <div
+      className="overview-exclusions"
+      role="region"
+      aria-label="Excluded positions and currencies"
+    >
+      <div className="exclusions-header">
+        <span className="record-mark" aria-hidden="true">
+          !
+        </span>
+        <div>
+          <h3>Exclusions &amp; Limitations</h3>
+          <p>
+            The following items are excluded from total known USD value and
+            allocations because they are unvalued, non-USD, or unavailable:
+          </p>
+        </div>
+      </div>
+      <ul className="exclusions-list">
+        {exclusions.map((exc, idx) => (
+          <li key={idx}>
+            <strong>{exc.symbol ?? exc.account_id ?? "Provider"}</strong>
+            <span className="status status-partial">
+              {formatExclusionReason(exc.reason)}
+            </span>
+            <span>{exc.details}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function GainLossSummary({ gainLoss }: { gainLoss: GainLossCoverage }) {
+  const totalPositions = gainLoss.included_count + gainLoss.excluded_count;
+  return (
+    <div className="overview-cards">
+      <article className="overview-card" aria-label="Gain and loss summary">
+        <div className="card-heading">
+          <h3>Unrealized gain / loss</h3>
+          <span className="muted">
+            {gainLoss.included_count} of {totalPositions} positions with cost basis
+          </span>
+        </div>
+        <dl className="metric-grid">
+          <div>
+            <dt>Unrealized gain/loss</dt>
+            <dd className="numeric">
+              {displayValue(gainLoss.unrealized_gain_loss, "USD")}
+            </dd>
+          </div>
+          <div>
+            <dt>Cost basis</dt>
+            <dd className="numeric">
+              {displayValue(gainLoss.cost_basis, "USD")}
+            </dd>
+          </div>
+          <div>
+            <dt>Covered market value</dt>
+            <dd className="numeric">
+              {displayValue(gainLoss.market_value, "USD")}
+            </dd>
+          </div>
+          <div>
+            <dt>Coverage</dt>
+            <dd>
+              {gainLoss.included_count} included
+              {gainLoss.excluded_count > 0 &&
+                ` · ${gainLoss.excluded_count} excluded`}
+            </dd>
+          </div>
+        </dl>
+      </article>
+    </div>
+  );
+}
+
+function AccountContributions({
+  accounts,
+}: {
+  accounts: OverviewAccountContribution[];
+}) {
+  return (
+    <div className="account-contributions-section" aria-label="Account contributions">
+      <div className="section-heading">
+        <div>
+          <h3>Account contributions</h3>
+        </div>
+        <span className="muted">{accounts.length} accounts</span>
+      </div>
+      <div
+        className="table-scroll"
+        tabIndex={0}
+        role="region"
+        aria-label="Scrollable account contributions table"
+      >
+        <table className="contributions-table">
+          <thead>
+            <tr>
+              <th scope="col" className="identity-column">
+                Account
+              </th>
+              <th scope="col">Status</th>
+              <th scope="col" className="numeric">
+                Market value
+              </th>
+              <th scope="col" className="numeric">
+                Share of total
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {accounts.map((acc) => {
+              const shareLabel =
+                acc.percentage_of_total !== null
+                  ? formatPercentage(acc.percentage_of_total)
+                  : "Excluded (Stale)";
+              return (
+                <tr key={acc.account_id}>
+                  <td className="identity-column">
+                    <strong>{acc.label}</strong>
+                    <span>
+                      {acc.provider} · {accountTypeLabel(acc.account_type)}
+                    </span>
+                  </td>
+                  <td>
+                    <StatusPill status={acc.is_stale ? "stale" : "fresh"} />
+                  </td>
+                  <td className="numeric">
+                    {displayValue(acc.market_value, acc.currency)}
+                  </td>
+                  <td className="numeric">{shareLabel}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
 }
 
 function AllocationCard({
@@ -764,6 +1001,159 @@ function AllocationCard({
   );
 }
 
+function AllocationBreakdown({
+  allocations,
+}: {
+  allocations: PortfolioOverview["allocations"];
+}) {
+  return (
+    <div className="allocations-section">
+      <div className="section-heading">
+        <div>
+          <h3>Allocation breakdown</h3>
+        </div>
+        <span className="muted">Server-computed distribution</span>
+      </div>
+
+      <div className="allocations-grid">
+        {allocations.asset_class && (
+          <AllocationCard
+            title="By Asset Class"
+            group={allocations.asset_class}
+          />
+        )}
+        {allocations.security_type && (
+          <AllocationCard
+            title="By Security Type"
+            group={allocations.security_type}
+          />
+        )}
+        {allocations.account && (
+          <AllocationCard
+            title="By Account"
+            group={allocations.account}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function RecordedHistorySection({
+  history,
+  overviewHistory,
+}: {
+  history:
+    | RecordedHistory
+    | DailyRecordedPoint[]
+    | { history?: DailyRecordedPoint[] | RecordedHistory }
+    | undefined;
+  overviewHistory: RecordedHistory | undefined;
+}) {
+  const points = useMemo(() => {
+    if (!history) {
+      return overviewHistory?.points ?? [];
+    }
+    if (Array.isArray(history)) {
+      return history;
+    }
+    if ("history" in history && history.history) {
+      if (Array.isArray(history.history)) {
+        return history.history;
+      }
+      if ("points" in history.history && Array.isArray(history.history.points)) {
+        return history.history.points;
+      }
+    }
+    if ("points" in history && Array.isArray(history.points)) {
+      return history.points;
+    }
+    return overviewHistory?.points ?? [];
+  }, [history, overviewHistory]);
+
+  const sortedPoints = useMemo(() => {
+    return [...points].sort((a, b) =>
+      getPointDate(a).localeCompare(getPointDate(b)),
+    );
+  }, [points]);
+
+  return (
+    <div className="history-section">
+      <div className="section-heading">
+        <div>
+          <h3>Recorded Value History (Not Investment Return)</h3>
+        </div>
+        <span className="muted">Daily snapshot timeline</span>
+      </div>
+      <p className="history-disclaimer muted">
+        Aggregated from daily recorded account balances. Missing calendar dates are preserved
+        as gaps and are never interpolated. Does not calculate investment performance or rate of return.
+      </p>
+      {sortedPoints.length === 0 ? (
+        <p className="state state-empty">No daily snapshots recorded yet.</p>
+      ) : (
+        <div
+          className="table-scroll"
+          tabIndex={0}
+          role="region"
+          aria-label="Recorded value history table"
+        >
+          <table className="history-table">
+            <thead>
+              <tr>
+                <th scope="col" className="identity-column">Snapshot date</th>
+                <th scope="col" className="numeric">Recorded value</th>
+                <th scope="col" className="numeric">Accounts</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sortedPoints.flatMap((point, index) => {
+                const pointDate = getPointDate(point);
+                const rows = [];
+                if (index > 0) {
+                  const prevPoint = sortedPoints[index - 1];
+                  const prevDate = getPointDate(prevPoint);
+                  if (prevDate && pointDate) {
+                    const gapDays = dateGapDays(prevDate, pointDate);
+                    if (gapDays > 1) {
+                      const missingDays = gapDays - 1;
+                      rows.push(
+                        <tr
+                          key={`gap-${prevDate}-${pointDate}`}
+                          className="history-gap-row"
+                        >
+                          <td colSpan={3} className="history-gap-cell">
+                            <span className="gap-indicator" aria-hidden="true">⋯</span>
+                            <em>
+                              Gap in recorded history ({missingDays} missing day{missingDays > 1 ? "s" : ""} between {prevDate} and {pointDate})
+                            </em>
+                          </td>
+                        </tr>
+                      );
+                    }
+                  }
+                }
+                rows.push(
+                  <tr key={pointDate || index}>
+                    <td className="identity-column">
+                      <strong>{pointDate || "Unavailable"}</strong>
+                    </td>
+                    <td className="numeric">
+                      {displayValue(point.value, point.currency)}
+                    </td>
+                    <td className="numeric">{point.accounts_count}</td>
+                  </tr>
+                );
+                return rows;
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function OverviewSection({
   overview,
   history,
@@ -771,46 +1161,37 @@ function OverviewSection({
   error,
 }: {
   overview: PortfolioOverview | undefined;
-  history: RecordedHistory | DailyRecordedPoint[] | undefined;
+  history:
+    | RecordedHistory
+    | DailyRecordedPoint[]
+    | { history?: DailyRecordedPoint[] | RecordedHistory }
+    | undefined;
   loading: boolean;
   error: boolean;
 }) {
-  const points = useMemo(() => {
-    const historyPoints = history
-      ? Array.isArray(history)
-        ? history
-        : (history.points ?? [])
-      : [];
-    if (historyPoints.length > 0) return historyPoints;
-    return overview?.history?.points ?? [];
-  }, [history, overview]);
-
-  const sortedPoints = useMemo(() => {
-    return [...points].sort((a, b) => a.snapshot_date.localeCompare(b.snapshot_date));
-  }, [points]);
-
   if (loading && !overview) {
     return (
-      <section className="content-section" id="overview" aria-labelledby="overview-heading">
-        <div className="section-heading">
-          <div>
-            <h2 id="overview-heading">Portfolio overview</h2>
-          </div>
-          <span className="muted">Authoritative aggregate record</span>
-        </div>
-        <p className="state overview-loading" role="status">Loading portfolio overview…</p>
+      <section
+        className="content-section"
+        id="overview"
+        aria-labelledby="overview-heading"
+      >
+        <OverviewHeading />
+        <p className="state overview-loading" role="status">
+          Loading portfolio overview…
+        </p>
       </section>
     );
   }
 
   if (error && !overview) {
     return (
-      <section className="content-section" id="overview" aria-labelledby="overview-heading">
-        <div className="section-heading">
-          <div>
-            <h2 id="overview-heading">Portfolio overview</h2>
-          </div>
-        </div>
+      <section
+        className="content-section"
+        id="overview"
+        aria-labelledby="overview-heading"
+      >
+        <OverviewHeading />
         <p className="state state-error" role="alert">
           Portfolio overview is unavailable. Try refreshing the portfolio.
         </p>
@@ -824,13 +1205,12 @@ function OverviewSection({
     (overview.accounts.length === 0 && overview.total_known_usd_value === null)
   ) {
     return (
-      <section className="content-section" id="overview" aria-labelledby="overview-heading">
-        <div className="section-heading">
-          <div>
-            <h2 id="overview-heading">Portfolio overview</h2>
-          </div>
-          <span className="muted">Authoritative aggregate record</span>
-        </div>
+      <section
+        className="content-section"
+        id="overview"
+        aria-labelledby="overview-heading"
+      >
+        <OverviewHeading />
         <p className="state state-empty">
           No accounts refreshed yet. Refresh your portfolio to load saved accounts.
         </p>
@@ -839,13 +1219,12 @@ function OverviewSection({
   }
 
   return (
-    <section className="content-section" id="overview" aria-labelledby="overview-heading">
-      <div className="section-heading">
-        <div>
-          <h2 id="overview-heading">Portfolio overview</h2>
-        </div>
-        <span className="muted">Authoritative aggregate record</span>
-      </div>
+    <section
+      className="content-section"
+      id="overview"
+      aria-labelledby="overview-heading"
+    >
+      <OverviewHeading />
 
       {error && (
         <p className="inline-alert" role="alert">
@@ -861,190 +1240,29 @@ function OverviewSection({
 
       {(overview.status === "stale" || overview.status === "partial") && (
         <p className="stale-note" role="alert">
-          <strong>Overview is {overview.status}</strong> · Some account data is stale or incomplete.
+          <strong>Overview is {overview.status}</strong> · Some account data is
+          stale or incomplete.
         </p>
       )}
 
-      <div className="overview-strip">
-        <div className="overview-total-card">
-          <span className="eyebrow">Total Known USD Value</span>
-          <div className="overview-headline">
-            <strong className="overview-total-value">
-              {displayValue(overview.total_known_usd_value, "USD")}
-            </strong>
-            <StatusPill status={overview.status} />
-          </div>
-          <div className="overview-metadata">
-            <span>As of {overview.as_of ?? "Unavailable"}</span>
-            {overview.refreshed_at && (
-              <span> · Saved {new Date(overview.refreshed_at).toLocaleString()}</span>
-            )}
-          </div>
-        </div>
-      </div>
+      <OverviewSummary overview={overview} />
 
       {overview.exclusions && overview.exclusions.length > 0 && (
-        <div
-          className="overview-exclusions"
-          role="region"
-          aria-label="Excluded positions and currencies"
-        >
-          <div className="exclusions-header">
-            <span className="record-mark" aria-hidden="true">!</span>
-            <div>
-              <h3>Exclusions &amp; Limitations</h3>
-              <p>
-                The following items are excluded from total known USD value and allocations
-                because they are unvalued, non-USD, or unavailable:
-              </p>
-            </div>
-          </div>
-          <ul className="exclusions-list">
-            {overview.exclusions.map((exc, idx) => (
-              <li key={idx}>
-                <strong>{exc.symbol ?? exc.account_id ?? "Provider"}</strong>
-                <span className="status status-partial">
-                  {formatExclusionReason(exc.reason)}
-                </span>
-                <span>{exc.details}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
+        <ExclusionsCallout exclusions={overview.exclusions} />
       )}
 
-      <div className="overview-cards">
-        <article className="overview-card" aria-label="Gain and loss summary">
-          <div className="card-heading">
-            <h3>Unrealized gain / loss</h3>
-            <span className="muted">
-              {overview.gain_loss.included_count} of{" "}
-              {overview.gain_loss.included_count + overview.gain_loss.excluded_count} positions with cost basis
-            </span>
-          </div>
-          <dl className="metric-grid">
-            <div>
-              <dt>Unrealized gain/loss</dt>
-              <dd className="numeric">
-                {displayValue(overview.gain_loss.unrealized_gain_loss, "USD")}
-              </dd>
-            </div>
-            <div>
-              <dt>Cost basis</dt>
-              <dd className="numeric">
-                {displayValue(overview.gain_loss.cost_basis, "USD")}
-              </dd>
-            </div>
-            <div>
-              <dt>Covered market value</dt>
-              <dd className="numeric">
-                {displayValue(overview.gain_loss.market_value, "USD")}
-              </dd>
-            </div>
-            <div>
-              <dt>Coverage</dt>
-              <dd>
-                {overview.gain_loss.included_count} included
-                {overview.gain_loss.excluded_count > 0 && ` · ${overview.gain_loss.excluded_count} excluded`}
-              </dd>
-            </div>
-          </dl>
-        </article>
-      </div>
+      <GainLossSummary gainLoss={overview.gain_loss} />
 
-      <div className="allocations-section">
-        <div className="section-heading">
-          <div>
-            <h3>Allocation breakdown</h3>
-          </div>
-          <span className="muted">Server-computed distribution</span>
-        </div>
+      {overview.accounts && overview.accounts.length > 0 && (
+        <AccountContributions accounts={overview.accounts} />
+      )}
 
-        <div className="allocations-grid">
-          {overview.allocations.asset_class && (
-            <AllocationCard
-              title="By Asset Class"
-              group={overview.allocations.asset_class}
-            />
-          )}
-          {overview.allocations.account && (
-            <AllocationCard
-              title="By Account"
-              group={overview.allocations.account}
-            />
-          )}
-        </div>
-      </div>
+      <AllocationBreakdown allocations={overview.allocations} />
 
-      <div className="history-section">
-        <div className="section-heading">
-          <div>
-            <h3>Recorded Value History (Not Investment Return)</h3>
-          </div>
-          <span className="muted">Daily snapshot timeline</span>
-        </div>
-        <p className="history-disclaimer muted">
-          Aggregated from daily recorded account balances. Missing calendar dates are preserved
-          as gaps and are never interpolated. Does not calculate investment performance or rate of return.
-        </p>
-        {sortedPoints.length === 0 ? (
-          <p className="state state-empty">No daily snapshots recorded yet.</p>
-        ) : (
-          <div
-            className="table-scroll"
-            tabIndex={0}
-            role="region"
-            aria-label="Recorded value history table"
-          >
-            <table className="history-table">
-              <thead>
-                <tr>
-                  <th scope="col" className="identity-column">Snapshot date</th>
-                  <th scope="col" className="numeric">Recorded value</th>
-                  <th scope="col" className="numeric">Accounts</th>
-                </tr>
-              </thead>
-              <tbody>
-                {sortedPoints.flatMap((point, index) => {
-                  const rows = [];
-                  if (index > 0) {
-                    const prevPoint = sortedPoints[index - 1];
-                    const gapDays = dateGapDays(prevPoint.snapshot_date, point.snapshot_date);
-                    if (gapDays > 1) {
-                      const missingDays = gapDays - 1;
-                      rows.push(
-                        <tr
-                          key={`gap-${prevPoint.snapshot_date}-${point.snapshot_date}`}
-                          className="history-gap-row"
-                        >
-                          <td colSpan={3} className="history-gap-cell">
-                            <span className="gap-indicator" aria-hidden="true">⋯</span>
-                            <em>
-                              Gap in recorded history ({missingDays} missing day{missingDays > 1 ? "s" : ""} between {prevPoint.snapshot_date} and {point.snapshot_date})
-                            </em>
-                          </td>
-                        </tr>
-                      );
-                    }
-                  }
-                  rows.push(
-                    <tr key={point.snapshot_date}>
-                      <td className="identity-column">
-                        <strong>{point.snapshot_date}</strong>
-                      </td>
-                      <td className="numeric">
-                        {displayValue(point.value, point.currency)}
-                      </td>
-                      <td className="numeric">{point.accounts_count}</td>
-                    </tr>
-                  );
-                  return rows;
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
+      <RecordedHistorySection
+        history={history}
+        overviewHistory={overview.history}
+      />
     </section>
   );
 }
@@ -1385,7 +1603,7 @@ export function App() {
         </section>
         <OverviewSection
           overview={overviewQuery.data?.overview}
-          history={overviewHistoryQuery.data?.history ?? overviewQuery.data?.overview.history}
+          history={overviewHistoryQuery.data ?? overviewQuery.data?.overview.history}
           loading={overviewQuery.isPending}
           error={overviewQuery.isError}
         />
