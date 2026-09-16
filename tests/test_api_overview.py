@@ -92,6 +92,7 @@ def test_fresh_overview_endpoint(tmp_path) -> None:
     allocations = overview["allocations"]
     assert "account" in allocations
     assert "asset_class" in allocations
+    assert "security_type" in allocations
 
     account_alloc = allocations["account"]
     assert account_alloc["group_by"] == "account"
@@ -111,6 +112,20 @@ def test_fresh_overview_endpoint(tmp_path) -> None:
     assert asset_alloc["excluded_count"] == 0
     assert len(asset_alloc["slices"]) > 0
 
+    sec_alloc = allocations["security_type"]
+    assert sec_alloc["group_by"] == "security_type"
+    assert sec_alloc["denominator"] == "9999.95"
+    assert sec_alloc["included_count"] == 9
+    assert sec_alloc["excluded_count"] == 0
+    assert len(sec_alloc["slices"]) > 0
+
+    # Provider coverage
+    assert "provider_coverage" in overview
+    assert len(overview["provider_coverage"]) == 2
+    for pc in overview["provider_coverage"]:
+        assert pc["status"] == "fresh"
+        assert pc["is_included_in_totals"] is True
+
     # Gain / loss
     gain_loss = overview["gain_loss"]
     assert gain_loss["unrealized_gain_loss"] == "758.95"
@@ -123,9 +138,12 @@ def test_fresh_overview_endpoint(tmp_path) -> None:
     history = overview["history"]
     assert len(history) == 1
     assert history[0]["date"] == "2026-08-29"
+    assert history[0]["snapshot_date"] == "2026-08-29"
     assert history[0]["value"] == "9999.95"
     assert history[0]["currency"] == "USD"
     assert history[0]["accounts_count"] == 2
+    assert history[0]["accounts_total"] == 2
+    assert history[0]["is_complete"] is True
 
 
 def test_empty_portfolio_overview(tmp_path) -> None:
@@ -285,15 +303,21 @@ def test_history_endpoint_preserves_gaps(tmp_path) -> None:
     assert len(history) == 2
     assert history[0] == {
         "date": "2026-08-20",
+        "snapshot_date": "2026-08-20",
         "value": "1000.00",
         "currency": "USD",
         "accounts_count": 1,
+        "accounts_total": 2,
+        "is_complete": False,
     }
     assert history[1] == {
         "date": "2026-08-25",
+        "snapshot_date": "2026-08-25",
         "value": "1550.00",
         "currency": "USD",
         "accounts_count": 2,
+        "accounts_total": 2,
+        "is_complete": True,
     }
 
 
@@ -388,3 +412,25 @@ def test_missing_market_value_and_cost_basis_exclusions(tmp_path) -> None:
     assert overview["gain_loss"]["included_count"] == 0
     assert overview["gain_loss"]["excluded_count"] == 2
     assert overview["gain_loss"]["unrealized_gain_loss"] is None
+
+
+def test_error_overview_when_initial_refresh_fails(tmp_path) -> None:
+    class FailingProvider(FixturePortfolioProvider):
+        async def list_accounts(self) -> list[Account]:
+            raise ProviderUnavailableError("Provider is down")
+
+    client, _ = create_client(provider=FailingProvider(), tmp_path=tmp_path)
+    refresh_resp = client.post("/api/refresh")
+    assert refresh_resp.status_code == 200
+
+    overview_resp = client.get("/api/overview")
+    assert overview_resp.status_code == 200
+    overview = overview_resp.json()["overview"]
+
+    assert overview["status"] == "error"
+    assert overview["total_known_usd_value"] is None
+    assert overview["accounts"] == []
+    assert len(overview["warnings"]) > 0
+    for w in overview["warnings"]:
+        assert "traceback" not in w.lower()
+        assert "exception" not in w.lower()

@@ -89,7 +89,7 @@ def create_app(
     @app.get("/api/overview/history")
     async def get_overview_history() -> dict[str, object]:
         history = overview_service.get_history()
-        return {"history": history.to_dict()}
+        return {"history": [point.to_dict() for point in history.points]}
 
     @app.get("/api/accounts")
     async def list_accounts() -> dict[str, list[dict[str, str | bool]]]:
