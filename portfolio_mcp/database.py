@@ -900,6 +900,7 @@ class PortfolioRepository:
             position.market_value
             for position in snapshot.positions
             if position.market_value is not None
+            and position.currency == snapshot.account.currency
         ]
         if not values:
             return

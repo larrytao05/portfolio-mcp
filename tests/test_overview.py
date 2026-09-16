@@ -2,6 +2,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 
 from portfolio_mcp.database import PortfolioRepository
+from portfolio_mcp.models import Account, HoldingsSnapshot, Position
 from portfolio_mcp.overview import (
     AllocationGroup,
     GainLossCoverage,
@@ -911,3 +912,63 @@ def test_overview_to_dict_serialization(tmp_path) -> None:
     history = data["history"]
     assert isinstance(history, dict)
     assert isinstance(history["points"], list)
+
+
+def test_mixed_currency_account_daily_history_excludes_non_usd_from_usd_snapshot(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'mixed.db'}"
+    repository = PortfolioRepository(database_url)
+
+    now = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
+    snap_date = date(2026, 8, 29)
+
+    acc = Account(
+        id="acc-mixed",
+        provider="Schwab",
+        label="Schwab Mixed",
+        account_type="taxable_brokerage",
+        currency="USD",
+    )
+    positions = [
+        Position(
+            account_id="acc-mixed",
+            symbol="VTI",
+            name="Vanguard Total Stock Market ETF",
+            asset_class="equity_etf",
+            quantity=Decimal("10"),
+            current_price=Decimal("300.00"),
+            market_value=Decimal("3000.00"),
+            cost_basis=Decimal("2500.00"),
+            currency="USD",
+        ),
+        Position(
+            account_id="acc-mixed",
+            symbol="RY.TO",
+            name="Royal Bank of Canada",
+            asset_class="equity",
+            quantity=Decimal("50"),
+            current_price=Decimal("150.00"),
+            market_value=Decimal("7500.00"),
+            cost_basis=Decimal("7000.00"),
+            currency="CAD",
+        ),
+    ]
+
+    repository.save_refresh(
+        snapshots=[
+            HoldingsSnapshot(account=acc, as_of=snap_date, positions=tuple(positions))
+        ],
+        started_at=now,
+        completed_at=now,
+        snapshot_date=snap_date,
+    )
+
+    service = OverviewService(repository)
+    overview = service.get_overview()
+
+    assert len(overview.history.points) == 1
+    # Only the USD holding (3000.00) is included; CAD holding (7500.00) is
+    # excluded from the USD daily snapshot.
+    assert overview.history.points[0].value == Decimal("3000.00")
+    assert overview.history.points[0].currency == "USD"

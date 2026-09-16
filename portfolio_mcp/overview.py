@@ -68,6 +68,9 @@ class OverviewAccountContribution:
             "percentage_of_total": str(self.percentage_of_total)
             if self.percentage_of_total is not None
             else None,
+            "percentage_of_total_display": f"{self.percentage_of_total * 100:.2f}%"
+            if self.percentage_of_total is not None
+            else None,
         }
 
 
@@ -85,6 +88,7 @@ class AllocationSlice:
             "label": self.label,
             "amount": str(self.amount),
             "percentage": str(self.percentage),
+            "percentage_display": f"{self.percentage * 100:.2f}%",
             "position_count": self.position_count,
         }
 
