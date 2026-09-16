@@ -90,11 +90,11 @@ describe("App", () => {
         gain_loss: { unrealized_gain_loss: null, cost_basis: null, market_value: null, included_count: 0, excluded_count: 0 },
         exclusions: [],
         warnings: [],
-        history: { points: [], currencies: [] },
+        history: [],
       },
     });
     api.getOverviewHistory.mockResolvedValue({
-      history: { points: [], currencies: [] },
+      history: [],
     });
     api.createOrderDraft.mockResolvedValue({ draft: null });
     api.confirmOrderDraft.mockResolvedValue({ order: null });
@@ -713,6 +713,7 @@ describe("App", () => {
             market_value: "125000.50",
             is_stale: false,
             percentage_of_total: "1.0000",
+            percentage_of_total_display: "100.00%",
           },
         ],
         allocations: {
@@ -725,6 +726,7 @@ describe("App", () => {
                 label: "Schwab Taxable ••••4821",
                 amount: "125000.50",
                 percentage: "1.0000",
+                percentage_display: "100.00%",
                 position_count: 10,
               },
             ],
@@ -740,6 +742,7 @@ describe("App", () => {
                 label: "Equities",
                 amount: "100000.00",
                 percentage: "0.8000",
+                percentage_display: "80.00%",
                 position_count: 8,
               },
               {
@@ -747,6 +750,7 @@ describe("App", () => {
                 label: "Cash",
                 amount: "25000.50",
                 percentage: "0.2000",
+                percentage_display: "20.00%",
                 position_count: 2,
               },
             ],
@@ -762,6 +766,7 @@ describe("App", () => {
                 label: "Common Stock",
                 amount: "100000.00",
                 percentage: "0.8000",
+                percentage_display: "80.00%",
                 position_count: 8,
               },
             ],
@@ -778,7 +783,7 @@ describe("App", () => {
         },
         exclusions: [],
         warnings: [],
-        history: { points: [], currencies: ["USD"] },
+        history: [],
       },
     });
 
@@ -861,7 +866,7 @@ describe("App", () => {
           },
         ],
         warnings: ["Provider Schwab sync incomplete; previous records retained."],
-        history: { points: [], currencies: ["USD"] },
+        history: [],
       },
     });
 
@@ -896,7 +901,7 @@ describe("App", () => {
         gain_loss: { unrealized_gain_loss: null, cost_basis: null, market_value: null, included_count: 0, excluded_count: 0 },
         exclusions: [],
         warnings: [],
-        history: { points: [], currencies: [] },
+        history: [],
       },
     });
 
@@ -922,37 +927,42 @@ describe("App", () => {
         gain_loss: { unrealized_gain_loss: null, cost_basis: null, market_value: null, included_count: 0, excluded_count: 0 },
         exclusions: [],
         warnings: [],
-        history: {
-          points: [],
-          currencies: ["USD"],
-        },
+        history: [],
       },
     });
-    // #58 returns {"history": [{"date": "...", "value": "...", "currency": "USD", "accounts_count": 2}]}
+    // #58 returns {"history": [{"date": "...", "value": "...", "currency": "USD", "accounts_count": 1, "accounts_total": 2, "is_complete": false}]}
     api.getOverviewHistory.mockResolvedValue({
       history: [
         {
           date: "2026-09-10",
+          snapshot_date: "2026-09-10",
           value: "10000.00",
           currency: "USD",
-          accounts_count: 2,
+          accounts_count: 1,
+          accounts_total: 2,
+          is_complete: false,
         },
         {
           date: "2026-09-14",
+          snapshot_date: "2026-09-14",
           value: "10500.00",
           currency: "USD",
           accounts_count: 2,
+          accounts_total: 2,
+          is_complete: true,
         },
       ],
     });
 
     renderApp();
 
-    expect(await screen.findByText("Recorded Value History (Not Investment Return)")).toBeTruthy();
-    expect(screen.getByText("2026-09-10")).toBeTruthy();
+    expect(await screen.findByText("2026-09-10")).toBeTruthy();
     expect(screen.getByText("10,000.00 USD")).toBeTruthy();
+    expect(screen.getByText("1 of 2 accounts")).toBeTruthy();
+    expect(screen.getByText("Incomplete")).toBeTruthy();
     expect(screen.getByText("2026-09-14")).toBeTruthy();
     expect(screen.getAllByText("10,500.00 USD").length).toBeGreaterThan(0);
+    expect(screen.getByText("2 of 2 accounts")).toBeTruthy();
     expect(screen.getByText(/Gap in recorded history/)).toBeTruthy();
   });
 });

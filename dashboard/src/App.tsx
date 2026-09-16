@@ -14,7 +14,6 @@ import {
   type OverviewExclusion,
   type PortfolioOverview,
   type Position,
-  type RecordedHistory,
   type RefreshResult,
   getAccount,
   getActivity,
@@ -679,36 +678,18 @@ function MarketDataSection() {
 }
 
 
-function formatPercentage(percentage: string | null | undefined): string {
+function formatPercentage(
+  percentage: string | null | undefined,
+  display?: string | null,
+): string {
+  if (display) return display;
   if (!percentage) return "0.00%";
   if (percentage.endsWith("%")) return percentage;
-
-  const isNegative = percentage.startsWith("-");
-  const clean = isNegative ? percentage.slice(1) : percentage;
-  const [whole = "0", fraction = ""] = clean.split(".");
-
-  // If already scaled (e.g. "80.00" or "100"), format without multiplication
-  if (whole.length > 1 || (whole.length === 1 && whole !== "0" && whole !== "1")) {
-    const formattedFrac = fraction ? fraction.slice(0, 2).padEnd(2, "0") : "00";
-    return `${isNegative ? "-" : ""}${whole}.${formattedFrac}%`;
-  }
-
-  // Exact decimal shift by two positions (e.g. "0.8000" -> "80.00%", "1.0000" -> "100.00%")
-  const paddedFraction = fraction.padEnd(2, "0");
-  const shiftWhole = paddedFraction.slice(0, 2);
-  const remainingFraction = paddedFraction.slice(2);
-
-  const rawWhole =
-    whole === "0" ? shiftWhole.replace(/^0+/, "") || "0" : `${whole}${shiftWhole}`;
-  const formattedFraction = remainingFraction
-    ? remainingFraction.slice(0, 2).padEnd(2, "0")
-    : "00";
-
-  return `${isNegative ? "-" : ""}${rawWhole}.${formattedFraction}%`;
+  return `${percentage}%`;
 }
 
 function getPointDate(point: DailyRecordedPoint): string {
-  return point.snapshot_date ?? point.date ?? "";
+  return point.date ?? point.snapshot_date ?? "";
 }
 
 function parseDateUtc(dateStr: string): number {
@@ -921,7 +902,10 @@ function AccountContributions({
             {accounts.map((acc) => {
               const shareLabel =
                 acc.percentage_of_total !== null
-                  ? formatPercentage(acc.percentage_of_total)
+                  ? formatPercentage(
+                      acc.percentage_of_total,
+                      acc.percentage_of_total_display,
+                    )
                   : "Excluded (Stale)";
               return (
                 <tr key={acc.account_id}>
@@ -985,7 +969,9 @@ function AllocationCard({
                   <strong>{slice.label}</strong>
                 </td>
                 <td className="numeric">{displayValue(slice.amount, "USD")}</td>
-                <td className="numeric">{formatPercentage(slice.percentage)}</td>
+                <td className="numeric">
+                  {formatPercentage(slice.percentage, slice.percentage_display)}
+                </td>
                 <td className="numeric">{slice.position_count}</td>
               </tr>
             ))}
@@ -1039,43 +1025,148 @@ function AllocationBreakdown({
   );
 }
 
+type HistoryRowItem =
+  | { type: "point"; point: DailyRecordedPoint }
+  | {
+      type: "gap";
+      key: string;
+      prevDate: string;
+      nextDate: string;
+      missingDays: number;
+    };
+
+function deriveHistoryRows(points: DailyRecordedPoint[]): HistoryRowItem[] {
+  const sorted = [...points].sort((a, b) =>
+    getPointDate(a).localeCompare(getPointDate(b)),
+  );
+  const rows: HistoryRowItem[] = [];
+  for (let i = 0; i < sorted.length; i++) {
+    const point = sorted[i];
+    const pointDate = getPointDate(point);
+    if (i > 0) {
+      const prevDate = getPointDate(sorted[i - 1]);
+      if (prevDate && pointDate) {
+        const gapDays = dateGapDays(prevDate, pointDate);
+        if (gapDays > 1) {
+          const missingDays = gapDays - 1;
+          rows.push({
+            type: "gap",
+            key: `gap-${prevDate}-${pointDate}`,
+            prevDate,
+            nextDate: pointDate,
+            missingDays,
+          });
+        }
+      }
+    }
+    rows.push({ type: "point", point });
+  }
+  return rows;
+}
+
+function HistoryGapRow({
+  prevDate,
+  nextDate,
+  missingDays,
+}: {
+  prevDate: string;
+  nextDate: string;
+  missingDays: number;
+}) {
+  return (
+    <tr className="history-gap-row">
+      <td colSpan={3} className="history-gap-cell">
+        <span className="gap-indicator" aria-hidden="true">
+          ⋯
+        </span>
+        <em>
+          Gap in recorded history ({missingDays} missing day
+          {missingDays > 1 ? "s" : ""} between {prevDate} and {nextDate})
+        </em>
+      </td>
+    </tr>
+  );
+}
+
+function HistoryPointRow({ point }: { point: DailyRecordedPoint }) {
+  const pointDate = getPointDate(point) || "Unavailable";
+  const coverageText = point.accounts_total
+    ? `${point.accounts_count} of ${point.accounts_total} accounts`
+    : `${point.accounts_count} account${point.accounts_count === 1 ? "" : "s"}`;
+
+  return (
+    <tr>
+      <td className="identity-column">
+        <strong>{pointDate}</strong>
+      </td>
+      <td className="numeric">{displayValue(point.value, point.currency)}</td>
+      <td className="numeric">
+        <span className="history-coverage-content">
+          <span>{coverageText}</span>
+          {point.is_complete === false && (
+            <span className="status status-partial history-incomplete-badge">
+              <span aria-hidden="true" className="status-dot" />
+              Incomplete
+            </span>
+          )}
+        </span>
+      </td>
+    </tr>
+  );
+}
+
+function RecordedHistoryTable({ points }: { points: DailyRecordedPoint[] }) {
+  const rows = useMemo(() => deriveHistoryRows(points), [points]);
+
+  return (
+    <div
+      className="table-scroll"
+      tabIndex={0}
+      role="region"
+      aria-label="Recorded value history table"
+    >
+      <table className="history-table">
+        <thead>
+          <tr>
+            <th scope="col" className="identity-column">
+              Snapshot date
+            </th>
+            <th scope="col" className="numeric">
+              Recorded value
+            </th>
+            <th scope="col" className="numeric">
+              Accounts
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((item) =>
+            item.type === "gap" ? (
+              <HistoryGapRow
+                key={item.key}
+                prevDate={item.prevDate}
+                nextDate={item.nextDate}
+                missingDays={item.missingDays}
+              />
+            ) : (
+              <HistoryPointRow
+                key={getPointDate(item.point)}
+                point={item.point}
+              />
+            ),
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function RecordedHistorySection({
   history,
-  overviewHistory,
 }: {
-  history:
-    | RecordedHistory
-    | DailyRecordedPoint[]
-    | { history?: DailyRecordedPoint[] | RecordedHistory }
-    | undefined;
-  overviewHistory: RecordedHistory | undefined;
+  history: DailyRecordedPoint[] | undefined;
 }) {
-  const points = useMemo(() => {
-    if (!history) {
-      return overviewHistory?.points ?? [];
-    }
-    if (Array.isArray(history)) {
-      return history;
-    }
-    if ("history" in history && history.history) {
-      if (Array.isArray(history.history)) {
-        return history.history;
-      }
-      if ("points" in history.history && Array.isArray(history.history.points)) {
-        return history.history.points;
-      }
-    }
-    if ("points" in history && Array.isArray(history.points)) {
-      return history.points;
-    }
-    return overviewHistory?.points ?? [];
-  }, [history, overviewHistory]);
-
-  const sortedPoints = useMemo(() => {
-    return [...points].sort((a, b) =>
-      getPointDate(a).localeCompare(getPointDate(b)),
-    );
-  }, [points]);
+  const points = Array.isArray(history) ? history : [];
 
   return (
     <div className="history-section">
@@ -1086,69 +1177,14 @@ function RecordedHistorySection({
         <span className="muted">Daily snapshot timeline</span>
       </div>
       <p className="history-disclaimer muted">
-        Aggregated from daily recorded account balances. Missing calendar dates are preserved
-        as gaps and are never interpolated. Does not calculate investment performance or rate of return.
+        Aggregated from daily recorded account balances. Missing calendar dates
+        are preserved as gaps and are never interpolated. Does not calculate
+        investment performance or rate of return.
       </p>
-      {sortedPoints.length === 0 ? (
+      {points.length === 0 ? (
         <p className="state state-empty">No daily snapshots recorded yet.</p>
       ) : (
-        <div
-          className="table-scroll"
-          tabIndex={0}
-          role="region"
-          aria-label="Recorded value history table"
-        >
-          <table className="history-table">
-            <thead>
-              <tr>
-                <th scope="col" className="identity-column">Snapshot date</th>
-                <th scope="col" className="numeric">Recorded value</th>
-                <th scope="col" className="numeric">Accounts</th>
-              </tr>
-            </thead>
-            <tbody>
-              {sortedPoints.flatMap((point, index) => {
-                const pointDate = getPointDate(point);
-                const rows = [];
-                if (index > 0) {
-                  const prevPoint = sortedPoints[index - 1];
-                  const prevDate = getPointDate(prevPoint);
-                  if (prevDate && pointDate) {
-                    const gapDays = dateGapDays(prevDate, pointDate);
-                    if (gapDays > 1) {
-                      const missingDays = gapDays - 1;
-                      rows.push(
-                        <tr
-                          key={`gap-${prevDate}-${pointDate}`}
-                          className="history-gap-row"
-                        >
-                          <td colSpan={3} className="history-gap-cell">
-                            <span className="gap-indicator" aria-hidden="true">⋯</span>
-                            <em>
-                              Gap in recorded history ({missingDays} missing day{missingDays > 1 ? "s" : ""} between {prevDate} and {pointDate})
-                            </em>
-                          </td>
-                        </tr>
-                      );
-                    }
-                  }
-                }
-                rows.push(
-                  <tr key={pointDate || index}>
-                    <td className="identity-column">
-                      <strong>{pointDate || "Unavailable"}</strong>
-                    </td>
-                    <td className="numeric">
-                      {displayValue(point.value, point.currency)}
-                    </td>
-                    <td className="numeric">{point.accounts_count}</td>
-                  </tr>
-                );
-                return rows;
-              })}
-            </tbody>
-          </table>
-        </div>
+        <RecordedHistoryTable points={points} />
       )}
     </div>
   );
@@ -1161,11 +1197,7 @@ function OverviewSection({
   error,
 }: {
   overview: PortfolioOverview | undefined;
-  history:
-    | RecordedHistory
-    | DailyRecordedPoint[]
-    | { history?: DailyRecordedPoint[] | RecordedHistory }
-    | undefined;
+  history: DailyRecordedPoint[] | undefined;
   loading: boolean;
   error: boolean;
 }) {
@@ -1260,8 +1292,7 @@ function OverviewSection({
       <AllocationBreakdown allocations={overview.allocations} />
 
       <RecordedHistorySection
-        history={history}
-        overviewHistory={overview.history}
+        history={history ?? overview.history}
       />
     </section>
   );
@@ -1603,7 +1634,7 @@ export function App() {
         </section>
         <OverviewSection
           overview={overviewQuery.data?.overview}
-          history={overviewHistoryQuery.data ?? overviewQuery.data?.overview.history}
+          history={overviewHistoryQuery.data?.history ?? overviewQuery.data?.overview.history}
           loading={overviewQuery.isPending}
           error={overviewQuery.isError}
         />

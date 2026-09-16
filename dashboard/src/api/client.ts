@@ -149,6 +149,7 @@ export type OverviewAccountContribution = {
   market_value: string | null;
   is_stale: boolean;
   percentage_of_total: string | null;
+  percentage_of_total_display?: string | null;
 };
 
 export type AllocationSlice = {
@@ -156,6 +157,7 @@ export type AllocationSlice = {
   label: string;
   amount: string;
   percentage: string;
+  percentage_display?: string;
   position_count: number;
 };
 
@@ -183,13 +185,13 @@ export type OverviewExclusion = {
 };
 
 export type DailyRecordedPoint = {
-  date?: string;
+  date: string;
   snapshot_date?: string;
   value: string;
   currency: string;
   accounts_count: number;
-  accounts_total?: number;
-  is_complete?: boolean;
+  accounts_total: number;
+  is_complete: boolean;
 };
 
 export type RecordedHistory = {
@@ -214,17 +216,16 @@ export type PortfolioOverview = {
   gain_loss: GainLossCoverage;
   exclusions: OverviewExclusion[];
   warnings: string[];
-  history: RecordedHistory;
+  history: DailyRecordedPoint[];
 };
 
 export type OverviewResponse = {
   overview: PortfolioOverview;
 };
 
-export type HistoryResponse =
-  | { history: RecordedHistory | DailyRecordedPoint[] }
-  | DailyRecordedPoint[]
-  | RecordedHistory;
+export type HistoryResponse = {
+  history: DailyRecordedPoint[];
+};
 
 
 async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
