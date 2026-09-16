@@ -69,6 +69,8 @@ def test_fresh_overview_endpoint(tmp_path) -> None:
 
     assert overview["status"] == "fresh"
     assert overview["total_known_usd_value"] == "9999.95"
+    assert overview["cash_usd"] is not None
+    assert overview["buying_power_usd"] is None
     assert overview["as_of"] == "2026-08-29"
     assert overview["refreshed_at"] is not None
     assert overview["refreshed_at"].endswith("+00:00")
@@ -434,3 +436,87 @@ def test_error_overview_when_initial_refresh_fails(tmp_path) -> None:
     for w in overview["warnings"]:
         assert "traceback" not in w.lower()
         assert "exception" not in w.lower()
+
+
+def test_provider_coverage_mixed_account_outcomes(tmp_path) -> None:
+    client, repo = create_client(tmp_path=tmp_path)
+    now = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
+    snap_date = date(2026, 8, 29)
+
+    acc1 = Account(
+        id="schwab-1",
+        provider="Schwab",
+        label="Schwab Taxable 1",
+        account_type="taxable_brokerage",
+        currency="USD",
+    )
+    acc2 = Account(
+        id="schwab-2",
+        provider="Schwab",
+        label="Schwab Taxable 2",
+        account_type="taxable_brokerage",
+        currency="USD",
+    )
+    pos1 = [
+        Position(
+            account_id="schwab-1",
+            symbol="VTI",
+            name="VTI",
+            asset_class="equity_etf",
+            quantity=Decimal("10"),
+            current_price=Decimal("100.00"),
+            market_value=Decimal("1000.00"),
+            cost_basis=Decimal("900.00"),
+            currency="USD",
+        )
+    ]
+    pos2 = [
+        Position(
+            account_id="schwab-2",
+            symbol="BND",
+            name="BND",
+            asset_class="bond_etf",
+            quantity=Decimal("10"),
+            current_price=Decimal("100.00"),
+            market_value=Decimal("1000.00"),
+            cost_basis=Decimal("900.00"),
+            currency="USD",
+        )
+    ]
+
+    # Save initial refresh with 2 accounts
+    repo.save_refresh(
+        snapshots=[
+            HoldingsSnapshot(account=acc1, as_of=snap_date, positions=tuple(pos1)),
+            HoldingsSnapshot(account=acc2, as_of=snap_date, positions=tuple(pos2)),
+        ],
+        started_at=now,
+        completed_at=now,
+        snapshot_date=snap_date,
+    )
+
+    # Second refresh: only acc1 is refreshed, acc2 fails (stale)
+    repo.save_refresh(
+        snapshots=[
+            HoldingsSnapshot(account=acc1, as_of=snap_date, positions=tuple(pos1)),
+        ],
+        failed_accounts=[acc2],
+        started_at=now,
+        completed_at=now,
+        snapshot_date=snap_date,
+    )
+
+    resp = client.get("/api/overview")
+    assert resp.status_code == 200
+    overview = resp.json()["overview"]
+
+    assert overview["status"] == "partial"
+    # Fresh positions from acc1 remain in total
+    assert overview["total_known_usd_value"] == "1000.00"
+
+    coverages = {pc["provider"]: pc for pc in overview["provider_coverage"]}
+    schwab_cov = coverages["Schwab"]
+    assert schwab_cov["status"] == "partial"
+    assert schwab_cov["accounts_refreshed"] == 1
+    assert schwab_cov["stale_accounts"] == 1
+    assert schwab_cov["is_included_in_totals"] is True
