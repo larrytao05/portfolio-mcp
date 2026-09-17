@@ -654,7 +654,6 @@ class OverviewService:
     def _sanitize_warnings(self, warnings: Sequence[str]) -> tuple[str, ...]:
         sanitized: list[str] = []
         for w in warnings:
-            # Strip out raw internal exception details or tracebacks
             if any(
                 err in w
                 for err in ("Traceback", "Exception:", "Error:", "OperationalError")
@@ -696,9 +695,6 @@ class OverviewService:
         provider_coverages: list[ProviderCoverage] = []
         if latest_refresh and latest_refresh.provider_outcomes:
             for outcome in latest_refresh.provider_outcomes:
-                # Accurately model partial provider coverage:
-                # If both refreshed > 0 and (stale > 0 or excluded > 0),
-                # provider status is partial
                 if outcome.accounts_refreshed > 0 and (
                     outcome.stale_accounts > 0 or outcome.excluded_accounts > 0
                 ):
