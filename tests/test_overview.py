@@ -910,8 +910,7 @@ def test_overview_to_dict_serialization(tmp_path) -> None:
     assert gain_loss["cost_basis"] == "2500.00"
 
     history = data["history"]
-    assert isinstance(history, dict)
-    assert isinstance(history["points"], list)
+    assert isinstance(history, list)
 
 
 def test_mixed_currency_account_daily_history_excludes_non_usd_from_usd_snapshot(

@@ -1,6 +1,6 @@
 # Portfolio Dashboard
 
-A local, read-only portfolio dashboard for viewing brokerage accounts,
+A local, read-focused portfolio workspace for viewing brokerage accounts,
 holdings, transaction activity, and market quotes. It pairs a React frontend
 with a FastAPI backend and SQLite storage, with fixture data available for
 offline development.
@@ -10,16 +10,35 @@ and page through saved activity, and search instruments and view quotes. It
 currently supports SnapTrade for portfolio data and Schwab for market data;
 both integrations are strictly read-only.
 
+The guarded order workflow uses fake execution for safe product testing; it
+does not submit live orders.
+
+## Guides
+
+- [Frontend guide](dashboard/README.md) explains the React and TypeScript
+  application, including data fetching, testing, and a beginner-friendly code
+  tour.
+- [Backend guide](portfolio_mcp/README.md) explains FastAPI, services,
+  providers, SQLite persistence, migrations, and the MCP server.
+
 ## Architecture
 
-- `dashboard/` contains the React frontend.
+- `dashboard/` contains the React and TypeScript frontend.
 - `api_main.py` starts the FastAPI API used by the dashboard.
-- `portfolio_mcp/` contains the provider adapters, application logic, and API.
+- `main.py` starts the MCP server over stdio.
+- `portfolio_mcp/` contains provider adapters, application logic, persistence,
+  and API routes.
+- `tests/` contains backend behavior tests and `alembic/` contains SQLite
+  schema migrations.
 
 Portfolio providers list accounts, retrieve holdings snapshots, and return
 date-bounded transaction history. Account labels are safe to display,
 transactions are newest first, and a missing price, market value, or cost basis
 is represented as `null`.
+
+Authoritative cross-account portfolio calculations belong in the backend
+overview read model; the browser renders server-provided totals and coverage
+rather than rebuilding financial aggregates independently.
 
 ## Run and verify
 
