@@ -706,6 +706,37 @@ class PortfolioRepository:
                 for record in records
             ]
 
+    def all_positions(self) -> list[StoredPosition]:
+        with self._sessions() as session:
+            records = session.execute(
+                select(PositionRecord, AccountRecord)
+                .join(AccountRecord, PositionRecord.account_id == AccountRecord.id)
+                .order_by(PositionRecord.account_id, PositionRecord.symbol)
+            ).all()
+            return [
+                self._stored_position(pos_record, acc_record)
+                for pos_record, acc_record in records
+            ]
+
+    def all_daily_values(self) -> list[DailyAccountValue]:
+        with self._sessions() as session:
+            records = session.scalars(
+                select(DailyAccountValueRecord).order_by(
+                    DailyAccountValueRecord.snapshot_date,
+                    DailyAccountValueRecord.account_id,
+                )
+            )
+            return [
+                DailyAccountValue(
+                    account_id=record.account_id,
+                    snapshot_date=record.snapshot_date,
+                    value=record.value,
+                    currency=record.currency,
+                    recorded_at=record.recorded_at,
+                )
+                for record in records
+            ]
+
     def latest_refresh(self) -> RefreshResult | None:
         with self._sessions() as session:
             record = session.scalar(
@@ -869,6 +900,7 @@ class PortfolioRepository:
             position.market_value
             for position in snapshot.positions
             if position.market_value is not None
+            and position.currency == snapshot.account.currency
         ]
         if not values:
             return
