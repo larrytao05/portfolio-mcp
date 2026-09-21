@@ -50,7 +50,7 @@ def create_app(
     database_url: str = "sqlite:///portfolio.db",
     clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
-    repository = PortfolioRepository(database_url)
+    repository = PortfolioRepository(database_url, clock)
     refresh_service = PortfolioRefreshService(provider, repository, clock)
     market_data = market_data_provider or FixtureMarketDataProvider()
     service_clock = clock or (lambda: datetime.now(UTC))
@@ -116,6 +116,25 @@ def create_app(
         if values is None:
             raise HTTPException(status_code=404, detail="Account not found")
         return {"daily_values": [value.to_dict() for value in values]}
+
+    @app.get("/api/trading/status")
+    async def trading_status() -> dict[str, object]:
+        return {
+            "providers": [health.to_dict() for health in repository.provider_health()],
+            "accounts": [
+                capability.to_dict() for capability in repository.current_capabilities()
+            ],
+        }
+
+    @app.get("/api/accounts/{account_id}/capabilities")
+    async def account_capabilities(account_id: str) -> dict[str, object]:
+        capability = repository.account_capability(account_id)
+        if capability is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "account_not_found", "message": "Account not found"},
+            )
+        return {"capability": capability.to_dict()}
 
     @app.get("/api/refreshes/latest")
     async def latest_refresh() -> dict[str, object]:

@@ -108,6 +108,38 @@ export type Quote = {
   currency: string | null;
 };
 
+export type CapabilityBlock = {
+  code: string;
+  message: string;
+  recovery_action: string | null;
+};
+
+export type ProviderHealth = {
+  provider: string;
+  state: string;
+  observed_at: string | null;
+  last_success_at: string | null;
+  blocks: CapabilityBlock[];
+};
+
+export type AccountCapability = {
+  account_id: string;
+  provider: string;
+  asset_classes: string[];
+  supported_sides: string[];
+  order_types: string[];
+  time_in_force: string[];
+  sizing_modes: string[];
+  preview_supported: boolean;
+  cancellation_supported: boolean;
+  observed_at: string | null;
+  last_success_at: string | null;
+  source: string;
+  blocks: CapabilityBlock[];
+  is_stale: boolean;
+  is_trade_capable: boolean;
+};
+
 export type OrderDraft = {
   id: string;
   account: { id: string; label: string; provider: string };
@@ -255,6 +287,13 @@ export function getAccount(accountId: string): Promise<{ account: AccountDetail 
 
 export function getLatestRefresh(): Promise<{ refresh: RefreshResult | null }> {
   return getJson("/api/refreshes/latest");
+}
+
+export function getTradingStatus(): Promise<{
+  providers: ProviderHealth[];
+  accounts: AccountCapability[];
+}> {
+  return getJson("/api/trading/status");
 }
 
 export function refreshPortfolio(): Promise<{ refresh: RefreshResult }> {

@@ -20,6 +20,7 @@ import {
   getAccounts,
   getHealth,
   getLatestRefresh,
+  getTradingStatus,
   getOverview,
   getOverviewHistory,
   getQuote,
@@ -28,9 +29,11 @@ import {
   refreshPortfolio,
   searchInstruments,
   type Account,
+  type AccountCapability,
   type ActivityFilters,
   type Order,
   type OrderDraft,
+  type ProviderHealth,
 } from "./api/client";
 
 type SortField =
@@ -227,6 +230,64 @@ function AccountSummary({ account }: { account: AccountDetail }) {
     </dl>
   );
 }
+
+function capabilityLabel(capability: AccountCapability) {
+  if (capability.is_trade_capable) return "Trade-capable";
+  if (capability.blocks.some((block) => block.code === "monitoring_only"))
+    return "Monitoring only";
+  if (capability.is_stale) return "Stale — trading blocked";
+  return "Trading blocked";
+}
+
+function ExecutionStatus({
+  status,
+  loading,
+  unavailable,
+}: {
+  status: { providers: ProviderHealth[]; accounts: AccountCapability[] } | undefined;
+  loading: boolean;
+  unavailable: boolean;
+}) {
+  return (
+    <section className="content-section" id="settings" aria-labelledby="settings-heading">
+      <div className="section-heading">
+        <div><h2 id="settings-heading">Execution status</h2></div>
+        <span className="muted">Saved capability observations</span>
+      </div>
+      {loading && !status && <p className="state">Loading execution status…</p>}
+      {unavailable && !status && <p className="state state-error">Execution status is unavailable. Refresh to check provider status.</p>}
+      {status?.accounts.length === 0 && <p className="state state-empty">No saved capability observations yet. Refresh your portfolio first.</p>}
+      {status?.providers.map((provider) => (
+        <div className="stale-note" key={provider.provider}>
+          <p>
+            <strong>{provider.provider}</strong> · Connection state: {provider.state}
+          </p>
+          <p>
+            Last successful observation: {provider.last_success_at ? new Date(provider.last_success_at).toLocaleString() : "never"}
+          </p>
+          {provider.blocks.map((block) => (
+            <p className="inline-alert" key={block.code} role="alert">
+              {block.message}{block.recovery_action ? ` ${block.recovery_action}` : ""}
+            </p>
+          ))}
+        </div>
+      ))}
+      {status?.accounts.map((capability) => (
+        <article className="account-record" key={capability.account_id}>
+          <div className="account-body">
+            <h3>{capability.provider}</h3>
+            <p>Public account ID: {capability.account_id}</p>
+            <p><strong>{capabilityLabel(capability)}</strong> · Observed {capability.observed_at ? new Date(capability.observed_at).toLocaleString() : "never"}</p>
+            <p>Supports: {capability.asset_classes.join(", ") || "no execution actions"} · {capability.order_types.join(", ") || "no order types"}</p>
+            <p>Sides: {capability.supported_sides.join(", ") || "unavailable"} · Time in force: {capability.time_in_force.join(", ") || "unavailable"} · Sizing: {capability.sizing_modes.join(", ") || "unavailable"}</p>
+            <p>Preview: {capability.preview_supported ? "available" : "unavailable"} · Cancellation: {capability.cancellation_supported ? "available" : "unavailable"}</p>
+            {capability.blocks.map((block) => <p className="inline-alert" key={block.code} role="alert">{block.message}{block.recovery_action ? ` ${block.recovery_action}` : ""}</p>)}
+          </div>
+        </article>
+      ))}
+    </section>
+  );
+}
 function HoldingsTable({
   holdings,
   sort,
@@ -299,7 +360,13 @@ function HoldingsTable({
     </div>
   );
 }
-function AccountHoldings({ account }: { account: AccountDetail }) {
+function AccountHoldings({
+  account,
+  capability,
+}: {
+  account: AccountDetail;
+  capability?: AccountCapability;
+}) {
   const [filter, setFilter] = useState(""),
     [assetClass, setAssetClass] = useState("all"),
     [sort, setSort] = useState<{ field: SortField; direction: SortDirection }>({
@@ -356,6 +423,27 @@ function AccountHoldings({ account }: { account: AccountDetail }) {
       </summary>
       <div className="account-body">
         <AccountSummary account={account} />
+        {capability && (
+          <dl className="account-facts">
+            <div>
+              <dt>Execution capability</dt>
+              <dd>{capabilityLabel(capability)}</dd>
+            </div>
+            <div>
+              <dt>Supported orders</dt>
+              <dd>{capability.order_types.join(", ") || "Unavailable"}</dd>
+            </div>
+            {capability.blocks.map((block) => (
+              <div key={block.code}>
+                <dt>Trading block</dt>
+                <dd className="inline-alert" role="alert">
+                  {block.message}
+                  {block.recovery_action ? ` ${block.recovery_action}` : ""}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        )}
         <div className="section-heading">
           <div>
             <h3>Holdings</h3>
@@ -1312,6 +1400,7 @@ function Navigation() {
         ["accounts", "Accounts"],
         ["activity", "Activity"],
         ["market-data", "Market data"],
+        ["settings", "Settings"],
         ["trade", "Trade"],
       ].map(([id, label]) => (
         <a
@@ -1473,6 +1562,7 @@ export function App() {
     queryKey: ["refreshes", "latest"],
     queryFn: getLatestRefresh,
   });
+  const tradingStatus = useQuery({ queryKey: ["trading", "status"], queryFn: getTradingStatus });
   const overviewQuery = useQuery({
     queryKey: ["overview"],
     queryFn: getOverview,
@@ -1495,6 +1585,7 @@ export function App() {
         queryClient.invalidateQueries({ queryKey: ["refreshes"] }),
         queryClient.invalidateQueries({ queryKey: ["activity"] }),
         queryClient.invalidateQueries({ queryKey: ["overview"] }),
+        queryClient.invalidateQueries({ queryKey: ["trading", "status"] }),
       ]);
     },
   });
@@ -1624,7 +1715,12 @@ export function App() {
                       </p>
                     )}
                     {detail?.data && (
-                      <AccountHoldings account={detail.data.account} />
+                      <AccountHoldings
+                        account={detail.data.account}
+                        capability={tradingStatus.data?.accounts.find(
+                          (capability) => capability.account_id === account.id,
+                        )}
+                      />
                     )}
                   </div>
                 );
@@ -1640,6 +1736,7 @@ export function App() {
         />
         <ActivitySection accounts={accounts.data?.accounts ?? []} />
         <MarketDataSection />
+        <ExecutionStatus status={tradingStatus.data} loading={tradingStatus.isPending} unavailable={tradingStatus.isError} />
         <TradeSection accounts={accounts.data?.accounts ?? []} />
       </main>
     </div>
