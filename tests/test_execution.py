@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -20,6 +21,11 @@ from portfolio_mcp.execution import (
     require_transition,
 )
 from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
+from portfolio_mcp.trading_safety import (
+    TradeIntent,
+    TradingGuard,
+    TradingSettingsService,
+)
 from portfolio_mcp.trading_service import (
     OrderDraftService,
     OrderSubmissionService,
@@ -41,6 +47,168 @@ def command() -> ExecutionCommand:
         quantity=Decimal("1"),
         limit_price=Decimal("300"),
     )
+
+
+def enable_trading_api(client: TestClient) -> None:
+    assert client.post("/api/refresh").status_code == 200
+    response = client.put(
+        "/api/trading/settings",
+        json={
+            "live_trading_enabled": True,
+            "kill_switch_active": False,
+            "max_order_shares": "1000",
+            "max_order_notional_usd": "1000000",
+            "version": 0,
+        },
+    )
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_trading_guard_applies_conservative_limits_and_capabilities(
+    tmp_path,
+) -> None:
+    now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+    portfolio = FixturePortfolioProvider()
+    repository = PortfolioRepository(
+        f"sqlite:///{tmp_path / 'portfolio.db'}", lambda: now
+    )
+    snapshots = [
+        await portfolio.get_holdings(account.id)
+        for account in await portfolio.list_accounts()
+    ]
+    repository.save_refresh(
+        snapshots,
+        now,
+        now,
+        now.date(),
+        capabilities=await portfolio.get_account_capabilities(
+            [snapshot.account.id for snapshot in snapshots]
+        ),
+    )
+    settings = TradingSettingsService(repository, lambda: now)
+    settings.replace(
+        live_trading_enabled=True,
+        kill_switch_active=False,
+        max_order_shares="2",
+        max_order_notional_usd="200",
+        version=0,
+    )
+    guard = TradingGuard(repository, settings)
+
+    allowed = guard.evaluate(
+        TradeIntent(
+            account_id="schwab-taxable-demo",
+            symbol="VTI",
+            asset_class="equity_etf",
+            side="buy",
+            order_type="market",
+            quantity=Decimal("2"),
+            limit_price=None,
+            bid_price=Decimal("99"),
+            ask_price=Decimal("100"),
+            last_price=Decimal("98"),
+        )
+    )
+    assert allowed.allowed
+    assert allowed.estimated_notional == Decimal("200")
+
+    blocked = guard.evaluate(
+        TradeIntent(
+            account_id="schwab-taxable-demo",
+            symbol="VTI",
+            asset_class="etf",
+            side="buy",
+            order_type="market",
+            quantity=Decimal("3"),
+            limit_price=None,
+            bid_price=Decimal("99"),
+            ask_price=Decimal("100"),
+            last_price=None,
+        )
+    )
+    assert {violation.code for violation in blocked.violations} == {
+        "share_limit_exceeded",
+        "notional_limit_exceeded",
+    }
+
+
+@pytest.mark.asyncio
+async def test_trading_guard_fails_closed_for_each_safety_precondition(
+    tmp_path,
+) -> None:
+    now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+    portfolio = FixturePortfolioProvider()
+    repository = PortfolioRepository(
+        f"sqlite:///{tmp_path / 'portfolio.db'}", lambda: now
+    )
+    snapshots = [
+        await portfolio.get_holdings(account.id)
+        for account in await portfolio.list_accounts()
+    ]
+    repository.save_refresh(
+        snapshots,
+        now,
+        now,
+        now.date(),
+        capabilities=await portfolio.get_account_capabilities(
+            [snapshot.account.id for snapshot in snapshots]
+        ),
+    )
+    settings = TradingSettingsService(repository, lambda: now)
+    enabled = settings.replace(
+        live_trading_enabled=True,
+        kill_switch_active=False,
+        max_order_shares="100",
+        max_order_notional_usd="10000",
+        version=0,
+    )
+    guard = TradingGuard(repository, settings)
+    intent = TradeIntent(
+        account_id="schwab-taxable-demo",
+        symbol="VTI",
+        asset_class="etf",
+        side="buy",
+        order_type="market",
+        quantity=Decimal("1"),
+        limit_price=None,
+        bid_price=Decimal("99"),
+        ask_price=Decimal("100"),
+        last_price=Decimal("98"),
+    )
+
+    assert "capability_unavailable" in _violation_codes(
+        guard.evaluate(replace(intent, account_id="fidelity-roth-demo"))
+    )
+    assert "capability_unsupported" in _violation_codes(
+        guard.evaluate(replace(intent, asset_class="crypto"))
+    )
+    assert "quote_unavailable" in _violation_codes(
+        guard.evaluate(replace(intent, bid_price=None, ask_price=None, last_price=None))
+    )
+    assert "invalid_quantity" in _violation_codes(
+        guard.evaluate(replace(intent, quantity=Decimal("1.5")))
+    )
+    assert "insufficient_holdings" in _violation_codes(
+        guard.evaluate(replace(intent, side="sell", quantity=Decimal("10")))
+    )
+
+    blocked = settings.replace(
+        live_trading_enabled=False,
+        kill_switch_active=True,
+        max_order_shares="100",
+        max_order_notional_usd="10000",
+        version=enabled.version,
+    )
+    assert _violation_codes(guard.evaluate(intent)) == {
+        "trading_disabled",
+        "kill_switch_active",
+    }
+    assert blocked.version == 2
+
+
+def _violation_codes(decision) -> set[str]:
+    return {violation.code for violation in decision.violations}
 
 
 class IndeterminateExecutionProvider:
@@ -92,18 +260,70 @@ async def create_limit_draft(
     now: datetime,
     account_id: str = "schwab-taxable-demo",
 ):
-    return await OrderDraftService(
+    portfolio = FixturePortfolioProvider()
+    service = await enabled_order_draft_service(
         repository,
-        FixturePortfolioProvider(),
+        portfolio,
         FixtureMarketDataProvider(),
         lambda: now,
-    ).create(
+    )
+    return await service.create(
         account_id=account_id,
         instrument_id="us-etf:VTI",
         side="buy",
         order_type="limit",
         quantity="1",
         limit_price="300.25",
+    )
+
+
+async def enabled_trading_guard(
+    repository: PortfolioRepository, portfolio: FixturePortfolioProvider
+) -> TradingGuard:
+    refreshed_at = datetime.now(UTC)
+    accounts = await portfolio.list_accounts()
+    snapshots = [await portfolio.get_holdings(account.id) for account in accounts]
+    capabilities = [
+        replace(
+            capability,
+            observed_at=refreshed_at,
+            last_success_at=refreshed_at,
+            is_stale=False,
+        )
+        for capability in await portfolio.get_account_capabilities(
+            [account.id for account in accounts]
+        )
+    ]
+    repository.save_refresh(
+        snapshots,
+        refreshed_at,
+        refreshed_at,
+        refreshed_at.date(),
+        capabilities=capabilities,
+    )
+    settings = TradingSettingsService(repository, lambda: refreshed_at)
+    settings.replace(
+        live_trading_enabled=True,
+        kill_switch_active=False,
+        max_order_shares="1000",
+        max_order_notional_usd="1000000",
+        version=0,
+    )
+    return TradingGuard(repository, settings)
+
+
+async def enabled_order_draft_service(
+    repository: PortfolioRepository,
+    portfolio: FixturePortfolioProvider,
+    market_data: FixtureMarketDataProvider,
+    clock: Callable[[], datetime],
+) -> OrderDraftService:
+    return OrderDraftService(
+        repository,
+        portfolio,
+        market_data,
+        clock,
+        await enabled_trading_guard(repository, portfolio),
     )
 
 
@@ -185,12 +405,15 @@ async def test_drafts_accept_canonical_etf_asset_class(tmp_path) -> None:
                 quote, instrument=replace(quote.instrument, asset_class="etf")
             )
 
-    draft = await OrderDraftService(
-        PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}"),
-        FixturePortfolioProvider(),
+    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    portfolio = FixturePortfolioProvider()
+    service = await enabled_order_draft_service(
+        repository,
+        portfolio,
         CanonicalEtfMarketDataProvider(),
         lambda: now,
-    ).create(
+    )
+    draft = await service.create(
         account_id="schwab-taxable-demo",
         instrument_id="us-etf:VTI",
         side="buy",
@@ -232,9 +455,10 @@ async def test_fixture_submission_validator_rechecks_current_sell_holdings(
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
     portfolio = FixturePortfolioProvider()
     repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    draft = await OrderDraftService(
+    service = await enabled_order_draft_service(
         repository, portfolio, FixtureMarketDataProvider(), lambda: now
-    ).create(
+    )
+    draft = await service.create(
         account_id="schwab-taxable-demo",
         instrument_id="us-etf:VTI",
         side="sell",
@@ -309,12 +533,14 @@ async def test_market_quote_can_stale_after_intent_and_reject_without_provider_c
 ) -> None:
     observed_at = FixtureMarketDataProvider.observed_at
     repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    draft = await OrderDraftService(
+    portfolio = FixturePortfolioProvider()
+    draft_service = await enabled_order_draft_service(
         repository,
-        FixturePortfolioProvider(),
+        portfolio,
         FixtureMarketDataProvider(),
         lambda: observed_at,
-    ).create(
+    )
+    draft = await draft_service.create(
         account_id="schwab-taxable-demo",
         instrument_id="us-etf:VTI",
         side="buy",
@@ -389,9 +615,10 @@ async def test_submission_persists_intent_once_and_never_retries_unknown(
 ) -> None:
     now = datetime(2026, 9, 12, 20, 0, 30, tzinfo=UTC)
     repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    draft_service = OrderDraftService(
+    portfolio = FixturePortfolioProvider()
+    draft_service = await enabled_order_draft_service(
         repository,
-        FixturePortfolioProvider(),
+        portfolio,
         FixtureMarketDataProvider(),
         lambda: now,
     )
@@ -424,12 +651,14 @@ async def test_submission_runs_the_final_policy_check_before_persisting_intent(
 ) -> None:
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
     repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    draft = await OrderDraftService(
+    portfolio = FixturePortfolioProvider()
+    draft_service = await enabled_order_draft_service(
         repository,
-        FixturePortfolioProvider(),
+        portfolio,
         FixtureMarketDataProvider(),
         lambda: now,
-    ).create(
+    )
+    draft = await draft_service.create(
         account_id="schwab-taxable-demo",
         instrument_id="us-etf:VTI",
         side="buy",
@@ -562,7 +791,7 @@ async def test_empty_capability_map_denies_default_account() -> None:
 
 def test_confirm_api_blocks_unknown_account_capability_before_submit(tmp_path) -> None:
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
-    execution = FixtureExecutionProvider()
+    execution = FixtureExecutionProvider(capabilities={})
     client = TestClient(
         create_app(
             FixturePortfolioProvider(),
@@ -571,10 +800,11 @@ def test_confirm_api_blocks_unknown_account_capability_before_submit(tmp_path) -
             clock=lambda: now,
         )
     )
+    enable_trading_api(client)
     draft = client.post(
         "/api/order-drafts",
         json={
-            "account_id": "fidelity-roth-demo",
+            "account_id": "schwab-taxable-demo",
             "instrument_id": "us-etf:VTI",
             "side": "buy",
             "order_type": "limit",
@@ -739,9 +969,10 @@ async def test_market_confirmation_enforces_quote_freshness_boundary(
 ) -> None:
     observed_at = FixtureMarketDataProvider.observed_at
     repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    draft_service = OrderDraftService(
+    portfolio = FixturePortfolioProvider()
+    draft_service = await enabled_order_draft_service(
         repository,
-        FixturePortfolioProvider(),
+        portfolio,
         FixtureMarketDataProvider(),
         lambda: observed_at,
     )
@@ -786,6 +1017,7 @@ def test_confirm_api_requires_explicit_confirmation_and_replays_safely(
             clock=lambda: now,
         )
     )
+    enable_trading_api(client)
     draft_response = client.post(
         "/api/order-drafts",
         json={
@@ -831,3 +1063,48 @@ def test_confirm_api_requires_explicit_confirmation_and_replays_safely(
     assert wrong_fingerprint.status_code == 422
     assert wrong_fingerprint.json()["error"]["code"] == "draft_changed"
     assert [name for name, _ in provider.invocations] == ["capability", "submit"]
+
+
+def test_kill_switch_blocks_submission_after_a_draft_is_reviewed(tmp_path) -> None:
+    now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+    provider = FixtureExecutionProvider()
+    client = TestClient(
+        create_app(
+            FixturePortfolioProvider(),
+            execution_provider=provider,
+            database_url=f"sqlite:///{tmp_path / 'portfolio.db'}",
+            clock=lambda: now,
+        )
+    )
+    enable_trading_api(client)
+    draft = client.post(
+        "/api/order-drafts",
+        json={
+            "account_id": "schwab-taxable-demo",
+            "instrument_id": "us-etf:VTI",
+            "side": "buy",
+            "order_type": "limit",
+            "quantity": "1",
+            "limit_price": "300",
+        },
+    ).json()["draft"]
+    response = client.put(
+        "/api/trading/settings",
+        json={
+            "live_trading_enabled": True,
+            "kill_switch_active": True,
+            "max_order_shares": "1000",
+            "max_order_notional_usd": "1000000",
+            "version": 1,
+        },
+    )
+    assert response.status_code == 200
+
+    confirmation = client.post(
+        f"/api/order-drafts/{draft['id']}/confirm",
+        json={"expected_fingerprint": draft["fingerprint"], "confirmed": True},
+    )
+
+    assert confirmation.status_code == 200
+    assert confirmation.json()["order"]["result"]["code"] == "kill_switch_active"
+    assert [name for name, _ in provider.invocations] == ["capability"]

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 from alembic.config import Config
@@ -17,8 +18,10 @@ from sqlalchemy import (
     UniqueConstraint,
     delete,
     select,
+    update,
 )
-from sqlalchemy.engine import Engine, create_engine
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import CursorResult, Engine, create_engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sqlalchemy.types import TypeDecorator
@@ -180,6 +183,18 @@ class AccountCapabilityRecord(Base):
     is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
+class TradingSettingsRecord(Base):
+    __tablename__ = "trading_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    live_trading_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    kill_switch_active: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    max_order_shares: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    max_order_notional_usd: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    updated_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
 class OrderDraftRecord(Base):
     __tablename__ = "order_drafts"
 
@@ -285,6 +300,16 @@ class StoredAccount:
             "is_stale": self.is_stale,
             "source_refreshed_at": self.source_refreshed_at.isoformat(),
         }
+
+
+@dataclass(frozen=True)
+class StoredTradingSettings:
+    live_trading_enabled: bool
+    kill_switch_active: bool
+    max_order_shares: Decimal | None
+    max_order_notional_usd: Decimal | None
+    updated_at: datetime | None
+    version: int
 
 
 @dataclass(frozen=True)
@@ -457,6 +482,62 @@ class PortfolioRepository:
                     expires_at=draft.expires_at,
                 )
             )
+
+    def trading_settings(self) -> StoredTradingSettings:
+        with self._sessions() as session:
+            record = session.get(TradingSettingsRecord, 1)
+            if record is None:
+                return StoredTradingSettings(False, True, None, None, None, 0)
+            return self._stored_trading_settings(record)
+
+    def replace_trading_settings(
+        self,
+        *,
+        live_trading_enabled: bool,
+        kill_switch_active: bool,
+        max_order_shares: Decimal | None,
+        max_order_notional_usd: Decimal | None,
+        expected_version: int,
+        updated_at: datetime,
+    ) -> StoredTradingSettings | None:
+        values = {
+            "live_trading_enabled": live_trading_enabled,
+            "kill_switch_active": kill_switch_active,
+            "max_order_shares": max_order_shares,
+            "max_order_notional_usd": max_order_notional_usd,
+            "updated_at": updated_at,
+            "version": expected_version + 1,
+        }
+        with self._sessions.begin() as session:
+            if expected_version == 0:
+                inserted = cast(
+                    CursorResult[object],
+                    session.execute(
+                        sqlite_insert(TradingSettingsRecord)
+                        .values(id=1, **values)
+                        .on_conflict_do_nothing(index_elements=("id",))
+                    ),
+                )
+                if inserted.rowcount == 1:
+                    record = session.get(TradingSettingsRecord, 1)
+                    assert record is not None
+                    return self._stored_trading_settings(record)
+            updated = cast(
+                CursorResult[object],
+                session.execute(
+                    update(TradingSettingsRecord)
+                    .where(
+                        TradingSettingsRecord.id == 1,
+                        TradingSettingsRecord.version == expected_version,
+                    )
+                    .values(**values)
+                ),
+            )
+            if updated.rowcount != 1:
+                return None
+            record = session.get(TradingSettingsRecord, 1)
+            assert record is not None
+            return self._stored_trading_settings(record)
 
     def order_draft(self, draft_id: str) -> "OrderDraft | None":
         with self._sessions() as session:
@@ -1111,6 +1192,18 @@ class PortfolioRepository:
             fingerprint=record.fingerprint,
             created_at=record.created_at,
             expires_at=record.expires_at,
+        )
+
+    def _stored_trading_settings(
+        self, record: TradingSettingsRecord
+    ) -> StoredTradingSettings:
+        return StoredTradingSettings(
+            live_trading_enabled=record.live_trading_enabled,
+            kill_switch_active=record.kill_switch_active,
+            max_order_shares=record.max_order_shares,
+            max_order_notional_usd=record.max_order_notional_usd,
+            updated_at=record.updated_at,
+            version=record.version,
         )
 
     def _stored_order(self, record: OrderRecord) -> "StoredOrder":

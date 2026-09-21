@@ -140,6 +140,16 @@ export type AccountCapability = {
   is_trade_capable: boolean;
 };
 
+export type TradingSettings = {
+  live_trading_enabled: boolean;
+  kill_switch_active: boolean;
+  max_order_shares: string | null;
+  max_order_notional_usd: string | null;
+  updated_at: string | null;
+  version: number;
+  effective_state: string;
+};
+
 export type OrderDraft = {
   id: string;
   account: { id: string; label: string; provider: string };
@@ -294,6 +304,18 @@ export function getTradingStatus(): Promise<{
   accounts: AccountCapability[];
 }> {
   return getJson("/api/trading/status");
+}
+
+export function getTradingSettings(): Promise<{ settings: TradingSettings }> {
+  return getJson("/api/trading/settings");
+}
+
+export function updateTradingSettings(input: Omit<TradingSettings, "updated_at" | "effective_state">): Promise<{ settings: TradingSettings }> {
+  return getJson("/api/trading/settings", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
 }
 
 export function refreshPortfolio(): Promise<{ refresh: RefreshResult }> {

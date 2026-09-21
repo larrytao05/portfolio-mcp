@@ -23,7 +23,9 @@ const api = vi.hoisted(() => ({
   getOverviewHistory: vi.fn(),
   getQuote: vi.fn(),
   getTradingStatus: vi.fn(),
+  getTradingSettings: vi.fn(),
   refreshPortfolio: vi.fn(),
+  updateTradingSettings: vi.fn(),
   searchInstruments: vi.fn(),
 }));
 
@@ -76,6 +78,8 @@ describe("App", () => {
     api.searchInstruments.mockResolvedValue({ instruments: [] });
     api.getQuote.mockResolvedValue({ quote: null });
     api.getTradingStatus.mockResolvedValue({ providers: [], accounts: [] });
+    api.getTradingSettings.mockResolvedValue({ settings: { live_trading_enabled: false, kill_switch_active: true, max_order_shares: null, max_order_notional_usd: null, updated_at: null, version: 0, effective_state: "Trading blocked" } });
+    api.updateTradingSettings.mockResolvedValue({ settings: { live_trading_enabled: false, kill_switch_active: true, max_order_shares: null, max_order_notional_usd: null, updated_at: null, version: 1, effective_state: "Trading blocked" } });
     api.getOverview.mockResolvedValue({
       overview: {
         total_known_usd_value: null,
@@ -128,6 +132,47 @@ describe("App", () => {
     expect(
       await screen.findByText(/Saved 2 accounts and 9 positions/),
     ).toBeTruthy();
+  });
+
+  it("starts with visibly blocking trading safeguards", async () => {
+    renderApp();
+
+    expect(await screen.findByText("Trading safeguards")).toBeTruthy();
+    expect(screen.getByText("Trading blocked")).toBeTruthy();
+    expect(
+      (screen.getByLabelText("Kill switch active") as HTMLInputElement).checked,
+    ).toBe(true);
+  });
+
+  it("requires explicit confirmation before increasing trading authority", async () => {
+    renderApp();
+
+    fireEvent.click(
+      await screen.findByLabelText("Enable live trading"),
+    );
+    expect(
+      screen.getByLabelText("I confirm this increases trading authority"),
+    ).toBeTruthy();
+    expect(
+      (screen.getByRole("button", { name: "Save safeguards" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+
+    fireEvent.click(
+      screen.getByLabelText("I confirm this increases trading authority"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save safeguards" }));
+
+    await waitFor(() =>
+      expect(api.updateTradingSettings).toHaveBeenCalledOnce(),
+    );
+    expect(api.updateTradingSettings.mock.calls[0]?.[0]).toEqual({
+      live_trading_enabled: true,
+      kill_switch_active: true,
+      max_order_shares: null,
+      max_order_notional_usd: null,
+      version: 0,
+    });
   });
 
   it("explains monitoring-only account capability without relying on color", async () => {

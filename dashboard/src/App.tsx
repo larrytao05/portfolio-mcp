@@ -21,6 +21,7 @@ import {
   getHealth,
   getLatestRefresh,
   getTradingStatus,
+  getTradingSettings,
   getOverview,
   getOverviewHistory,
   getQuote,
@@ -34,6 +35,8 @@ import {
   type Order,
   type OrderDraft,
   type ProviderHealth,
+  type TradingSettings,
+  updateTradingSettings,
 } from "./api/client";
 
 type SortField =
@@ -285,6 +288,80 @@ function ExecutionStatus({
           </div>
         </article>
       ))}
+    </section>
+  );
+}
+
+function TradingSettingsPanel({
+  settings,
+}: {
+  settings: TradingSettings | undefined;
+}) {
+  const queryClient = useQueryClient();
+  const [form, setForm] = useState<TradingSettings | null>(null);
+  const [confirmed, setConfirmed] = useState(false);
+  useEffect(() => {
+    if (settings) setForm(settings);
+  }, [settings]);
+  const update = useMutation({
+    mutationFn: updateTradingSettings,
+    onSuccess: async () => {
+      setConfirmed(false);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["trading", "settings"] }),
+        queryClient.invalidateQueries({ queryKey: ["trading", "status"] }),
+      ]);
+    },
+  });
+  if (!form) return <p className="state">Loading trading safeguards…</p>;
+  const submittedForm = form;
+  const requiresConfirmation =
+    (!settings?.live_trading_enabled && form.live_trading_enabled) ||
+    (settings?.kill_switch_active && !form.kill_switch_active);
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (requiresConfirmation && !confirmed) return;
+    update.mutate({
+      live_trading_enabled: submittedForm.live_trading_enabled,
+      kill_switch_active: submittedForm.kill_switch_active,
+      max_order_shares: submittedForm.max_order_shares || null,
+      max_order_notional_usd: submittedForm.max_order_notional_usd || null,
+      version: submittedForm.version,
+    });
+  }
+  return (
+    <section className="content-section" aria-labelledby="safeguards-heading">
+      <div className="section-heading">
+        <div><h2 id="safeguards-heading">Trading safeguards</h2></div>
+        <span className="muted">Dashboard-only owner controls</span>
+      </div>
+      <p role="status"><strong>{settings?.effective_state}</strong></p>
+      <form className="filter-bar" onSubmit={submit}>
+        <label>
+          Maximum shares per order
+          <input aria-label="Maximum shares per order" inputMode="decimal" value={form.max_order_shares ?? ""} onChange={(event) => setForm({ ...form, max_order_shares: event.target.value || null })} />
+        </label>
+        <label>
+          Maximum USD notional per order
+          <input aria-label="Maximum USD notional per order" inputMode="decimal" value={form.max_order_notional_usd ?? ""} onChange={(event) => setForm({ ...form, max_order_notional_usd: event.target.value || null })} />
+        </label>
+        <label>
+          <input checked={form.live_trading_enabled} onChange={(event) => setForm({ ...form, live_trading_enabled: event.target.checked })} type="checkbox" />
+          Enable live trading
+        </label>
+        <label>
+          <input checked={form.kill_switch_active} onChange={(event) => setForm({ ...form, kill_switch_active: event.target.checked })} type="checkbox" />
+          Kill switch active
+        </label>
+        {requiresConfirmation && (
+          <label>
+            <input checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} type="checkbox" />
+            I confirm this increases trading authority
+          </label>
+        )}
+        <button disabled={update.isPending || (requiresConfirmation && !confirmed)} type="submit">Save safeguards</button>
+      </form>
+      {update.isError && <p className="inline-alert" role="alert">Safeguards were not changed. Reload the latest settings and try again.</p>}
     </section>
   );
 }
@@ -1563,6 +1640,7 @@ export function App() {
     queryFn: getLatestRefresh,
   });
   const tradingStatus = useQuery({ queryKey: ["trading", "status"], queryFn: getTradingStatus });
+  const tradingSettings = useQuery({ queryKey: ["trading", "settings"], queryFn: getTradingSettings });
   const overviewQuery = useQuery({
     queryKey: ["overview"],
     queryFn: getOverview,
@@ -1737,6 +1815,7 @@ export function App() {
         <ActivitySection accounts={accounts.data?.accounts ?? []} />
         <MarketDataSection />
         <ExecutionStatus status={tradingStatus.data} loading={tradingStatus.isPending} unavailable={tradingStatus.isError} />
+        <TradingSettingsPanel settings={tradingSettings.data?.settings} />
         <TradeSection accounts={accounts.data?.accounts ?? []} />
       </main>
     </div>

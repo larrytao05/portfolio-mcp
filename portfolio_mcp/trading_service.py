@@ -24,6 +24,11 @@ from portfolio_mcp.execution import (
     OrderState,
 )
 from portfolio_mcp.provider import MarketDataProvider, PortfolioProvider
+from portfolio_mcp.trading_safety import (
+    TradeIntent,
+    TradingGuard,
+    TradingSettingsService,
+)
 
 
 class TradingValidationError(ValueError):
@@ -42,11 +47,15 @@ class OrderDraftService:
         portfolio_provider: PortfolioProvider,
         market_data_provider: MarketDataProvider,
         clock: Callable[[], datetime],
+        trading_guard: TradingGuard | None = None,
     ) -> None:
         self._repository = repository
         self._portfolio_provider = portfolio_provider
         self._market_data_provider = market_data_provider
         self._clock = clock
+        self._trading_guard = trading_guard or TradingGuard(
+            repository, TradingSettingsService(repository, clock)
+        )
 
     async def create(
         self,
@@ -102,6 +111,21 @@ class OrderDraftService:
             raise TradingValidationError(
                 "quote_unavailable", "A price is required for a market order"
             )
+        _require_guard(
+            self._trading_guard,
+            TradeIntent(
+                account_id=account.id,
+                symbol=quote.instrument.symbol,
+                asset_class=quote.instrument.asset_class,
+                side=side,
+                order_type=order_type,
+                quantity=parsed_quantity,
+                limit_price=parsed_limit_price,
+                bid_price=quote.bid_price,
+                ask_price=quote.ask_price,
+                last_price=quote.last_price,
+            ),
+        )
         fingerprint = _fingerprint(
             account_id,
             instrument_id,
@@ -146,11 +170,15 @@ class OrderSubmissionService:
         execution_provider: ExecutionProvider,
         clock: Callable[[], datetime],
         validator: SubmissionValidator,
+        trading_guard: TradingGuard | None = None,
     ) -> None:
         self._repository = repository
         self._execution_provider = execution_provider
         self._clock = clock
         self._validator = validator
+        self._trading_guard = trading_guard or TradingGuard(
+            repository, TradingSettingsService(repository, clock)
+        )
         if self._repository.has_stranded_submissions():
             self._repository.recover_stranded_submissions(_utc_now(self._clock()))
 
@@ -227,6 +255,7 @@ class OrderSubmissionService:
                 raise TradingValidationError("draft_expired", "Order draft has expired")
             self._require_fresh_market_quote(draft, final_now)
             await self._validator(draft, final_now)
+            _require_guard(self._trading_guard, _trade_intent(draft))
         except TradingValidationError as error:
             return self._repository.finish_order_submission(
                 order.id,
@@ -402,6 +431,29 @@ def _positive_decimal(
             "whole_shares_required", f"{field_name} must be a whole-share quantity"
         )
     return parsed
+
+
+def _require_guard(trading_guard: TradingGuard, intent: TradeIntent) -> None:
+    decision = trading_guard.evaluate(intent)
+    if decision.allowed:
+        return
+    violation = decision.violations[0]
+    raise TradingValidationError(violation.code, violation.message)
+
+
+def _trade_intent(draft: OrderDraft) -> TradeIntent:
+    return TradeIntent(
+        account_id=draft.account_id,
+        symbol=draft.symbol,
+        asset_class=draft.asset_class,
+        side=draft.side,
+        order_type=draft.order_type,
+        quantity=draft.quantity,
+        limit_price=draft.limit_price,
+        bid_price=draft.quote_bid_price,
+        ask_price=draft.quote_ask_price,
+        last_price=draft.quote_last_price,
+    )
 
 
 def _limit_price(order_type: str, value: str | None) -> Decimal | None:
