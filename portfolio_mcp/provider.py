@@ -1,8 +1,9 @@
 from datetime import date
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from portfolio_mcp.models import (
     Account,
+    AccountCapabilities,
     HoldingsSnapshot,
     Instrument,
     Quote,
@@ -63,6 +64,13 @@ class PortfolioProvider(Protocol):
     async def get_transactions(
         self, account_id: str, start_date: date, end_date: date
     ) -> TransactionHistory: ...
+
+
+@runtime_checkable
+class CapabilityProvider(Protocol):
+    async def get_account_capabilities(
+        self, account_ids: list[str]
+    ) -> list[AccountCapabilities]: ...
 
 
 class MarketDataProvider(Protocol):

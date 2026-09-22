@@ -22,6 +22,7 @@ const api = vi.hoisted(() => ({
   getOverview: vi.fn(),
   getOverviewHistory: vi.fn(),
   getQuote: vi.fn(),
+  getTradingStatus: vi.fn(),
   refreshPortfolio: vi.fn(),
   searchInstruments: vi.fn(),
 }));
@@ -74,6 +75,7 @@ describe("App", () => {
     api.getLatestRefresh.mockResolvedValue({ refresh: null });
     api.searchInstruments.mockResolvedValue({ instruments: [] });
     api.getQuote.mockResolvedValue({ quote: null });
+    api.getTradingStatus.mockResolvedValue({ providers: [], accounts: [] });
     api.getOverview.mockResolvedValue({
       overview: {
         total_known_usd_value: null,
@@ -126,6 +128,40 @@ describe("App", () => {
     expect(
       await screen.findByText(/Saved 2 accounts and 9 positions/),
     ).toBeTruthy();
+  });
+
+  it("explains monitoring-only account capability without relying on color", async () => {
+    api.getTradingStatus.mockResolvedValue({
+      providers: [{ provider: "Fidelity", state: "healthy", observed_at: null, last_success_at: null, blocks: [] }],
+      accounts: [{
+        account_id: "fidelity-roth-demo", provider: "Fidelity", asset_classes: [],
+        supported_sides: [], order_types: [], time_in_force: [], sizing_modes: [],
+        preview_supported: false, cancellation_supported: false, observed_at: "2026-09-12T20:00:00+00:00",
+        last_success_at: "2026-09-12T20:00:00+00:00", source: "fixture",
+        blocks: [{ code: "monitoring_only", message: "This provider is available for monitoring only.", recovery_action: null }],
+        is_stale: false, is_trade_capable: false,
+      }],
+    });
+    renderApp();
+
+    expect(await screen.findByText("Execution status")).toBeTruthy();
+    expect(await screen.findByText("Monitoring only")).toBeTruthy();
+    expect(screen.getByText("Public account ID: fidelity-roth-demo")).toBeTruthy();
+    expect(screen.getByText("This provider is available for monitoring only.")).toBeTruthy();
+  });
+
+  it("shows provider-level recovery guidance", async () => {
+    api.getTradingStatus.mockResolvedValue({
+      providers: [{
+        provider: "Schwab", state: "authentication_required", observed_at: "2026-09-12T20:00:00+00:00", last_success_at: "2026-09-11T20:00:00+00:00",
+        blocks: [{ code: "authentication_required", message: "Provider authentication is required.", recovery_action: "reconnect_provider" }],
+      }],
+      accounts: [],
+    });
+    renderApp();
+
+    expect(await screen.findByText("Provider authentication is required. reconnect_provider")).toBeTruthy();
+    expect(screen.getByText(/Last successful observation/)).toBeTruthy();
   });
 
   it.each([

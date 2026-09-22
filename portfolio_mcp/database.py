@@ -1,6 +1,7 @@
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
@@ -24,7 +25,16 @@ from sqlalchemy.types import TypeDecorator
 
 from alembic import command
 from portfolio_mcp.execution import OrderState, require_transition
-from portfolio_mcp.models import Account, HoldingsSnapshot, Position, Transaction
+from portfolio_mcp.models import (
+    Account,
+    AccountCapabilities,
+    CapabilityBlock,
+    HoldingsSnapshot,
+    Position,
+    ProviderHealth,
+    ProviderHealthState,
+    Transaction,
+)
 
 
 class Base(DeclarativeBase):
@@ -148,6 +158,26 @@ class ActivityRecord(Base):
     fees: Mapped[Decimal] = mapped_column(ExactDecimal(), nullable=False)
     currency: Mapped[str] = mapped_column(String(8), nullable=False)
     imported_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+
+
+class AccountCapabilityRecord(Base):
+    __tablename__ = "account_capabilities"
+
+    account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    asset_classes: Mapped[str] = mapped_column(Text, nullable=False)
+    supported_sides: Mapped[str] = mapped_column(Text, nullable=False)
+    order_types: Mapped[str] = mapped_column(Text, nullable=False)
+    time_in_force: Mapped[str] = mapped_column(Text, nullable=False)
+    sizing_modes: Mapped[str] = mapped_column(Text, nullable=False)
+    preview_supported: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    cancellation_supported: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    observed_at: Mapped[datetime | None] = mapped_column(UtcTimestamp())
+    last_success_at: Mapped[datetime | None] = mapped_column(UtcTimestamp())
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    blocks: Mapped[str] = mapped_column(Text, nullable=False)
+    is_stale: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
 class OrderDraftRecord(Base):
@@ -389,11 +419,16 @@ def upgrade_database(database_url: str) -> None:
 
 
 class PortfolioRepository:
-    def __init__(self, database_url: str) -> None:
+    def __init__(
+        self,
+        database_url: str,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         upgrade_database(database_url)
         self._sessions = sessionmaker(
             create_engine_for(database_url), expire_on_commit=False
         )
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     def save_order_draft(self, draft: "OrderDraft") -> None:
         with self._sessions.begin() as session:
@@ -621,6 +656,94 @@ class PortfolioRepository:
                 positions=positions,
             )
 
+    def account_capability(self, account_id: str) -> AccountCapabilities | None:
+        with self._sessions() as session:
+            account = session.get(AccountRecord, account_id)
+            if account is None:
+                return None
+            record = session.get(AccountCapabilityRecord, account_id)
+            if record is not None and not record.is_current:
+                return None
+            return (
+                self._capability(record, account)
+                if record is not None
+                else self._unknown_capability(account)
+            )
+
+    def current_capabilities(self) -> list[AccountCapabilities]:
+        with self._sessions() as session:
+            records = session.execute(
+                select(AccountRecord, AccountCapabilityRecord)
+                .outerjoin(
+                    AccountCapabilityRecord,
+                    AccountCapabilityRecord.account_id == AccountRecord.id,
+                )
+                .where(
+                    AccountCapabilityRecord.is_current.is_(True)
+                    | AccountCapabilityRecord.account_id.is_(None)
+                )
+                .order_by(AccountRecord.label)
+            ).all()
+            return [
+                self._capability(capability, account)
+                if capability is not None
+                else self._unknown_capability(account)
+                for account, capability in records
+            ]
+
+    def provider_health(self) -> list[ProviderHealth]:
+        with self._sessions() as session:
+            accounts = list(
+                session.scalars(select(AccountRecord).order_by(AccountRecord.provider))
+            )
+            latest = session.scalar(
+                select(RefreshRunRecord).order_by(RefreshRunRecord.id.desc()).limit(1)
+            )
+            outcomes = (
+                {
+                    item.provider: item
+                    for item in self._outcomes_for_refresh(session, latest.id)
+                }
+                if latest is not None
+                else {}
+            )
+            return [
+                ProviderHealth(
+                    provider=provider,
+                    state=self._provider_health_state(
+                        outcome=outcomes.get(provider),
+                        accounts=[
+                            account
+                            for account in accounts
+                            if account.provider == provider
+                        ],
+                        refresh_status=latest.status if latest is not None else None,
+                        error_code=latest.error_code if latest is not None else None,
+                    ),
+                    observed_at=latest.completed_at if latest is not None else None,
+                    last_success_at=self._latest_provider_success(session, provider),
+                    blocks=self._health_blocks(
+                        self._provider_health_state(
+                            outcome=outcomes.get(provider),
+                            accounts=[
+                                account
+                                for account in accounts
+                                if account.provider == provider
+                            ],
+                            refresh_status=latest.status
+                            if latest is not None
+                            else None,
+                            error_code=latest.error_code
+                            if latest is not None
+                            else None,
+                        )
+                    ),
+                )
+                for provider in sorted(
+                    {account.provider for account in accounts} | set(outcomes)
+                )
+            ]
+
     def save_refresh(
         self,
         snapshots: list[HoldingsSnapshot],
@@ -629,12 +752,21 @@ class PortfolioRepository:
         snapshot_date: date,
         failed_accounts: list[Account] | None = None,
         transactions: list[Transaction] | None = None,
+        capabilities: list[AccountCapabilities] | None = None,
+        failed_capability_accounts: list[Account] | None = None,
+        current_accounts: list[Account] | None = None,
     ) -> "RefreshResult":
         failed_accounts = failed_accounts or []
+        current_accounts = current_accounts or [
+            snapshot.account for snapshot in snapshots
+        ]
         with self._sessions.begin() as session:
+            self._mark_removed_capabilities(session, current_accounts)
             for snapshot in snapshots:
                 self._save_snapshot(session, snapshot, completed_at, snapshot_date)
             self._save_transactions(session, transactions or [], completed_at)
+            self._save_capabilities(session, capabilities or [])
+            self._mark_capabilities_stale(session, failed_capability_accounts or [])
 
             stale_account_ids = self._mark_failed_accounts(session, failed_accounts)
             outcomes = self._provider_outcomes(
@@ -670,6 +802,7 @@ class PortfolioRepository:
     ) -> RefreshResult:
         with self._sessions.begin() as session:
             stale_accounts = self._mark_all_accounts_stale(session)
+            self._mark_all_capabilities_stale(session)
             outcomes = self._failed_outcomes(stale_accounts)
             run = RefreshRunRecord(
                 started_at=started_at,
@@ -790,6 +923,170 @@ class PortfolioRepository:
             return [
                 self._activity(activity, account) for activity, account in records
             ], total
+
+    def _capability(
+        self, record: AccountCapabilityRecord, account: AccountRecord
+    ) -> AccountCapabilities:
+        return AccountCapabilities(
+            account_id=record.account_id,
+            provider=record.provider,
+            asset_classes=tuple(json.loads(record.asset_classes)),
+            supported_sides=tuple(json.loads(record.supported_sides)),
+            order_types=tuple(json.loads(record.order_types)),
+            time_in_force=tuple(json.loads(record.time_in_force)),
+            sizing_modes=tuple(json.loads(record.sizing_modes)),
+            preview_supported=record.preview_supported,
+            cancellation_supported=record.cancellation_supported,
+            observed_at=record.observed_at,
+            last_success_at=record.last_success_at,
+            source=record.source,
+            blocks=tuple(
+                CapabilityBlock(**block) for block in json.loads(record.blocks)
+            ),
+            is_stale=(
+                record.is_stale
+                or account.is_stale
+                or record.observed_at is None
+                or record.observed_at < self._now() - timedelta(days=1)
+            ),
+        )
+
+    def _unknown_capability(self, account: AccountRecord) -> AccountCapabilities:
+        return AccountCapabilities(
+            account_id=account.id,
+            provider=account.provider,
+            asset_classes=(),
+            supported_sides=(),
+            order_types=(),
+            time_in_force=(),
+            sizing_modes=(),
+            preview_supported=False,
+            cancellation_supported=False,
+            observed_at=None,
+            last_success_at=None,
+            source="not_observed",
+            blocks=(
+                CapabilityBlock("capability_unknown", "Trading capability is unknown."),
+            ),
+            is_stale=True,
+        )
+
+    def _save_capabilities(
+        self, session: Session, capabilities: list[AccountCapabilities]
+    ) -> None:
+        for capability in capabilities:
+            if session.get(AccountRecord, capability.account_id) is None:
+                continue
+            record = session.get(AccountCapabilityRecord, capability.account_id)
+            if record is None:
+                record = AccountCapabilityRecord(account_id=capability.account_id)
+                session.add(record)
+            record.provider = capability.provider
+            record.asset_classes = json.dumps(capability.asset_classes)
+            record.supported_sides = json.dumps(capability.supported_sides)
+            record.order_types = json.dumps(capability.order_types)
+            record.time_in_force = json.dumps(capability.time_in_force)
+            record.sizing_modes = json.dumps(capability.sizing_modes)
+            record.preview_supported = capability.preview_supported
+            record.cancellation_supported = capability.cancellation_supported
+            record.observed_at = capability.observed_at
+            record.last_success_at = capability.last_success_at
+            record.source = capability.source
+            record.blocks = json.dumps([block.to_dict() for block in capability.blocks])
+            record.is_stale = capability.is_stale
+            record.is_current = True
+
+    def _mark_removed_capabilities(
+        self, session: Session, current_accounts: list[Account]
+    ) -> None:
+        current_ids = {account.id for account in current_accounts}
+        for record in session.scalars(select(AccountCapabilityRecord)):
+            if record.account_id not in current_ids:
+                record.is_current = False
+                record.is_stale = True
+
+    def _mark_capabilities_stale(
+        self, session: Session, accounts: list[Account]
+    ) -> None:
+        for account in accounts:
+            record = session.get(AccountCapabilityRecord, account.id)
+            if record is not None:
+                record.is_stale = True
+
+    def _mark_all_capabilities_stale(self, session: Session) -> None:
+        for record in session.scalars(select(AccountCapabilityRecord)):
+            record.is_stale = True
+
+    def _provider_health_state(
+        self,
+        *,
+        outcome: ProviderRefreshOutcome | None,
+        accounts: list[AccountRecord],
+        refresh_status: str | None,
+        error_code: str | None,
+    ) -> ProviderHealthState:
+        if outcome is None:
+            return "unknown"
+        if refresh_status == "failed":
+            if error_code == "authentication_required":
+                return "authentication_required"
+            if error_code == "authorization_required":
+                return "authorization_required"
+            return "unavailable"
+        if outcome.status == "success" and not any(
+            account.is_stale for account in accounts
+        ):
+            return "healthy"
+        return "degraded"
+
+    def _health_blocks(self, state: ProviderHealthState) -> tuple[CapabilityBlock, ...]:
+        if state == "authentication_required":
+            return (
+                CapabilityBlock(
+                    "authentication_required",
+                    "Provider authentication is required.",
+                    "reconnect_provider",
+                ),
+            )
+        if state == "authorization_required":
+            return (
+                CapabilityBlock(
+                    "authorization_required",
+                    "Provider authorization is required.",
+                    "reconnect_provider",
+                ),
+            )
+        if state == "unavailable":
+            return (
+                CapabilityBlock(
+                    "provider_unavailable",
+                    "Provider status is unavailable. Refresh again later.",
+                ),
+            )
+        return ()
+
+    def _latest_provider_success(
+        self, session: Session, provider: str
+    ) -> datetime | None:
+        outcome = session.scalar(
+            select(RefreshProviderOutcomeRecord)
+            .where(
+                RefreshProviderOutcomeRecord.provider == provider,
+                RefreshProviderOutcomeRecord.status == "success",
+            )
+            .order_by(RefreshProviderOutcomeRecord.id.desc())
+            .limit(1)
+        )
+        if outcome is None:
+            return None
+        run = session.get(RefreshRunRecord, outcome.refresh_id)
+        return run.completed_at if run is not None else None
+
+    def _now(self) -> datetime:
+        value = self._clock()
+        if value.tzinfo is None:
+            raise ValueError("Clock must return a timezone-aware timestamp")
+        return value.astimezone(UTC)
 
     def _order_draft(self, record: OrderDraftRecord) -> "OrderDraft":
         return OrderDraft(

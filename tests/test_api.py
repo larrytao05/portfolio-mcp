@@ -7,7 +7,7 @@ from portfolio_mcp.api import create_app
 from portfolio_mcp.database import PortfolioRepository
 from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
 from portfolio_mcp.models import Account, HoldingsSnapshot, Instrument, Position
-from portfolio_mcp.provider import ProviderUnavailableError
+from portfolio_mcp.provider import ProviderAuthenticationError, ProviderUnavailableError
 
 
 class FailingFixtureProvider(FixturePortfolioProvider):
@@ -15,11 +15,35 @@ class FailingFixtureProvider(FixturePortfolioProvider):
         raise ProviderUnavailableError("Fixture provider is unavailable")
 
 
+class AuthenticationFailingFixtureProvider(FixturePortfolioProvider):
+    async def list_accounts(self) -> list[Account]:
+        raise ProviderAuthenticationError("Fixture credentials expired")
+
+
 class PartiallyFailingFixtureProvider(FixturePortfolioProvider):
     async def get_holdings(self, account_id: str) -> HoldingsSnapshot:
         if account_id == "schwab-taxable-demo":
             raise ProviderUnavailableError("Schwab fixture data is unavailable")
         return await super().get_holdings(account_id)
+
+
+class IncompleteCapabilityFixtureProvider(FixturePortfolioProvider):
+    async def get_account_capabilities(self, account_ids: list[str]):
+        capabilities = await super().get_account_capabilities(account_ids)
+        return [
+            capability
+            for capability in capabilities
+            if capability.account_id != "schwab-taxable-demo"
+        ]
+
+
+class RemovedAccountFixtureProvider(FixturePortfolioProvider):
+    async def list_accounts(self) -> list[Account]:
+        return [
+            account
+            for account in await super().list_accounts()
+            if account.provider == "Fidelity"
+        ]
 
 
 class FailingMarketDataProvider(FixtureMarketDataProvider):
@@ -86,6 +110,186 @@ def test_refresh_persists_accounts(tmp_path) -> None:
         "Fidelity",
         "Schwab",
     }
+
+
+def test_trading_status_reads_saved_capabilities_and_stales_after_failure(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
+    client = TestClient(
+        create_app(
+            FixturePortfolioProvider(),
+            database_url=database_url,
+            clock=lambda: datetime(2026, 9, 12, 20, 0, tzinfo=UTC),
+        )
+    )
+
+    client.post("/api/refresh")
+
+    status = client.get("/api/trading/status")
+    account = client.get("/api/accounts/schwab-taxable-demo/capabilities")
+
+    assert status.status_code == 200
+    assert [
+        (item["provider"], item["state"]) for item in status.json()["providers"]
+    ] == [
+        ("Fidelity", "healthy"),
+        ("Schwab", "healthy"),
+    ]
+    assert status.json()["accounts"][0]["blocks"][0]["code"] == "monitoring_only"
+    assert account.json()["capability"]["is_trade_capable"] is True
+
+    failing = TestClient(
+        create_app(FailingFixtureProvider(), database_url=database_url)
+    )
+    failing.post("/api/refresh")
+
+    stale = failing.get("/api/accounts/schwab-taxable-demo/capabilities")
+    assert stale.json()["capability"]["is_stale"] is True
+    assert stale.json()["capability"]["is_trade_capable"] is False
+    assert failing.get("/api/accounts/missing/capabilities").status_code == 404
+
+
+def test_old_capability_observation_is_not_trade_capable(tmp_path) -> None:
+    client = create_client(tmp_path)
+
+    client.post("/api/refresh")
+
+    capability = client.get("/api/accounts/schwab-taxable-demo/capabilities")
+    assert capability.json()["capability"]["is_stale"] is True
+    assert capability.json()["capability"]["is_trade_capable"] is False
+
+
+def test_incomplete_capability_response_stales_previous_observation(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
+    initial = TestClient(
+        create_app(
+            FixturePortfolioProvider(),
+            database_url=database_url,
+            clock=lambda: datetime(2026, 9, 12, 20, 0, tzinfo=UTC),
+        )
+    )
+    initial.post("/api/refresh")
+
+    incomplete = TestClient(
+        create_app(
+            IncompleteCapabilityFixtureProvider(),
+            database_url=database_url,
+            clock=lambda: datetime(2026, 9, 12, 20, 0, tzinfo=UTC),
+        )
+    )
+    incomplete.post("/api/refresh")
+
+    capability = incomplete.get("/api/accounts/schwab-taxable-demo/capabilities")
+    assert capability.json()["capability"]["is_stale"] is True
+    assert capability.json()["capability"]["is_trade_capable"] is False
+
+
+def test_capability_ages_out_after_its_observation_window(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
+    refreshed = TestClient(
+        create_app(
+            FixturePortfolioProvider(),
+            database_url=database_url,
+            clock=lambda: datetime(2026, 9, 12, 20, 0, tzinfo=UTC),
+        )
+    )
+    refreshed.post("/api/refresh")
+
+    aged = TestClient(
+        create_app(
+            FixturePortfolioProvider(),
+            database_url=database_url,
+            clock=lambda: datetime(2026, 9, 14, 20, 0, tzinfo=UTC),
+        )
+    )
+
+    capability = aged.get("/api/accounts/schwab-taxable-demo/capabilities")
+    assert capability.json()["capability"]["is_stale"] is True
+    assert capability.json()["capability"]["is_trade_capable"] is False
+
+
+def test_removed_account_is_excluded_from_current_capability_responses(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
+    initial = TestClient(
+        create_app(
+            FixturePortfolioProvider(),
+            database_url=database_url,
+            clock=lambda: datetime(2026, 9, 12, 20, 0, tzinfo=UTC),
+        )
+    )
+    initial.post("/api/refresh")
+
+    removed = TestClient(
+        create_app(
+            RemovedAccountFixtureProvider(),
+            database_url=database_url,
+            clock=lambda: datetime(2026, 9, 12, 21, 0, tzinfo=UTC),
+        )
+    )
+    removed.post("/api/refresh")
+
+    status = removed.get("/api/trading/status").json()
+    assert [item["account_id"] for item in status["accounts"]] == ["fidelity-roth-demo"]
+    assert (
+        removed.get("/api/accounts/schwab-taxable-demo/capabilities").status_code == 404
+    )
+
+
+def test_partial_refresh_stales_existing_capability_and_auth_has_safe_recovery(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
+    successful = TestClient(
+        create_app(FixturePortfolioProvider(), database_url=database_url)
+    )
+    successful.post("/api/refresh")
+
+    partial = TestClient(
+        create_app(PartiallyFailingFixtureProvider(), database_url=database_url)
+    )
+    partial.post("/api/refresh")
+    capability = partial.get("/api/accounts/schwab-taxable-demo/capabilities")
+
+    assert capability.json()["capability"]["is_stale"] is True
+    assert capability.json()["capability"]["is_trade_capable"] is False
+
+    auth = TestClient(
+        create_app(AuthenticationFailingFixtureProvider(), database_url=database_url)
+    )
+    auth.post("/api/refresh")
+    health = auth.get("/api/trading/status").json()["providers"]
+
+    assert {item["state"] for item in health} == {"authentication_required"}
+    assert all(
+        item["blocks"][0]["recovery_action"] == "reconnect_provider" for item in health
+    )
+
+
+def test_first_refresh_auth_failure_returns_recovery_status(tmp_path) -> None:
+    client = TestClient(
+        create_app(
+            AuthenticationFailingFixtureProvider(),
+            database_url=f"sqlite:///{tmp_path / 'portfolio.db'}",
+        )
+    )
+
+    client.post("/api/refresh")
+
+    providers = client.get("/api/trading/status").json()["providers"]
+    assert providers[0]["provider"] == "Portfolio provider"
+    assert providers[0]["state"] == "authentication_required"
+    assert providers[0]["observed_at"] is not None
+    assert providers[0]["last_success_at"] is None
+    assert providers[0]["blocks"] == [
+        {
+            "code": "authentication_required",
+            "message": "Provider authentication is required.",
+            "recovery_action": "reconnect_provider",
+        }
+    ]
 
 
 def test_refresh_imports_a_reverse_chronological_activity_feed(tmp_path) -> None:

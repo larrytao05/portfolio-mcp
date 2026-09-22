@@ -3,6 +3,8 @@ from decimal import Decimal
 
 from portfolio_mcp.models import (
     Account,
+    AccountCapabilities,
+    CapabilityBlock,
     HoldingsSnapshot,
     Instrument,
     Position,
@@ -240,6 +242,76 @@ class FixturePortfolioProvider:
             start_date=start_date,
             end_date=end_date,
             transactions=transactions,
+        )
+
+    async def get_account_capabilities(
+        self, account_ids: list[str]
+    ) -> list[AccountCapabilities]:
+        observed_at = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+        return [
+            self._capabilities_for(account_id, observed_at)
+            for account_id in account_ids
+        ]
+
+    def _capabilities_for(
+        self, account_id: str, observed_at: datetime
+    ) -> AccountCapabilities:
+        account = self._accounts_by_id.get(account_id)
+        if account is None:
+            return AccountCapabilities(
+                account_id=account_id,
+                provider="Unknown",
+                asset_classes=(),
+                supported_sides=(),
+                order_types=(),
+                time_in_force=(),
+                sizing_modes=(),
+                preview_supported=False,
+                cancellation_supported=False,
+                observed_at=None,
+                last_success_at=None,
+                source="fixture",
+                blocks=(
+                    CapabilityBlock(
+                        "capability_unknown", "Trading capability is unknown."
+                    ),
+                ),
+                is_stale=True,
+            )
+        if account.provider == "Fidelity":
+            return AccountCapabilities(
+                account_id=account.id,
+                provider=account.provider,
+                asset_classes=(),
+                supported_sides=(),
+                order_types=(),
+                time_in_force=(),
+                sizing_modes=(),
+                preview_supported=False,
+                cancellation_supported=False,
+                observed_at=observed_at,
+                last_success_at=observed_at,
+                source="fixture",
+                blocks=(
+                    CapabilityBlock(
+                        "monitoring_only",
+                        "This provider is available for monitoring only.",
+                    ),
+                ),
+            )
+        return AccountCapabilities(
+            account_id=account.id,
+            provider=account.provider,
+            asset_classes=("equity", "etf"),
+            supported_sides=("buy", "sell"),
+            order_types=("market", "limit"),
+            time_in_force=("day",),
+            sizing_modes=("whole_shares",),
+            preview_supported=True,
+            cancellation_supported=True,
+            observed_at=observed_at,
+            last_success_at=observed_at,
+            source="fixture",
         )
 
     def _get_account(self, account_id: str) -> Account:

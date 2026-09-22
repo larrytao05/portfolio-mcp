@@ -78,6 +78,27 @@ async def test_provider_contract_rejects_unknown_accounts(
 
 
 @pytest.mark.asyncio
+async def test_capability_contract_normalizes_eligible_and_monitoring_only_accounts(
+    provider: FixturePortfolioProvider,
+) -> None:
+    capabilities = await provider.get_account_capabilities(
+        ["schwab-taxable-demo", "fidelity-roth-demo"]
+    )
+
+    schwab, fidelity = capabilities
+
+    assert schwab.account_id == "schwab-taxable-demo"
+    assert schwab.is_trade_capable
+    assert schwab.supported_sides == ("buy", "sell")
+    assert schwab.preview_supported
+    assert schwab.cancellation_supported
+    assert fidelity.account_id == "fidelity-roth-demo"
+    assert not fidelity.is_trade_capable
+    assert fidelity.blocks[0].code == "monitoring_only"
+    assert "9046" not in fidelity.blocks[0].message
+
+
+@pytest.mark.asyncio
 async def test_market_data_contract_searches_canonical_instruments(
     market_data_provider: MarketDataProvider,
 ) -> None:
