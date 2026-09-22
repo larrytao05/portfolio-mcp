@@ -215,6 +215,10 @@ class OrderDraftRecord(Base):
     quote_bid_price: Mapped[Decimal | None] = mapped_column(ExactDecimal())
     quote_ask_price: Mapped[Decimal | None] = mapped_column(ExactDecimal())
     quote_source: Mapped[str | None] = mapped_column(String(64))
+    estimated_notional: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    account_refreshed_at: Mapped[datetime | None] = mapped_column(UtcTimestamp())
+    capability_observed_at: Mapped[datetime | None] = mapped_column(UtcTimestamp())
+    capability_last_success_at: Mapped[datetime | None] = mapped_column(UtcTimestamp())
     warnings: Mapped[str] = mapped_column(Text, nullable=False)
     fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
@@ -476,6 +480,10 @@ class PortfolioRepository:
                     quote_bid_price=draft.quote_bid_price,
                     quote_ask_price=draft.quote_ask_price,
                     quote_source=draft.quote_source,
+                    estimated_notional=draft.estimated_notional,
+                    account_refreshed_at=draft.account_refreshed_at,
+                    capability_observed_at=draft.capability_observed_at,
+                    capability_last_success_at=draft.capability_last_success_at,
                     warnings=json.dumps(draft.warnings),
                     fingerprint=draft.fingerprint,
                     created_at=draft.created_at,
@@ -489,6 +497,13 @@ class PortfolioRepository:
             if record is None:
                 return StoredTradingSettings(False, True, None, None, None, 0)
             return self._stored_trading_settings(record)
+
+    def stored_account(self, account_id: str) -> StoredAccount | None:
+        with self._sessions() as session:
+            record = session.get(AccountRecord, account_id)
+            if record is None:
+                return None
+            return self._stored_account(record)
 
     def replace_trading_settings(
         self,
@@ -682,20 +697,7 @@ class PortfolioRepository:
             records = session.scalars(
                 select(AccountRecord).order_by(AccountRecord.label)
             )
-            return [
-                StoredAccount(
-                    account=Account(
-                        id=record.id,
-                        provider=record.provider,
-                        label=record.label,
-                        account_type=record.account_type,
-                        currency=record.currency,
-                    ),
-                    is_stale=record.is_stale,
-                    source_refreshed_at=record.refreshed_at,
-                )
-                for record in records
-            ]
+            return [self._stored_account(record) for record in records]
 
     def list_positions(self, account_id: str) -> list[StoredPosition] | None:
         with self._sessions() as session:
@@ -1188,6 +1190,10 @@ class PortfolioRepository:
             quote_bid_price=record.quote_bid_price,
             quote_ask_price=record.quote_ask_price,
             quote_source=record.quote_source,
+            estimated_notional=record.estimated_notional,
+            account_refreshed_at=record.account_refreshed_at,
+            capability_observed_at=record.capability_observed_at,
+            capability_last_success_at=record.capability_last_success_at,
             warnings=tuple(json.loads(record.warnings)),
             fingerprint=record.fingerprint,
             created_at=record.created_at,
@@ -1204,6 +1210,19 @@ class PortfolioRepository:
             max_order_notional_usd=record.max_order_notional_usd,
             updated_at=record.updated_at,
             version=record.version,
+        )
+
+    def _stored_account(self, record: AccountRecord) -> StoredAccount:
+        return StoredAccount(
+            account=Account(
+                id=record.id,
+                provider=record.provider,
+                label=record.label,
+                account_type=record.account_type,
+                currency=record.currency,
+            ),
+            is_stale=record.is_stale,
+            source_refreshed_at=record.refreshed_at,
         )
 
     def _stored_order(self, record: OrderRecord) -> "StoredOrder":
@@ -1608,6 +1627,10 @@ class OrderDraft:
     quote_bid_price: Decimal | None
     quote_ask_price: Decimal | None
     quote_source: str | None
+    estimated_notional: Decimal | None
+    account_refreshed_at: datetime | None
+    capability_observed_at: datetime | None
+    capability_last_success_at: datetime | None
     warnings: tuple[str, ...]
     fingerprint: str
     created_at: datetime
@@ -1658,6 +1681,28 @@ class OrderDraft:
                     else None
                 ),
                 "source": self.quote_source,
+            },
+            "safety": {
+                "estimated_notional": (
+                    str(self.estimated_notional)
+                    if self.estimated_notional is not None
+                    else None
+                ),
+                "account_refreshed_at": (
+                    self.account_refreshed_at.isoformat()
+                    if self.account_refreshed_at is not None
+                    else None
+                ),
+                "capability_observed_at": (
+                    self.capability_observed_at.isoformat()
+                    if self.capability_observed_at is not None
+                    else None
+                ),
+                "capability_last_success_at": (
+                    self.capability_last_success_at.isoformat()
+                    if self.capability_last_success_at is not None
+                    else None
+                ),
             },
             "warnings": list(self.warnings),
             "fingerprint": self.fingerprint,

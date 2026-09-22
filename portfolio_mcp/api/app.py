@@ -83,7 +83,7 @@ def create_app(
     settings_service = TradingSettingsService(repository, service_clock)
     trading_guard = TradingGuard(repository, settings_service)
     draft_service = OrderDraftService(
-        repository, provider, market_data, service_clock, trading_guard
+        repository, market_data, service_clock, trading_guard
     )
     submission_service = OrderSubmissionService(
         repository, execution, service_clock, validator, trading_guard

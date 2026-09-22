@@ -1515,9 +1515,13 @@ function outcomeMessage(order: Order | null): string | null {
 function TradeSection({ accounts }: { accounts: Account[] }) {
   const [draft, setDraft] = useState<OrderDraft | null>(null);
   const [order, setOrder] = useState<Order | null>(null);
+  const [instrumentQuery, setInstrumentQuery] = useState("");
+  const [submittedInstrumentQuery, setSubmittedInstrumentQuery] = useState<
+    string | null
+  >(null);
   const [form, setForm] = useState({
     account_id: "",
-    instrument_id: "us-etf:VTI",
+    instrument_id: "",
     side: "buy",
     order_type: "limit",
     quantity: "1",
@@ -1529,6 +1533,11 @@ function TradeSection({ accounts }: { accounts: Account[] }) {
       setDraft(nextDraft);
       setOrder(null);
     },
+  });
+  const instruments = useQuery({
+    queryKey: ["trade-instrument-search", submittedInstrumentQuery],
+    queryFn: () => searchInstruments(submittedInstrumentQuery ?? ""),
+    enabled: submittedInstrumentQuery !== null,
   });
   const confirm = useMutation({
     mutationFn: () =>
@@ -1543,6 +1552,10 @@ function TradeSection({ accounts }: { accounts: Account[] }) {
       ...form,
       limit_price: form.order_type === "limit" ? form.limit_price : null,
     });
+  }
+  function search() {
+    if (submittedInstrumentQuery === instrumentQuery) void instruments.refetch();
+    setSubmittedInstrumentQuery(instrumentQuery);
   }
   const outcome = outcomeMessage(order);
   return (
@@ -1568,10 +1581,31 @@ function TradeSection({ accounts }: { accounts: Account[] }) {
             ))}
           </select>
         </label>
-        <label>
-          Canonical instrument ID
-          <input aria-label="Canonical instrument ID" value={form.instrument_id} onChange={(event) => setForm({ ...form, instrument_id: event.target.value })} required />
-        </label>
+        <fieldset>
+          <legend>Instrument</legend>
+          <div className="search-bar">
+            <label>
+              Search trade instruments
+              <input
+                aria-label="Trade instrument search"
+                onChange={(event) => setInstrumentQuery(event.target.value)}
+                placeholder="e.g. VTI"
+                value={instrumentQuery}
+              />
+            </label>
+            <button onClick={search} type="button">Search trade instruments</button>
+          </div>
+          {instruments.data?.instruments.map((instrument) => (
+            <button
+              key={instrument.id}
+              onClick={() => setForm({ ...form, instrument_id: instrument.id })}
+              type="button"
+            >
+              Select {instrument.symbol} — {instrument.name}
+            </button>
+          ))}
+          {form.instrument_id && <p>Selected canonical instrument: {form.instrument_id}</p>}
+        </fieldset>
         <label>
           Side
           <select aria-label="Trade side" value={form.side} onChange={(event) => setForm({ ...form, side: event.target.value })}>
@@ -1596,11 +1630,11 @@ function TradeSection({ accounts }: { accounts: Account[] }) {
             <input aria-label="Limit price" inputMode="decimal" value={form.limit_price} onChange={(event) => setForm({ ...form, limit_price: event.target.value })} required />
           </label>
         )}
-        <button type="submit" disabled={createDraft.isPending || accounts.length === 0}>
+        <button type="submit" disabled={createDraft.isPending || accounts.length === 0 || !form.instrument_id}>
           {createDraft.isPending ? "Creating draft…" : "Review fake order"}
         </button>
       </form>
-      {createDraft.isError && <p className="inline-alert" role="alert">Unable to create a safe order draft.</p>}
+      {createDraft.isError && <p className="inline-alert" role="alert">{createDraft.error.message}</p>}
       {draft !== null && (
         <article className="quote-card" aria-label="Order review">
           <div>
@@ -1615,6 +1649,11 @@ function TradeSection({ accounts }: { accounts: Account[] }) {
               <div><dt>Quote</dt><dd>Last {draft.quote.last_price ?? "unavailable"} · Bid {draft.quote.bid_price ?? "unavailable"} · Ask {draft.quote.ask_price ?? "unavailable"}</dd></div>
               <div><dt>Quote source</dt><dd>{draft.quote.source ?? "unavailable"}</dd></div>
               <div><dt>Quote observed</dt><dd>{draft.quote.observed_at === null ? "unavailable" : new Date(draft.quote.observed_at).toLocaleString()}</dd></div>
+              <div><dt>Estimated notional</dt><dd>{draft.safety.estimated_notional ?? "unavailable"}</dd></div>
+              <div><dt>Account refreshed</dt><dd>{draft.safety.account_refreshed_at === null ? "unavailable" : new Date(draft.safety.account_refreshed_at).toLocaleString()}</dd></div>
+              <div><dt>Capability observed</dt><dd>{draft.safety.capability_observed_at === null ? "unavailable" : new Date(draft.safety.capability_observed_at).toLocaleString()}</dd></div>
+              <div><dt>Capability last confirmed</dt><dd>{draft.safety.capability_last_success_at === null ? "unavailable" : new Date(draft.safety.capability_last_success_at).toLocaleString()}</dd></div>
+              <div><dt>Safeguard review</dt><dd>Permitted at draft creation; checked again before submission.</dd></div>
               <div><dt>Expires</dt><dd>{new Date(draft.expires_at).toLocaleString()}</dd></div>
               <div><dt>Fingerprint</dt><dd>{draft.fingerprint}</dd></div>
             </dl>
@@ -1627,6 +1666,9 @@ function TradeSection({ accounts }: { accounts: Account[] }) {
       )}
       {confirm.isError && <p className="inline-alert" role="alert">Confirmation was not accepted. Create a new draft if it expired or changed.</p>}
       {outcome !== null && <p className={order?.state === "UNKNOWN" ? "inline-alert" : "state"} role="status">{outcome}</p>}
+      {order?.state === "REJECTED" && order.result.message !== null && (
+        <p className="inline-alert" role="alert">{order.result.message}</p>
+      )}
     </section>
   );
 }

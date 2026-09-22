@@ -168,6 +168,12 @@ export type OrderDraft = {
     ask_price: string | null;
     source: string | null;
   };
+  safety: {
+    estimated_notional: string | null;
+    account_refreshed_at: string | null;
+    capability_observed_at: string | null;
+    capability_last_success_at: string | null;
+  };
   warnings: string[];
   fingerprint: string;
   created_at: string;
@@ -273,7 +279,13 @@ export type HistoryResponse = {
 async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.ok) {
-    throw new Error(`Request failed with status ${response.status}`);
+    const body = await response.json().catch(() => null);
+    const message = body?.error?.message;
+    throw new Error(
+      typeof message === "string"
+        ? message
+        : `Request failed with status ${response.status}`,
+    );
   }
 
   return response.json() as Promise<T>;

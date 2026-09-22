@@ -320,7 +320,6 @@ async def enabled_order_draft_service(
 ) -> OrderDraftService:
     return OrderDraftService(
         repository,
-        portfolio,
         market_data,
         clock,
         await enabled_trading_guard(repository, portfolio),
@@ -378,7 +377,6 @@ async def test_drafts_require_whole_share_quantities(tmp_path) -> None:
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
     service = OrderDraftService(
         PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}"),
-        FixturePortfolioProvider(),
         FixtureMarketDataProvider(),
         lambda: now,
     )
@@ -423,6 +421,36 @@ async def test_drafts_accept_canonical_etf_asset_class(tmp_path) -> None:
     )
 
     assert draft.asset_class == "etf"
+    assert draft.estimated_notional == Decimal("300.25")
+    assert draft.account_refreshed_at is not None
+    assert draft.capability_observed_at is not None
+    assert repository.order_draft(draft.id) == draft
+
+
+@pytest.mark.asyncio
+async def test_drafts_reject_future_market_quotes(tmp_path) -> None:
+    now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+
+    class FutureQuoteProvider(FixtureMarketDataProvider):
+        async def get_quote(self, instrument_id: str):
+            quote = await super().get_quote(instrument_id)
+            return replace(quote, observed_at=now + timedelta(seconds=1))
+
+    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    portfolio = FixturePortfolioProvider()
+    service = await enabled_order_draft_service(
+        repository, portfolio, FutureQuoteProvider(), lambda: now
+    )
+
+    with pytest.raises(TradingValidationError, match="current quote"):
+        await service.create(
+            account_id="schwab-taxable-demo",
+            instrument_id="us-etf:VTI",
+            side="buy",
+            order_type="market",
+            quantity="1",
+            limit_price=None,
+        )
 
 
 def test_custom_execution_provider_requires_explicit_policy_validator(tmp_path) -> None:
