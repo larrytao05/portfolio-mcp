@@ -4,6 +4,8 @@ from typing import Mapping
 
 from portfolio_mcp.provider import ProviderConfigurationError
 
+DEFAULT_SCHWAB_CALLBACK_URL = "https://127.0.0.1:8182"
+
 
 @dataclass(frozen=True)
 class SnapTradeSettings:
@@ -34,6 +36,7 @@ class SchwabMarketDataSettings:
     client_id: str
     client_secret: str
     refresh_token: str
+    callback_url: str = DEFAULT_SCHWAB_CALLBACK_URL
 
     @classmethod
     def from_environment(
@@ -55,4 +58,5 @@ class SchwabMarketDataSettings:
             client_id=source["SCHWAB_CLIENT_ID"],
             client_secret=source["SCHWAB_CLIENT_SECRET"],
             refresh_token=source["SCHWAB_REFRESH_TOKEN"],
+            callback_url=source.get("SCHWAB_CALLBACK_URL", DEFAULT_SCHWAB_CALLBACK_URL),
         )
