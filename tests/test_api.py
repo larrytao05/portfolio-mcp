@@ -71,6 +71,110 @@ def test_health(tmp_path) -> None:
     assert response.json() == {"status": "ok"}
 
 
+def test_trading_settings_default_to_blocking_and_use_optimistic_concurrency(
+    tmp_path,
+) -> None:
+    client = create_client(tmp_path)
+
+    default = client.get("/api/trading/settings")
+
+    assert default.status_code == 200
+    assert default.json()["settings"] == {
+        "live_trading_enabled": False,
+        "kill_switch_active": True,
+        "max_order_shares": None,
+        "max_order_notional_usd": None,
+        "updated_at": None,
+        "version": 0,
+        "effective_state": "Trading blocked",
+    }
+
+    invalid = client.put(
+        "/api/trading/settings",
+        json={
+            "live_trading_enabled": True,
+            "kill_switch_active": False,
+            "max_order_shares": None,
+            "max_order_notional_usd": None,
+            "version": 0,
+        },
+    )
+    assert invalid.status_code == 422
+    assert invalid.json()["error"]["code"] == "validation_error"
+
+    saved = client.put(
+        "/api/trading/settings",
+        json={
+            "live_trading_enabled": True,
+            "kill_switch_active": False,
+            "max_order_shares": "10",
+            "max_order_notional_usd": "1000.50",
+            "version": 0,
+        },
+    )
+    assert saved.status_code == 200
+    assert saved.json()["settings"]["version"] == 1
+    assert saved.json()["settings"]["effective_state"] == "Trading enabled"
+
+    conflict = client.put(
+        "/api/trading/settings",
+        json={
+            "live_trading_enabled": False,
+            "kill_switch_active": True,
+            "max_order_shares": "10",
+            "max_order_notional_usd": "1000.50",
+            "version": 0,
+        },
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "settings_conflict"
+
+    invalid_version = client.put(
+        "/api/trading/settings",
+        json={
+            "live_trading_enabled": False,
+            "kill_switch_active": True,
+            "max_order_shares": None,
+            "max_order_notional_usd": None,
+            "version": -1,
+        },
+    )
+    assert invalid_version.status_code == 422
+    assert invalid_version.json()["error"]["code"] == "validation_error"
+
+    invalid_boolean = client.put(
+        "/api/trading/settings",
+        json={
+            "live_trading_enabled": "yes",
+            "kill_switch_active": True,
+            "max_order_shares": None,
+            "max_order_notional_usd": None,
+            "version": 1,
+        },
+    )
+    assert invalid_boolean.status_code == 422
+    assert invalid_boolean.json()["error"]["code"] == "validation_error"
+
+
+def test_order_draft_api_cannot_bypass_default_trading_safeguards(tmp_path) -> None:
+    client = create_client(tmp_path)
+
+    response = client.post(
+        "/api/order-drafts",
+        json={
+            "account_id": "schwab-taxable-demo",
+            "instrument_id": "us-etf:VTI",
+            "side": "buy",
+            "order_type": "limit",
+            "quantity": "1",
+            "limit_price": "300",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "trading_disabled"
+
+
 def test_refresh_persists_accounts(tmp_path) -> None:
     client = create_client(tmp_path)
 

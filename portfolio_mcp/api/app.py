@@ -3,9 +3,11 @@ from datetime import UTC, date, datetime
 from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StrictBool
 
 from portfolio_mcp.database import PortfolioRepository
 from portfolio_mcp.execution import ExecutionProvider, FixtureExecutionProvider
@@ -18,6 +20,12 @@ from portfolio_mcp.provider import (
     ProviderError,
 )
 from portfolio_mcp.refresh import PortfolioRefreshService
+from portfolio_mcp.trading_safety import (
+    TradingGuard,
+    TradingSettingsError,
+    TradingSettingsService,
+    settings_dict,
+)
 from portfolio_mcp.trading_service import (
     OrderDraftService,
     OrderSubmissionService,
@@ -39,6 +47,14 @@ class CreateOrderDraftRequest(BaseModel):
 class ConfirmOrderDraftRequest(BaseModel):
     expected_fingerprint: str
     confirmed: bool
+
+
+class UpdateTradingSettingsRequest(BaseModel):
+    live_trading_enabled: StrictBool
+    kill_switch_active: StrictBool
+    max_order_shares: str | None
+    max_order_notional_usd: str | None
+    version: int = Field(ge=0)
 
 
 def create_app(
@@ -64,9 +80,13 @@ def create_app(
         if type(execution) is not FixtureExecutionProvider:
             raise ValueError("A final trading policy validator is required")
         validator = fixture_submission_validator(provider)
-    draft_service = OrderDraftService(repository, provider, market_data, service_clock)
+    settings_service = TradingSettingsService(repository, service_clock)
+    trading_guard = TradingGuard(repository, settings_service)
+    draft_service = OrderDraftService(
+        repository, market_data, service_clock, trading_guard
+    )
     submission_service = OrderSubmissionService(
-        repository, execution, service_clock, validator
+        repository, execution, service_clock, validator, trading_guard
     )
     overview_service = OverviewService(repository)
     app = FastAPI(title="Portfolio Dashboard API")
@@ -125,6 +145,17 @@ def create_app(
                 capability.to_dict() for capability in repository.current_capabilities()
             ],
         }
+
+    @app.get("/api/trading/settings")
+    async def trading_settings() -> dict[str, object]:
+        return {"settings": settings_dict(settings_service.get())}
+
+    @app.put("/api/trading/settings")
+    async def update_trading_settings(
+        request: UpdateTradingSettingsRequest,
+    ) -> dict[str, object]:
+        settings = settings_service.replace(**request.model_dump())
+        return {"settings": settings_dict(settings)}
 
     @app.get("/api/accounts/{account_id}/capabilities")
     async def account_capabilities(account_id: str) -> dict[str, object]:
@@ -237,6 +268,32 @@ def create_app(
         return JSONResponse(
             status_code=422,
             content={"error": {"code": error.code, "message": str(error)}},
+        )
+
+    @app.exception_handler(TradingSettingsError)
+    async def trading_settings_error(
+        _: Request, error: TradingSettingsError
+    ) -> JSONResponse:
+        status_code = 409 if error.code == "settings_conflict" else 422
+        return JSONResponse(
+            status_code=status_code,
+            content={"error": {"code": error.code, "message": str(error)}},
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def trading_settings_request_error(
+        request: Request, error: RequestValidationError
+    ) -> JSONResponse:
+        if request.url.path != "/api/trading/settings":
+            return await request_validation_exception_handler(request, error)
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "code": "validation_error",
+                    "message": "Invalid trading settings request",
+                }
+            },
         )
 
     return app

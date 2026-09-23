@@ -23,7 +23,9 @@ const api = vi.hoisted(() => ({
   getOverviewHistory: vi.fn(),
   getQuote: vi.fn(),
   getTradingStatus: vi.fn(),
+  getTradingSettings: vi.fn(),
   refreshPortfolio: vi.fn(),
+  updateTradingSettings: vi.fn(),
   searchInstruments: vi.fn(),
 }));
 
@@ -76,6 +78,8 @@ describe("App", () => {
     api.searchInstruments.mockResolvedValue({ instruments: [] });
     api.getQuote.mockResolvedValue({ quote: null });
     api.getTradingStatus.mockResolvedValue({ providers: [], accounts: [] });
+    api.getTradingSettings.mockResolvedValue({ settings: { live_trading_enabled: false, kill_switch_active: true, max_order_shares: null, max_order_notional_usd: null, updated_at: null, version: 0, effective_state: "Trading blocked" } });
+    api.updateTradingSettings.mockResolvedValue({ settings: { live_trading_enabled: false, kill_switch_active: true, max_order_shares: null, max_order_notional_usd: null, updated_at: null, version: 1, effective_state: "Trading blocked" } });
     api.getOverview.mockResolvedValue({
       overview: {
         total_known_usd_value: null,
@@ -128,6 +132,47 @@ describe("App", () => {
     expect(
       await screen.findByText(/Saved 2 accounts and 9 positions/),
     ).toBeTruthy();
+  });
+
+  it("starts with visibly blocking trading safeguards", async () => {
+    renderApp();
+
+    expect(await screen.findByText("Trading safeguards")).toBeTruthy();
+    expect(screen.getByText("Trading blocked")).toBeTruthy();
+    expect(
+      (screen.getByLabelText("Kill switch active") as HTMLInputElement).checked,
+    ).toBe(true);
+  });
+
+  it("requires explicit confirmation before increasing trading authority", async () => {
+    renderApp();
+
+    fireEvent.click(
+      await screen.findByLabelText("Enable live trading"),
+    );
+    expect(
+      screen.getByLabelText("I confirm this increases trading authority"),
+    ).toBeTruthy();
+    expect(
+      (screen.getByRole("button", { name: "Save safeguards" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+
+    fireEvent.click(
+      screen.getByLabelText("I confirm this increases trading authority"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save safeguards" }));
+
+    await waitFor(() =>
+      expect(api.updateTradingSettings).toHaveBeenCalledOnce(),
+    );
+    expect(api.updateTradingSettings.mock.calls[0]?.[0]).toEqual({
+      live_trading_enabled: true,
+      kill_switch_active: true,
+      max_order_shares: null,
+      max_order_notional_usd: null,
+      version: 0,
+    });
   });
 
   it("explains monitoring-only account capability without relying on color", async () => {
@@ -200,6 +245,12 @@ describe("App", () => {
           time_in_force: "day",
         },
         quote: { observed_at: null, last_price: null, bid_price: null, ask_price: null, source: null },
+        safety: {
+          estimated_notional: "333.33",
+          account_refreshed_at: "2026-09-12T20:00:00Z",
+          capability_observed_at: "2026-09-12T20:00:00Z",
+          capability_last_success_at: "2026-09-12T20:00:00Z",
+        },
         warnings: ["preview_unavailable", "impact_unavailable"],
         fingerprint: "safe-fingerprint",
         created_at: "2026-09-12T20:00:00Z",
@@ -215,6 +266,16 @@ describe("App", () => {
         result: { code: state.toLowerCase(), message: state },
       },
     });
+    api.searchInstruments.mockResolvedValue({
+      instruments: [{
+        id: "us-etf:VTI",
+        symbol: "VTI",
+        name: "Vanguard Total Stock Market ETF",
+        asset_class: "equity_etf",
+        exchange: null,
+        currency: "USD",
+      }],
+    });
     renderApp();
 
     await waitFor(() =>
@@ -225,18 +286,60 @@ describe("App", () => {
     fireEvent.change(await screen.findByLabelText("Trade account"), {
       target: { value: "schwab-taxable-demo" },
     });
+    fireEvent.change(screen.getByLabelText("Trade instrument search"), {
+      target: { value: "VTI" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Search trade instruments" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Select VTI — Vanguard Total Stock Market ETF",
+      }),
+    );
     fireEvent.click(screen.getByRole("button", { name: "Review fake order" }));
     await waitFor(() => expect(api.createOrderDraft).toHaveBeenCalledOnce());
     expect(await screen.findByRole("button", { name: "Confirm fake order" })).toBeTruthy();
-    expect(screen.getAllByText("Canonical instrument ID")).toHaveLength(2);
+    expect(screen.getByText("Canonical instrument ID")).toBeTruthy();
     expect(screen.getByText("us-etf:VTI")).toBeTruthy();
     expect(screen.getByText("Time in force")).toBeTruthy();
     expect(screen.getByText(/Fake execution provider/)).toBeTruthy();
     expect(screen.getByText(/preview_unavailable/)).toBeTruthy();
+    expect(screen.getByText("Estimated notional")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Confirm fake order" }));
     await waitFor(() => expect(api.confirmOrderDraft).toHaveBeenCalledWith("draft-1", "safe-fingerprint"));
     expect(await screen.findByText(message)).toBeTruthy();
     if (state === "UNKNOWN") expect(screen.queryByText(/retry/i)).toBeNull();
+  });
+
+  it("shows the final safeguard rejection reason", async () => {
+    api.getAccounts.mockResolvedValue({
+      accounts: [{ ...savedAccount().account, is_stale: false, source_refreshed_at: new Date().toISOString() }],
+    });
+    api.createOrderDraft.mockResolvedValue({
+      draft: {
+        id: "draft-1",
+        account: { id: "schwab-taxable-demo", label: "Schwab Taxable ••••4821", provider: "Schwab" },
+        instrument: { id: "us-etf:VTI", symbol: "VTI", name: "Vanguard Total Stock Market ETF", asset_class: "equity_etf" },
+        instruction: { side: "buy", type: "market", quantity: "1", limit_price: null, time_in_force: "day" },
+        quote: { observed_at: null, last_price: null, bid_price: null, ask_price: null, source: null },
+        safety: { estimated_notional: "333.33", account_refreshed_at: null, capability_observed_at: null, capability_last_success_at: null },
+        warnings: [], fingerprint: "safe-fingerprint", created_at: "2026-09-12T20:00:00Z", expires_at: "2026-09-12T20:05:00Z",
+      },
+    });
+    api.searchInstruments.mockResolvedValue({ instruments: [{ id: "us-etf:VTI", symbol: "VTI", name: "Vanguard Total Stock Market ETF", asset_class: "equity_etf", exchange: null, currency: "USD" }] });
+    api.confirmOrderDraft.mockResolvedValue({
+      order: { id: "order-1", draft_id: "draft-1", fingerprint: "safe-fingerprint", state: "REJECTED", result: { code: "kill_switch_active", message: "The owner kill switch is active." } },
+    });
+    renderApp();
+
+    await waitFor(() => expect(screen.getAllByRole("option", { name: "Schwab Taxable ••••4821" })).toHaveLength(2));
+    fireEvent.change(screen.getByLabelText("Trade account"), { target: { value: "schwab-taxable-demo" } });
+    fireEvent.change(screen.getByLabelText("Trade instrument search"), { target: { value: "VTI" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search trade instruments" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Select VTI — Vanguard Total Stock Market ETF" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review fake order" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Confirm fake order" }));
+
+    expect(await screen.findByText("The owner kill switch is active.")).toBeTruthy();
   });
 
   it("does not show a missing record or search loading while queries are inactive", async () => {

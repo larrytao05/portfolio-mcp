@@ -140,6 +140,16 @@ export type AccountCapability = {
   is_trade_capable: boolean;
 };
 
+export type TradingSettings = {
+  live_trading_enabled: boolean;
+  kill_switch_active: boolean;
+  max_order_shares: string | null;
+  max_order_notional_usd: string | null;
+  updated_at: string | null;
+  version: number;
+  effective_state: string;
+};
+
 export type OrderDraft = {
   id: string;
   account: { id: string; label: string; provider: string };
@@ -157,6 +167,12 @@ export type OrderDraft = {
     bid_price: string | null;
     ask_price: string | null;
     source: string | null;
+  };
+  safety: {
+    estimated_notional: string | null;
+    account_refreshed_at: string | null;
+    capability_observed_at: string | null;
+    capability_last_success_at: string | null;
   };
   warnings: string[];
   fingerprint: string;
@@ -263,7 +279,13 @@ export type HistoryResponse = {
 async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.ok) {
-    throw new Error(`Request failed with status ${response.status}`);
+    const body = await response.json().catch(() => null);
+    const message = body?.error?.message;
+    throw new Error(
+      typeof message === "string"
+        ? message
+        : `Request failed with status ${response.status}`,
+    );
   }
 
   return response.json() as Promise<T>;
@@ -294,6 +316,18 @@ export function getTradingStatus(): Promise<{
   accounts: AccountCapability[];
 }> {
   return getJson("/api/trading/status");
+}
+
+export function getTradingSettings(): Promise<{ settings: TradingSettings }> {
+  return getJson("/api/trading/settings");
+}
+
+export function updateTradingSettings(input: Omit<TradingSettings, "updated_at" | "effective_state">): Promise<{ settings: TradingSettings }> {
+  return getJson("/api/trading/settings", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
 }
 
 export function refreshPortfolio(): Promise<{ refresh: RefreshResult }> {

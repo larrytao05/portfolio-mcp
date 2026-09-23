@@ -24,6 +24,12 @@ from portfolio_mcp.execution import (
     OrderState,
 )
 from portfolio_mcp.provider import MarketDataProvider, PortfolioProvider
+from portfolio_mcp.trading_safety import (
+    GuardDecision,
+    TradeIntent,
+    TradingGuard,
+    TradingSettingsService,
+)
 
 
 class TradingValidationError(ValueError):
@@ -39,14 +45,16 @@ class OrderDraftService:
     def __init__(
         self,
         repository: PortfolioRepository,
-        portfolio_provider: PortfolioProvider,
         market_data_provider: MarketDataProvider,
         clock: Callable[[], datetime],
+        trading_guard: TradingGuard | None = None,
     ) -> None:
         self._repository = repository
-        self._portfolio_provider = portfolio_provider
         self._market_data_provider = market_data_provider
         self._clock = clock
+        self._trading_guard = trading_guard or TradingGuard(
+            repository, TradingSettingsService(repository, clock)
+        )
 
     async def create(
         self,
@@ -67,34 +75,18 @@ class OrderDraftService:
                 "invalid_order_type", "type must be market or limit"
             )
 
-        accounts = await self._portfolio_provider.list_accounts()
-        account = next((item for item in accounts if item.id == account_id), None)
-        if account is None:
-            raise TradingValidationError("account_not_found", "Account not found")
         quote = await self._market_data_provider.get_quote(instrument_id)
         if quote.instrument.asset_class not in {"equity", "etf", "equity_etf"}:
             raise TradingValidationError(
                 "unsupported_instrument", "Only US stocks and ETFs are supported"
             )
-        if side == "sell":
-            holdings = await self._portfolio_provider.get_holdings(account_id)
-            held = next(
-                (
-                    position.quantity
-                    for position in holdings.positions
-                    if position.symbol == quote.instrument.symbol
-                ),
-                Decimal("0"),
-            )
-            if parsed_quantity > held:
-                raise TradingValidationError(
-                    "insufficient_holdings", "Sell quantity exceeds known holdings"
-                )
         now = _utc_now(self._clock())
-        if order_type == "market" and now - quote.observed_at > timedelta(seconds=60):
-            raise TradingValidationError(
-                "quote_stale", "A current quote is required for a market order"
-            )
+        if order_type == "market":
+            quote_age = now - quote.observed_at
+            if quote_age < timedelta() or quote_age > timedelta(seconds=60):
+                raise TradingValidationError(
+                    "quote_stale", "A current quote is required for a market order"
+                )
         if order_type == "market" and all(
             value is None
             for value in (quote.last_price, quote.bid_price, quote.ask_price)
@@ -102,6 +94,27 @@ class OrderDraftService:
             raise TradingValidationError(
                 "quote_unavailable", "A price is required for a market order"
             )
+        decision = _require_guard(
+            self._trading_guard,
+            TradeIntent(
+                account_id=account_id,
+                symbol=quote.instrument.symbol,
+                asset_class=quote.instrument.asset_class,
+                side=side,
+                order_type=order_type,
+                quantity=parsed_quantity,
+                limit_price=parsed_limit_price,
+                bid_price=quote.bid_price,
+                ask_price=quote.ask_price,
+                last_price=quote.last_price,
+            ),
+        )
+        stored_account = self._repository.stored_account(account_id)
+        if stored_account is None:
+            raise TradingValidationError("account_not_found", "Account not found")
+        account = stored_account.account
+        capability = self._repository.account_capability(account.id)
+        assert capability is not None
         fingerprint = _fingerprint(
             account_id,
             instrument_id,
@@ -128,6 +141,10 @@ class OrderDraftService:
             quote_bid_price=quote.bid_price,
             quote_ask_price=quote.ask_price,
             quote_source=quote.source,
+            estimated_notional=decision.estimated_notional,
+            account_refreshed_at=stored_account.source_refreshed_at,
+            capability_observed_at=capability.observed_at,
+            capability_last_success_at=capability.last_success_at,
             warnings=_draft_warnings(
                 order_type, quote.last_price, quote.bid_price, quote.ask_price
             ),
@@ -146,11 +163,15 @@ class OrderSubmissionService:
         execution_provider: ExecutionProvider,
         clock: Callable[[], datetime],
         validator: SubmissionValidator,
+        trading_guard: TradingGuard | None = None,
     ) -> None:
         self._repository = repository
         self._execution_provider = execution_provider
         self._clock = clock
         self._validator = validator
+        self._trading_guard = trading_guard or TradingGuard(
+            repository, TradingSettingsService(repository, clock)
+        )
         if self._repository.has_stranded_submissions():
             self._repository.recover_stranded_submissions(_utc_now(self._clock()))
 
@@ -227,6 +248,7 @@ class OrderSubmissionService:
                 raise TradingValidationError("draft_expired", "Order draft has expired")
             self._require_fresh_market_quote(draft, final_now)
             await self._validator(draft, final_now)
+            _require_guard(self._trading_guard, _trade_intent(draft))
         except TradingValidationError as error:
             return self._repository.finish_order_submission(
                 order.id,
@@ -283,7 +305,8 @@ class OrderSubmissionService:
             raise TradingValidationError(
                 "quote_unavailable", "A current quote is required for a market order"
             )
-        if now - draft.quote_observed_at > timedelta(seconds=60):
+        quote_age = now - draft.quote_observed_at
+        if quote_age < timedelta() or quote_age > timedelta(seconds=60):
             raise TradingValidationError(
                 "quote_stale", "The market quote is stale; create a new draft"
             )
@@ -402,6 +425,29 @@ def _positive_decimal(
             "whole_shares_required", f"{field_name} must be a whole-share quantity"
         )
     return parsed
+
+
+def _require_guard(trading_guard: TradingGuard, intent: TradeIntent) -> GuardDecision:
+    decision = trading_guard.evaluate(intent)
+    if decision.allowed:
+        return decision
+    violation = decision.violations[0]
+    raise TradingValidationError(violation.code, violation.message)
+
+
+def _trade_intent(draft: OrderDraft) -> TradeIntent:
+    return TradeIntent(
+        account_id=draft.account_id,
+        symbol=draft.symbol,
+        asset_class=draft.asset_class,
+        side=draft.side,
+        order_type=draft.order_type,
+        quantity=draft.quantity,
+        limit_price=draft.limit_price,
+        bid_price=draft.quote_bid_price,
+        ask_price=draft.quote_ask_price,
+        last_price=draft.quote_last_price,
+    )
 
 
 def _limit_price(order_type: str, value: str | None) -> Decimal | None:

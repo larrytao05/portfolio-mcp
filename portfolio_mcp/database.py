@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 from alembic.config import Config
@@ -17,8 +18,10 @@ from sqlalchemy import (
     UniqueConstraint,
     delete,
     select,
+    update,
 )
-from sqlalchemy.engine import Engine, create_engine
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import CursorResult, Engine, create_engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sqlalchemy.types import TypeDecorator
@@ -180,6 +183,18 @@ class AccountCapabilityRecord(Base):
     is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
+class TradingSettingsRecord(Base):
+    __tablename__ = "trading_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    live_trading_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    kill_switch_active: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    max_order_shares: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    max_order_notional_usd: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    updated_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
 class OrderDraftRecord(Base):
     __tablename__ = "order_drafts"
 
@@ -200,6 +215,10 @@ class OrderDraftRecord(Base):
     quote_bid_price: Mapped[Decimal | None] = mapped_column(ExactDecimal())
     quote_ask_price: Mapped[Decimal | None] = mapped_column(ExactDecimal())
     quote_source: Mapped[str | None] = mapped_column(String(64))
+    estimated_notional: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    account_refreshed_at: Mapped[datetime | None] = mapped_column(UtcTimestamp())
+    capability_observed_at: Mapped[datetime | None] = mapped_column(UtcTimestamp())
+    capability_last_success_at: Mapped[datetime | None] = mapped_column(UtcTimestamp())
     warnings: Mapped[str] = mapped_column(Text, nullable=False)
     fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
@@ -285,6 +304,16 @@ class StoredAccount:
             "is_stale": self.is_stale,
             "source_refreshed_at": self.source_refreshed_at.isoformat(),
         }
+
+
+@dataclass(frozen=True)
+class StoredTradingSettings:
+    live_trading_enabled: bool
+    kill_switch_active: bool
+    max_order_shares: Decimal | None
+    max_order_notional_usd: Decimal | None
+    updated_at: datetime | None
+    version: int
 
 
 @dataclass(frozen=True)
@@ -451,12 +480,79 @@ class PortfolioRepository:
                     quote_bid_price=draft.quote_bid_price,
                     quote_ask_price=draft.quote_ask_price,
                     quote_source=draft.quote_source,
+                    estimated_notional=draft.estimated_notional,
+                    account_refreshed_at=draft.account_refreshed_at,
+                    capability_observed_at=draft.capability_observed_at,
+                    capability_last_success_at=draft.capability_last_success_at,
                     warnings=json.dumps(draft.warnings),
                     fingerprint=draft.fingerprint,
                     created_at=draft.created_at,
                     expires_at=draft.expires_at,
                 )
             )
+
+    def trading_settings(self) -> StoredTradingSettings:
+        with self._sessions() as session:
+            record = session.get(TradingSettingsRecord, 1)
+            if record is None:
+                return StoredTradingSettings(False, True, None, None, None, 0)
+            return self._stored_trading_settings(record)
+
+    def stored_account(self, account_id: str) -> StoredAccount | None:
+        with self._sessions() as session:
+            record = session.get(AccountRecord, account_id)
+            if record is None:
+                return None
+            return self._stored_account(record)
+
+    def replace_trading_settings(
+        self,
+        *,
+        live_trading_enabled: bool,
+        kill_switch_active: bool,
+        max_order_shares: Decimal | None,
+        max_order_notional_usd: Decimal | None,
+        expected_version: int,
+        updated_at: datetime,
+    ) -> StoredTradingSettings | None:
+        values = {
+            "live_trading_enabled": live_trading_enabled,
+            "kill_switch_active": kill_switch_active,
+            "max_order_shares": max_order_shares,
+            "max_order_notional_usd": max_order_notional_usd,
+            "updated_at": updated_at,
+            "version": expected_version + 1,
+        }
+        with self._sessions.begin() as session:
+            if expected_version == 0:
+                inserted = cast(
+                    CursorResult[object],
+                    session.execute(
+                        sqlite_insert(TradingSettingsRecord)
+                        .values(id=1, **values)
+                        .on_conflict_do_nothing(index_elements=("id",))
+                    ),
+                )
+                if inserted.rowcount == 1:
+                    record = session.get(TradingSettingsRecord, 1)
+                    assert record is not None
+                    return self._stored_trading_settings(record)
+            updated = cast(
+                CursorResult[object],
+                session.execute(
+                    update(TradingSettingsRecord)
+                    .where(
+                        TradingSettingsRecord.id == 1,
+                        TradingSettingsRecord.version == expected_version,
+                    )
+                    .values(**values)
+                ),
+            )
+            if updated.rowcount != 1:
+                return None
+            record = session.get(TradingSettingsRecord, 1)
+            assert record is not None
+            return self._stored_trading_settings(record)
 
     def order_draft(self, draft_id: str) -> "OrderDraft | None":
         with self._sessions() as session:
@@ -601,20 +697,7 @@ class PortfolioRepository:
             records = session.scalars(
                 select(AccountRecord).order_by(AccountRecord.label)
             )
-            return [
-                StoredAccount(
-                    account=Account(
-                        id=record.id,
-                        provider=record.provider,
-                        label=record.label,
-                        account_type=record.account_type,
-                        currency=record.currency,
-                    ),
-                    is_stale=record.is_stale,
-                    source_refreshed_at=record.refreshed_at,
-                )
-                for record in records
-            ]
+            return [self._stored_account(record) for record in records]
 
     def list_positions(self, account_id: str) -> list[StoredPosition] | None:
         with self._sessions() as session:
@@ -1107,10 +1190,39 @@ class PortfolioRepository:
             quote_bid_price=record.quote_bid_price,
             quote_ask_price=record.quote_ask_price,
             quote_source=record.quote_source,
+            estimated_notional=record.estimated_notional,
+            account_refreshed_at=record.account_refreshed_at,
+            capability_observed_at=record.capability_observed_at,
+            capability_last_success_at=record.capability_last_success_at,
             warnings=tuple(json.loads(record.warnings)),
             fingerprint=record.fingerprint,
             created_at=record.created_at,
             expires_at=record.expires_at,
+        )
+
+    def _stored_trading_settings(
+        self, record: TradingSettingsRecord
+    ) -> StoredTradingSettings:
+        return StoredTradingSettings(
+            live_trading_enabled=record.live_trading_enabled,
+            kill_switch_active=record.kill_switch_active,
+            max_order_shares=record.max_order_shares,
+            max_order_notional_usd=record.max_order_notional_usd,
+            updated_at=record.updated_at,
+            version=record.version,
+        )
+
+    def _stored_account(self, record: AccountRecord) -> StoredAccount:
+        return StoredAccount(
+            account=Account(
+                id=record.id,
+                provider=record.provider,
+                label=record.label,
+                account_type=record.account_type,
+                currency=record.currency,
+            ),
+            is_stale=record.is_stale,
+            source_refreshed_at=record.refreshed_at,
         )
 
     def _stored_order(self, record: OrderRecord) -> "StoredOrder":
@@ -1515,6 +1627,10 @@ class OrderDraft:
     quote_bid_price: Decimal | None
     quote_ask_price: Decimal | None
     quote_source: str | None
+    estimated_notional: Decimal | None
+    account_refreshed_at: datetime | None
+    capability_observed_at: datetime | None
+    capability_last_success_at: datetime | None
     warnings: tuple[str, ...]
     fingerprint: str
     created_at: datetime
@@ -1565,6 +1681,28 @@ class OrderDraft:
                     else None
                 ),
                 "source": self.quote_source,
+            },
+            "safety": {
+                "estimated_notional": (
+                    str(self.estimated_notional)
+                    if self.estimated_notional is not None
+                    else None
+                ),
+                "account_refreshed_at": (
+                    self.account_refreshed_at.isoformat()
+                    if self.account_refreshed_at is not None
+                    else None
+                ),
+                "capability_observed_at": (
+                    self.capability_observed_at.isoformat()
+                    if self.capability_observed_at is not None
+                    else None
+                ),
+                "capability_last_success_at": (
+                    self.capability_last_success_at.isoformat()
+                    if self.capability_last_success_at is not None
+                    else None
+                ),
             },
             "warnings": list(self.warnings),
             "fingerprint": self.fingerprint,
