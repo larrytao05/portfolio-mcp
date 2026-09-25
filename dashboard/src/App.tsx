@@ -16,6 +16,7 @@ import {
 import { ActivitySection } from "./features/activity/ActivitySection";
 import { AccountsSection } from "./features/accounts/AccountsSection";
 import { MarketDataSection } from "./features/market-data/MarketDataSection";
+import { OrdersSection } from "./features/orders/OrdersSection";
 import { OverviewSection } from "./features/overview/OverviewSection";
 import { RecordStrip } from "./features/record/RecordStrip";
 import { ExecutionStatus, TradeSection, TradingSettingsPanel } from "./features/trading/TradingPanels";
@@ -33,6 +34,7 @@ function Navigation() {
         ["overview", "Overview"],
         ["accounts", "Accounts"],
         ["activity", "Activity"],
+        ["orders", "Orders"],
         ["market-data", "Market data"],
         ["settings", "Settings"],
         ["trade", "Trade"],
@@ -75,6 +77,8 @@ export function App() {
         queryClient.invalidateQueries({ queryKey: ["activity"] }),
         queryClient.invalidateQueries({ queryKey: ["overview"] }),
         queryClient.invalidateQueries({ queryKey: ["trading", "status"] }),
+        queryClient.invalidateQueries({ queryKey: ["orders"] }),
+        queryClient.invalidateQueries({ queryKey: ["order-audit"] }),
       ]);
     },
   });
@@ -158,6 +162,7 @@ export function App() {
           error={overviewQuery.isError}
         />
         <ActivitySection accounts={accounts.data?.accounts ?? []} />
+        <OrdersSection accounts={accounts.data?.accounts ?? []} />
         <MarketDataSection />
         <ExecutionStatus status={tradingStatus.data} loading={tradingStatus.isPending} unavailable={tradingStatus.isError} />
         <TradingSettingsPanel />

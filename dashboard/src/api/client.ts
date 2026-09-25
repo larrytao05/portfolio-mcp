@@ -378,3 +378,163 @@ export function getOverview(): Promise<OverviewResponse> {
 export function getOverviewHistory(): Promise<HistoryResponse> {
   return getJson("/api/overview/history");
 }
+
+export type StoredOrder = {
+  id: string;
+  draft_id: string;
+  fingerprint: string;
+  account: {
+    id: string;
+    label: string;
+  };
+  provider: string;
+  instrument: {
+    id: string;
+    symbol: string;
+  };
+  instruction: {
+    side: "buy" | "sell" | string;
+    type: "market" | "limit" | string;
+    quantity: string;
+    limit_price: string | null;
+    time_in_force?: string;
+  };
+  state: string;
+  broker_order_id: string | null;
+  result: {
+    code: string | null;
+    message: string | null;
+    source: string | null;
+  };
+  fill: {
+    quantity: string;
+    average_price: string | null;
+  } | null;
+  remaining_quantity?: string | null;
+  provider_submission_started_at?: string | null;
+  provider_updated_at: string | null;
+  provider_status_label: string | null;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  reconciliation?: {
+    status: string;
+    source: string | null;
+    provider_updated_at: string | null;
+    next_refresh_at: string | null;
+    target_order_id: string | null;
+  };
+};
+
+export type OrderRefreshGroup = {
+  provider: string;
+  account_id: string;
+  target_order_id: string | null;
+  next_refresh_at: string;
+};
+
+export type OrderListPage = {
+  orders: StoredOrder[];
+  next_cursor: string | null;
+  refresh_groups: OrderRefreshGroup[];
+  server_time: string;
+};
+
+export type OrderAuditEvent = {
+  event_id: string;
+  draft_id: string | null;
+  order_id: string | null;
+  account_id: string | null;
+  event_type: string;
+  actor: string;
+  previous_state: string | null;
+  next_state: string | null;
+  code: string | null;
+  details: Record<string, unknown>;
+  occurred_at: string;
+};
+
+export type OrderAuditPage = {
+  events: OrderAuditEvent[];
+  next_cursor: string | null;
+};
+
+export type RefreshOrderResult = {
+  order: StoredOrder;
+  refresh: {
+    status: "attempted" | "throttled" | "target_changed" | "not_refreshable" | string;
+    provider_read_started: boolean;
+    next_refresh_at: string | null;
+    target_order_id: string | null;
+    server_time: string;
+  };
+};
+
+export type OrderListFilters = {
+  account_id?: string;
+  provider?: string;
+  symbol?: string;
+  state?: string[];
+  start_date?: string;
+  end_date?: string;
+  limit?: number;
+  cursor?: string;
+};
+
+export type OrderAuditFilters = {
+  order_id?: string;
+  draft_id?: string;
+  account_id?: string;
+  provider?: string;
+  symbol?: string;
+  state?: string[];
+  start_date?: string;
+  end_date?: string;
+  limit?: number;
+  cursor?: string;
+};
+
+export function getOrders(filters: OrderListFilters = {}): Promise<OrderListPage> {
+  const params = new URLSearchParams();
+  if (filters.account_id) params.set("account_id", filters.account_id);
+  if (filters.provider) params.set("provider", filters.provider);
+  if (filters.symbol) params.set("symbol", filters.symbol);
+  if (filters.state) {
+    for (const s of filters.state) params.append("state", s);
+  }
+  if (filters.start_date) params.set("start_date", filters.start_date);
+  if (filters.end_date) params.set("end_date", filters.end_date);
+  if (filters.limit) params.set("limit", String(filters.limit));
+  if (filters.cursor) params.set("cursor", filters.cursor);
+  const qs = params.toString();
+  return getJson(`/api/orders${qs ? `?${qs}` : ""}`);
+}
+
+export function getOrderAudit(filters: OrderAuditFilters = {}): Promise<OrderAuditPage> {
+  const params = new URLSearchParams();
+  if (filters.order_id) params.set("order_id", filters.order_id);
+  if (filters.draft_id) params.set("draft_id", filters.draft_id);
+  if (filters.account_id) params.set("account_id", filters.account_id);
+  if (filters.provider) params.set("provider", filters.provider);
+  if (filters.symbol) params.set("symbol", filters.symbol);
+  if (filters.state) {
+    for (const s of filters.state) params.append("state", s);
+  }
+  if (filters.start_date) params.set("start_date", filters.start_date);
+  if (filters.end_date) params.set("end_date", filters.end_date);
+  if (filters.limit) params.set("limit", String(filters.limit));
+  if (filters.cursor) params.set("cursor", filters.cursor);
+  const qs = params.toString();
+  return getJson(`/api/order-audit${qs ? `?${qs}` : ""}`);
+}
+
+export function refreshOrder(
+  orderId: string,
+  mode: "scheduled" | "manual" = "manual",
+): Promise<RefreshOrderResult> {
+  return getJson(`/api/orders/${encodeURIComponent(orderId)}/refresh`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
+}

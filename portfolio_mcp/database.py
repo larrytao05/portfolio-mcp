@@ -18,6 +18,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     delete,
+    func,
     select,
     update,
 )
@@ -40,17 +41,21 @@ from portfolio_mcp.models import (
     Transaction,
 )
 from portfolio_mcp.order_history import (
+    OrderAuditFilters,
     OrderCursor,
     OrderEventActor,
     OrderEventCode,
     OrderEventCursor,
     OrderEventPage,
     OrderEventType,
+    OrderListFilters,
     OrderPage,
     OrderStatusSource,
     StoredOrderEvent,
     decode_event_details,
     encode_event_details,
+    order_audit_filter_digest,
+    order_list_filter_digest,
     require_aware_utc,
 )
 
@@ -379,6 +384,22 @@ class ConcurrentOrderUpdate(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class OrderRefreshPlan:
+    provider: str
+    account_id: str
+    target_order_id: str
+    next_refresh_at: datetime
+
+
+@dataclass(frozen=True)
+class OrderReconciliationDecision:
+    claim: "ReconciliationClaim | None"
+    status: str
+    next_refresh_at: datetime
+    target_order_id: str | None
+
+
 def _validate_fill(
     fill: FillSummary, order_quantity: Decimal, previous_quantity: Decimal | None
 ) -> None:
@@ -426,18 +447,32 @@ def _epoch_microseconds(value: datetime) -> int:
     return delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
 
 
+class CorruptedAuditRecordError(ValueError):
+    """Raised when an audit record in the database fails decoding."""
+
+
 def _stored_order_event(record: OrderEventRecord) -> StoredOrderEvent:
+    try:
+        event_type = OrderEventType(record.event_type)
+        details = decode_event_details(record.details_json)
+        encode_event_details(event_type, details)
+        actor = OrderEventActor(record.actor)
+        code = OrderEventCode(record.code) if record.code is not None else None
+    except (ValueError, TypeError, KeyError) as error:
+        raise CorruptedAuditRecordError(
+            f"Corrupted audit record {record.event_id}"
+        ) from error
     return StoredOrderEvent(
         event_id=UUID(record.event_id),
         draft_id=record.draft_id,
         order_id=record.order_id,
         account_id=record.account_id,
-        event_type=OrderEventType(record.event_type),
-        actor=OrderEventActor(record.actor),
+        event_type=event_type,
+        actor=actor,
         previous_state=record.previous_state,
         next_state=record.next_state,
-        code=OrderEventCode(record.code) if record.code is not None else None,
-        details=decode_event_details(record.details_json),
+        code=code,
+        details=details,
         occurred_at=record.occurred_at,
     )
 
@@ -981,14 +1016,25 @@ class PortfolioRepository:
         after: OrderCursor | None = None,
         account_id: str | None = None,
         states: tuple[OrderState, ...] = (),
+        provider: str | None = None,
+        symbol: str | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
     ) -> OrderPage["StoredOrder"]:
         _validate_page_limit(limit)
         normalized_states = tuple(sorted({state.value for state in states}))
+        filters = OrderListFilters(
+            account_id=account_id,
+            provider=provider,
+            symbol=symbol,
+            states=normalized_states,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        filter_digest = order_list_filter_digest(filters, limit)
         if after is not None:
-            require_aware_utc(after.updated_at)
-        if after is not None and (
-            after.account_id != account_id or after.states != normalized_states
-        ):
+            require_aware_utc(after.created_at)
+        if after is not None and after.filter_digest != filter_digest:
             raise ValueError("Order cursor does not match the requested filters")
         with self._sessions() as session:
             statement = select(OrderRecord, OrderDraftRecord).join(
@@ -998,18 +1044,38 @@ class PortfolioRepository:
                 statement = statement.where(OrderRecord.account_id == account_id)
             if states:
                 statement = statement.where(OrderRecord.state.in_(normalized_states))
+            if provider is not None:
+                statement = statement.where(
+                    func.lower(OrderRecord.provider) == provider.casefold()
+                )
+            if symbol is not None:
+                statement = statement.where(
+                    func.upper(OrderRecord.symbol) == symbol.upper()
+                )
+            if start_date is not None:
+                statement = statement.where(
+                    OrderRecord.created_at
+                    >= datetime.combine(start_date, datetime.min.time(), UTC)
+                )
+            if end_date is not None:
+                statement = statement.where(
+                    OrderRecord.created_at
+                    < datetime.combine(
+                        end_date + timedelta(days=1), datetime.min.time(), UTC
+                    )
+                )
             if after is not None:
                 statement = statement.where(
-                    (OrderRecord.updated_at < after.updated_at)
+                    (OrderRecord.created_at < after.created_at)
                     | (
-                        (OrderRecord.updated_at == after.updated_at)
+                        (OrderRecord.created_at == after.created_at)
                         & (OrderRecord.id < after.order_id)
                     )
                 )
             rows = list(
                 session.execute(
                     statement.order_by(
-                        OrderRecord.updated_at.desc(), OrderRecord.id.desc()
+                        OrderRecord.created_at.desc(), OrderRecord.id.desc()
                     ).limit(limit + 1)
                 )
             )
@@ -1020,10 +1086,9 @@ class PortfolioRepository:
             if has_more and rows:
                 last = rows[-1][0]
                 cursor = OrderCursor(
-                    updated_at=last.updated_at,
+                    created_at=last.created_at,
                     order_id=last.id,
-                    account_id=account_id,
-                    states=normalized_states,
+                    filter_digest=filter_digest,
                 )
             return OrderPage(items, cursor)
 
@@ -1035,18 +1100,30 @@ class PortfolioRepository:
         draft_id: str | None = None,
         order_id: str | None = None,
         account_id: str | None = None,
+        provider: str | None = None,
+        symbol: str | None = None,
+        states: tuple[str, ...] = (),
+        start_date: date | None = None,
+        end_date: date | None = None,
     ) -> OrderEventPage:
         _validate_page_limit(limit)
+        normalized_states = tuple(sorted(set(states)))
+        filters = OrderAuditFilters(
+            order_id=order_id,
+            draft_id=draft_id,
+            account_id=account_id,
+            provider=provider,
+            symbol=symbol,
+            states=normalized_states,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        filter_digest = order_audit_filter_digest(filters, limit)
         if after is not None:
             require_aware_utc(after.occurred_at)
-        if order_id is not None:
-            if draft_id is not None:
-                raise ValueError("Specify order_id or draft_id, not both")
-        if after is not None and (
-            after.draft_id != draft_id
-            or after.order_id != order_id
-            or after.account_id != account_id
-        ):
+        if order_id is not None and draft_id is not None:
+            raise ValueError("Specify order_id or draft_id, not both")
+        if after is not None and after.filter_digest != filter_digest:
             raise ValueError("Order event cursor does not match the requested filters")
         with self._sessions() as session:
             statement = select(OrderEventRecord)
@@ -1062,6 +1139,44 @@ class PortfolioRepository:
                 statement = statement.where(OrderEventRecord.draft_id == draft_id)
             if account_id is not None:
                 statement = statement.where(OrderEventRecord.account_id == account_id)
+            if provider is not None or symbol is not None:
+                statement = statement.outerjoin(
+                    OrderRecord, OrderRecord.id == OrderEventRecord.order_id
+                ).outerjoin(
+                    OrderDraftRecord, OrderDraftRecord.id == OrderEventRecord.draft_id
+                )
+                if provider is not None:
+                    statement = statement.where(
+                        func.lower(
+                            func.coalesce(
+                                OrderRecord.provider, OrderDraftRecord.provider
+                            )
+                        )
+                        == provider.casefold()
+                    )
+                if symbol is not None:
+                    statement = statement.where(
+                        func.upper(
+                            func.coalesce(OrderRecord.symbol, OrderDraftRecord.symbol)
+                        )
+                        == symbol.upper()
+                    )
+            if normalized_states:
+                statement = statement.where(
+                    OrderEventRecord.next_state.in_(normalized_states)
+                )
+            if start_date is not None:
+                statement = statement.where(
+                    OrderEventRecord.occurred_at
+                    >= datetime.combine(start_date, datetime.min.time(), UTC)
+                )
+            if end_date is not None:
+                statement = statement.where(
+                    OrderEventRecord.occurred_at
+                    < datetime.combine(
+                        end_date + timedelta(days=1), datetime.min.time(), UTC
+                    )
+                )
             if after is not None:
                 statement = statement.where(
                     (OrderEventRecord.occurred_at < after.occurred_at)
@@ -1090,8 +1205,113 @@ class PortfolioRepository:
                     draft_id=draft_id,
                     order_id=order_id,
                     account_id=account_id,
+                    filter_digest=filter_digest,
                 )
             return OrderEventPage(items, cursor)
+
+    def account_exists(self, account_id: str) -> bool:
+        with self._sessions() as session:
+            return (
+                session.scalar(
+                    select(AccountRecord.id).where(AccountRecord.id == account_id)
+                )
+                is not None
+            )
+
+    def order_exists(self, order_id: str) -> bool:
+        with self._sessions() as session:
+            return session.get(OrderRecord, order_id) is not None
+
+    def order_draft_exists(self, draft_id: str) -> bool:
+        with self._sessions() as session:
+            return session.get(OrderDraftRecord, draft_id) is not None
+
+    def order_refresh_plans(
+        self,
+        groups: tuple[tuple[str, str], ...],
+        *,
+        now: datetime,
+        minimum_interval: timedelta,
+    ) -> tuple[OrderRefreshPlan, ...]:
+        now = require_aware_utc(now)
+        if minimum_interval < timedelta(seconds=30):
+            raise ValueError("Reconciliation interval must be at least 30 seconds")
+        normalized_groups = tuple(sorted(set(groups)))
+        if not normalized_groups:
+            return ()
+        plans: list[OrderRefreshPlan] = []
+        with self._sessions() as session:
+            for provider, account_id in normalized_groups:
+                target_id = self._reconciliation_target(session, provider, account_id)
+                if target_id is None:
+                    continue
+                next_at = self._reconciliation_gate_next_at(
+                    session, provider, account_id, now, minimum_interval
+                )
+                plans.append(OrderRefreshPlan(provider, account_id, target_id, next_at))
+        return tuple(plans)
+
+    def next_order_reconciliation_at(
+        self,
+        provider: str,
+        account_id: str,
+        *,
+        now: datetime,
+        minimum_interval: timedelta,
+    ) -> datetime:
+        now = require_aware_utc(now)
+        with self._sessions() as session:
+            return self._reconciliation_gate_next_at(
+                session, provider, account_id, now, minimum_interval
+            )
+
+    def claim_planned_order_reconciliation(
+        self,
+        order_id: str,
+        *,
+        attempt_at: datetime,
+        minimum_interval: timedelta,
+        expected_target_id: str | None = None,
+    ) -> OrderReconciliationDecision:
+        attempt_at = require_aware_utc(attempt_at)
+        if minimum_interval < timedelta(seconds=30):
+            raise ValueError("Reconciliation interval must be at least 30 seconds")
+        expected = expected_target_id if expected_target_id is not None else order_id
+        with self._sessions.begin() as session:
+            record = session.get(OrderRecord, order_id)
+            if record is None:
+                raise ValueError("Order not found")
+            target_id = self._reconciliation_target(
+                session, record.provider, record.account_id
+            )
+            next_at = self._reconciliation_gate_next_at(
+                session,
+                record.provider,
+                record.account_id,
+                attempt_at,
+                minimum_interval,
+            )
+            if target_id != expected:
+                return OrderReconciliationDecision(
+                    None, "target_changed", next_at, target_id
+                )
+            claim = self._claim_order_reconciliation(
+                session, record, attempt_at, minimum_interval
+            )
+            if claim is None:
+                next_at = self._reconciliation_gate_next_at(
+                    session,
+                    record.provider,
+                    record.account_id,
+                    attempt_at,
+                    minimum_interval,
+                )
+                return OrderReconciliationDecision(
+                    None, "throttled", next_at, target_id
+                )
+            return OrderReconciliationDecision(
+                claim, "attempted", attempt_at + minimum_interval, target_id
+            )
 
     def claim_order_reconciliation(
         self, order_id: str, *, attempt_at: datetime, minimum_interval: timedelta
@@ -1099,46 +1319,116 @@ class PortfolioRepository:
         attempt_at = require_aware_utc(attempt_at)
         if minimum_interval < timedelta(0):
             raise ValueError("Reconciliation interval must be nonnegative")
-        epoch_us = _epoch_microseconds(attempt_at)
-        earliest_next_us = _epoch_microseconds(attempt_at - minimum_interval)
-        attempt_id = uuid4()
         with self._sessions.begin() as session:
             record = session.get(OrderRecord, order_id)
             if record is None:
                 raise ValueError("Order not found")
-            statement = sqlite_insert(ReconciliationGateRecord).values(
-                provider=record.provider,
-                account_id=record.account_id,
-                last_attempt_at_us=epoch_us,
+            return self._claim_order_reconciliation(
+                session, record, attempt_at, minimum_interval
             )
-            statement = statement.on_conflict_do_update(
-                index_elements=[
-                    ReconciliationGateRecord.provider,
-                    ReconciliationGateRecord.account_id,
-                ],
-                set_={"last_attempt_at_us": epoch_us},
-                where=(ReconciliationGateRecord.last_attempt_at_us <= earliest_next_us),
+
+    def _claim_order_reconciliation(
+        self,
+        session: Session,
+        record: OrderRecord,
+        attempt_at: datetime,
+        minimum_interval: timedelta,
+    ) -> "ReconciliationClaim | None":
+        epoch_us = _epoch_microseconds(attempt_at)
+        earliest_next_us = _epoch_microseconds(attempt_at - minimum_interval)
+        statement = sqlite_insert(ReconciliationGateRecord).values(
+            provider=record.provider,
+            account_id=record.account_id,
+            last_attempt_at_us=epoch_us,
+        )
+        statement = statement.on_conflict_do_update(
+            index_elements=[
+                ReconciliationGateRecord.provider,
+                ReconciliationGateRecord.account_id,
+            ],
+            set_={"last_attempt_at_us": epoch_us},
+            where=(ReconciliationGateRecord.last_attempt_at_us <= earliest_next_us),
+        )
+        claim_result = cast(CursorResult[object], session.execute(statement))
+        if claim_result.rowcount != 1:
+            return None
+        attempt_id = uuid4()
+        _append_order_event(
+            session,
+            draft_id=record.draft_id,
+            order_id=record.id,
+            account_id=record.account_id,
+            event_type=OrderEventType.RECONCILIATION_ATTEMPTED,
+            actor=OrderEventActor.SYSTEM,
+            occurred_at=attempt_at,
+            details={"attempt_id": attempt_id},
+            deduplication_key=f"reconciliation:{attempt_id}:attempted",
+        )
+        return ReconciliationClaim(
+            order=self._stored_order(
+                record, session.get(OrderDraftRecord, record.draft_id)
+            ),
+            attempt_id=attempt_id,
+        )
+
+    def _reconciliation_target(
+        self, session: Session, provider: str, account_id: str
+    ) -> str | None:
+        attempted = (
+            select(
+                OrderEventRecord.order_id.label("order_id"),
+                func.max(OrderEventRecord.occurred_at).label("last_attempt_at"),
             )
-            claim_result = cast(CursorResult[object], session.execute(statement))
-            if claim_result.rowcount != 1:
-                return None
-            _append_order_event(
-                session,
-                draft_id=record.draft_id,
-                order_id=record.id,
-                account_id=record.account_id,
-                event_type=OrderEventType.RECONCILIATION_ATTEMPTED,
-                actor=OrderEventActor.SYSTEM,
-                occurred_at=attempt_at,
-                details={"attempt_id": attempt_id},
-                deduplication_key=f"reconciliation:{attempt_id}:attempted",
+            .where(
+                OrderEventRecord.event_type
+                == OrderEventType.RECONCILIATION_ATTEMPTED.value
             )
-            return ReconciliationClaim(
-                order=self._stored_order(
-                    record, session.get(OrderDraftRecord, record.draft_id)
-                ),
-                attempt_id=attempt_id,
+            .group_by(OrderEventRecord.order_id)
+            .subquery()
+        )
+        syncable_states = (
+            OrderState.ACCEPTED.value,
+            OrderState.PARTIALLY_FILLED.value,
+            OrderState.CANCEL_PENDING.value,
+            OrderState.UNKNOWN.value,
+        )
+        row = session.execute(
+            select(OrderRecord.id)
+            .outerjoin(attempted, attempted.c.order_id == OrderRecord.id)
+            .where(
+                OrderRecord.provider == provider,
+                OrderRecord.account_id == account_id,
+                OrderRecord.state.in_(syncable_states),
             )
+            .order_by(
+                attempted.c.last_attempt_at.asc().nulls_first(),
+                OrderRecord.created_at.asc(),
+                OrderRecord.id.asc(),
+            )
+            .limit(1)
+        ).first()
+        return row[0] if row is not None else None
+
+    def _reconciliation_gate_next_at(
+        self,
+        session: Session,
+        provider: str,
+        account_id: str,
+        now: datetime,
+        minimum_interval: timedelta,
+    ) -> datetime:
+        gate = session.scalar(
+            select(ReconciliationGateRecord).where(
+                ReconciliationGateRecord.provider == provider,
+                ReconciliationGateRecord.account_id == account_id,
+            )
+        )
+        if gate is None:
+            return now
+        last_attempt = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(
+            microseconds=gate.last_attempt_at_us
+        )
+        return max(now, last_attempt + minimum_interval)
 
     def finish_order_reconciliation(
         self,
