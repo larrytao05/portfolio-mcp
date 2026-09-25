@@ -1005,3 +1005,88 @@ select {
     scroll-behavior: auto;
   }
 }
+
+.badge {
+  display: inline-block;
+  padding: 2px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.06);
+  letter-spacing: 0.02em;
+}
+.state-accepted {
+  background: #e6f4ea;
+  color: #137333;
+}
+.state-submitting {
+  background: #fef7e0;
+  color: #b06000;
+}
+.state-partially_filled {
+  background: #e8f0fe;
+  color: #1a73e8;
+}
+.state-filled {
+  background: #ceead6;
+  color: #0d652d;
+}
+.state-canceled,
+.state-expired {
+  background: #f1f3f4;
+  color: #5f6368;
+}
+.state-rejected {
+  background: #fce8e6;
+  color: #c5221f;
+}
+.state-cancel_pending {
+  background: #fef7e0;
+  color: #b06000;
+}
+.state-unknown {
+  background: #feefe3;
+  color: #c26401;
+}
+.audit-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  justify-content: flex-end;
+  z-index: 1000;
+}
+.audit-modal-content {
+  background: #fff;
+  width: min(100%, 540px);
+  height: 100%;
+  overflow-y: auto;
+  padding: 32px 24px;
+  box-shadow: -4px 0 24px rgba(0, 0, 0, 0.15);
+}
+.audit-event-list {
+  list-style: none;
+  padding: 0;
+  margin: 20px 0 0;
+  display: grid;
+  gap: 16px;
+}
+.audit-event-item {
+  border-left: 2px solid var(--line);
+  padding-left: 12px;
+  font-size: 13px;
+}
+.audit-event-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+.audit-details {
+  background: #f8faf9;
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  font-size: 12px;
+  overflow-x: auto;
+  margin: 6px 0 0;
+}

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from portfolio_mcp.database import (
+    OrderRefreshPlan,
     PortfolioRepository,
     ReconciliationClaim,
     StoredOrder,
@@ -33,6 +36,7 @@ _SYNCABLE_STATES = {
     OrderState.CANCEL_PENDING,
     OrderState.UNKNOWN,
 }
+_PROVIDER_READ_TIMEOUT = timedelta(seconds=10)
 _SAFE_MESSAGES = {
     "matched": "Broker order status was synchronized.",
     "not_found": "No matching broker order was found.",
@@ -45,6 +49,16 @@ _SAFE_MESSAGES = {
         "Broker order status could not be applied; the saved status was preserved."
     ),
 }
+
+
+@dataclass(frozen=True)
+class OrderRefreshResult:
+    order: StoredOrder
+    status: str
+    provider_read_started: bool
+    next_refresh_at: datetime | None
+    target_order_id: str | None
+    server_time: datetime
 
 
 class OrderReconciliationService:
@@ -63,18 +77,91 @@ class OrderReconciliationService:
         self._minimum_interval = minimum_interval
 
     async def sync(self, order_id: str) -> StoredOrder:
-        order = self._require_order(order_id)
-        if order.state == OrderState.SUBMITTING:
-            return order
-        if order.state not in _SYNCABLE_STATES:
-            return order
-        return await self._reconcile(order)
+        return (await self.refresh(order_id, mode="manual")).order
 
     async def reconcile_unknown(self, order_id: str) -> StoredOrder:
         order = self._require_order(order_id)
         if order.state != OrderState.UNKNOWN:
             return order
-        return await self._reconcile(order)
+        return (await self.refresh(order_id, mode="manual")).order
+
+    def plan_for_orders(
+        self, orders: tuple[StoredOrder, ...]
+    ) -> tuple[OrderRefreshPlan, ...]:
+        groups = tuple(
+            (order.provider, order.account_id)
+            for order in orders
+            if order.state in _SYNCABLE_STATES
+        )
+        return self._repository.order_refresh_plans(
+            groups,
+            now=self._now(),
+            minimum_interval=self._minimum_interval,
+        )
+
+    async def refresh(
+        self,
+        order_id: str,
+        *,
+        mode: str = "manual",
+    ) -> OrderRefreshResult:
+        if mode not in {"manual", "scheduled"}:
+            raise ValueError("Invalid refresh mode")
+        now = self._now()
+        order = self._require_order(order_id)
+        if order.state not in _SYNCABLE_STATES:
+            return OrderRefreshResult(order, "not_refreshable", False, None, None, now)
+        if mode == "scheduled":
+            decision = self._repository.claim_planned_order_reconciliation(
+                order_id,
+                attempt_at=now,
+                minimum_interval=self._minimum_interval,
+            )
+            if decision.claim is None:
+                current = self._require_order(order_id)
+                return OrderRefreshResult(
+                    current,
+                    decision.status,
+                    False,
+                    decision.next_refresh_at,
+                    decision.target_order_id,
+                    self._now(),
+                )
+            claim = decision.claim
+            next_refresh_at = decision.next_refresh_at
+            target_order_id = decision.target_order_id
+        else:
+            claim = self._repository.claim_order_reconciliation(
+                order_id,
+                attempt_at=now,
+                minimum_interval=self._minimum_interval,
+            )
+            if claim is None:
+                current = self._require_order(order_id)
+                return OrderRefreshResult(
+                    current,
+                    "throttled",
+                    False,
+                    self._repository.next_order_reconciliation_at(
+                        current.provider,
+                        current.account_id,
+                        now=self._now(),
+                        minimum_interval=self._minimum_interval,
+                    ),
+                    None,
+                    self._now(),
+                )
+            next_refresh_at = now + self._minimum_interval
+            target_order_id = order_id
+        updated, read_started = await self._execute_claim(claim, now)
+        return OrderRefreshResult(
+            updated,
+            "attempted",
+            read_started,
+            next_refresh_at,
+            target_order_id,
+            self._now(),
+        )
 
     def _require_order(self, order_id: str) -> StoredOrder:
         order = self._repository.order(order_id)
@@ -94,18 +181,43 @@ class OrderReconciliationService:
         )
         if claim is None:
             return self._require_order(order.id)
+        updated, _ = await self._execute_claim(claim, attempt_at)
+        return updated
+
+    async def _execute_claim(
+        self, claim: ReconciliationClaim, attempt_at: datetime
+    ) -> tuple[StoredOrder, bool]:
+        provider_read_started = (
+            claim.order.broker_order_id is not None
+            or claim.order.provider_submission_started_at is not None
+        )
         try:
-            search = await self._search(claim.order)
+            search = await asyncio.wait_for(
+                self._search(claim.order),
+                timeout=_PROVIDER_READ_TIMEOUT.total_seconds(),
+            )
         except Exception:
-            return self._finish_without_match(claim, attempt_at, "provider_error")
+            return (
+                self._finish_without_match(claim, attempt_at, "provider_error"),
+                provider_read_started,
+            )
         if not isinstance(search, BrokerOrderSearch):
-            return self._finish_without_match(claim, attempt_at, "incomplete")
+            return (
+                self._finish_without_match(claim, attempt_at, "incomplete"),
+                provider_read_started,
+            )
         if search.complete is not True:
-            return self._finish_without_match(claim, attempt_at, "incomplete")
+            return (
+                self._finish_without_match(claim, attempt_at, "incomplete"),
+                provider_read_started,
+            )
         snapshot, outcome = self._single_exact_match(claim.order, search.orders)
         if snapshot is None:
-            return self._finish_without_match(claim, attempt_at, outcome)
-        return self._finish_match(claim, attempt_at, snapshot)
+            return (
+                self._finish_without_match(claim, attempt_at, outcome),
+                provider_read_started,
+            )
+        return self._finish_match(claim, attempt_at, snapshot), provider_read_started
 
     async def _search(self, order: StoredOrder) -> BrokerOrderSearch:
         if order.broker_order_id is not None:

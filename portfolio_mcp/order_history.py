@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from typing import Generic, TypeAlias, TypeVar
 from uuid import UUID
@@ -75,14 +78,186 @@ class OrderEventCursor:
     draft_id: str | None
     order_id: str | None
     account_id: str | None
+    filter_digest: str = ""
 
 
 @dataclass(frozen=True)
 class OrderCursor:
-    updated_at: datetime
+    created_at: datetime
     order_id: str
-    account_id: str | None
-    states: tuple[str, ...]
+    filter_digest: str
+
+
+@dataclass(frozen=True)
+class OrderListFilters:
+    account_id: str | None = None
+    provider: str | None = None
+    symbol: str | None = None
+    states: tuple[str, ...] = ()
+    start_date: date | None = None
+    end_date: date | None = None
+
+
+@dataclass(frozen=True)
+class OrderAuditFilters:
+    order_id: str | None = None
+    draft_id: str | None = None
+    account_id: str | None = None
+    provider: str | None = None
+    symbol: str | None = None
+    states: tuple[str, ...] = ()
+    start_date: date | None = None
+    end_date: date | None = None
+
+
+_CURSOR_MAX_LENGTH = 2048
+_CURSOR_TOKEN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def order_list_filter_digest(filters: OrderListFilters, limit: int) -> str:
+    return _filter_digest(
+        "orders",
+        {
+            "account_id": filters.account_id,
+            "provider": filters.provider.casefold() if filters.provider else None,
+            "symbol": filters.symbol.upper() if filters.symbol else None,
+            "states": sorted(set(filters.states)),
+            "start_date": filters.start_date.isoformat()
+            if filters.start_date
+            else None,
+            "end_date": filters.end_date.isoformat() if filters.end_date else None,
+            "limit": limit,
+        },
+    )
+
+
+def order_audit_filter_digest(filters: OrderAuditFilters, limit: int) -> str:
+    return _filter_digest(
+        "order-audit",
+        {
+            "order_id": filters.order_id,
+            "draft_id": filters.draft_id,
+            "account_id": filters.account_id,
+            "provider": filters.provider.casefold() if filters.provider else None,
+            "symbol": filters.symbol.upper() if filters.symbol else None,
+            "states": sorted(set(filters.states)),
+            "start_date": filters.start_date.isoformat()
+            if filters.start_date
+            else None,
+            "end_date": filters.end_date.isoformat() if filters.end_date else None,
+            "limit": limit,
+        },
+    )
+
+
+def encode_order_cursor(cursor: OrderCursor | None) -> str | None:
+    if cursor is None:
+        return None
+    return _encode_cursor(
+        {
+            "v": 1,
+            "kind": "orders",
+            "created_at": require_aware_utc(cursor.created_at).isoformat(),
+            "order_id": cursor.order_id,
+            "filter_digest": cursor.filter_digest,
+        }
+    )
+
+
+def decode_order_cursor(
+    token: str | None, filters: OrderListFilters, limit: int
+) -> OrderCursor | None:
+    if token is None:
+        return None
+    payload = _decode_cursor(token, "orders", filters, limit)
+    try:
+        created_at = datetime.fromisoformat(payload["created_at"])
+        require_aware_utc(created_at)
+        order_id = payload["order_id"]
+        if not isinstance(order_id, str) or not 1 <= len(order_id) <= 128:
+            raise ValueError
+        return OrderCursor(
+            created_at=created_at,
+            order_id=order_id,
+            filter_digest=payload["filter_digest"],
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("Invalid order cursor") from error
+
+
+def encode_order_event_cursor(cursor: OrderEventCursor | None) -> str | None:
+    if cursor is None:
+        return None
+    return _encode_cursor(
+        {
+            "v": 1,
+            "kind": "order-audit",
+            "occurred_at": require_aware_utc(cursor.occurred_at).isoformat(),
+            "event_id": str(cursor.event_id),
+            "filter_digest": cursor.filter_digest,
+        }
+    )
+
+
+def decode_order_event_cursor(
+    token: str | None, filters: OrderAuditFilters, limit: int
+) -> OrderEventCursor | None:
+    if token is None:
+        return None
+    payload = _decode_cursor(token, "order-audit", filters, limit)
+    try:
+        occurred_at = datetime.fromisoformat(payload["occurred_at"])
+        require_aware_utc(occurred_at)
+        return OrderEventCursor(
+            occurred_at=occurred_at,
+            event_id=UUID(payload["event_id"]),
+            draft_id=filters.draft_id,
+            order_id=filters.order_id,
+            account_id=filters.account_id,
+            filter_digest=payload["filter_digest"],
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("Invalid order-audit cursor") from error
+
+
+def _filter_digest(kind: str, filters: dict[str, object]) -> str:
+    encoded = json.dumps(
+        {"kind": kind, "filters": filters}, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _encode_cursor(payload: dict[str, object]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("=")
+
+
+def _decode_cursor(
+    token: str,
+    kind: str,
+    filters: OrderListFilters | OrderAuditFilters,
+    limit: int,
+) -> dict[str, str]:
+    if not 1 <= len(token) <= _CURSOR_MAX_LENGTH or not _CURSOR_TOKEN.fullmatch(token):
+        raise ValueError("Invalid cursor")
+    try:
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+        payload = json.loads(raw)
+    except (ValueError, json.JSONDecodeError) as error:
+        raise ValueError("Invalid cursor") from error
+    if (
+        not isinstance(payload, dict)
+        or payload.get("kind") != kind
+        or payload.get("v") != 1
+    ):
+        raise ValueError("Invalid cursor")
+    if isinstance(filters, OrderListFilters):
+        digest = order_list_filter_digest(filters, limit)
+    else:
+        digest = order_audit_filter_digest(filters, limit)
+    if payload.get("filter_digest") != digest:
+        raise ValueError("Cursor does not match the requested filters")
+    return payload
 
 
 T = TypeVar("T")

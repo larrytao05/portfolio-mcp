@@ -1,17 +1,31 @@
 from collections.abc import Callable
 from datetime import UTC, date, datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StrictBool
 
-from portfolio_mcp.database import PortfolioRepository
-from portfolio_mcp.execution import ExecutionProvider, FixtureExecutionProvider
+from portfolio_mcp.database import CorruptedAuditRecordError, PortfolioRepository
+from portfolio_mcp.execution import (
+    ExecutionProvider,
+    FixtureExecutionProvider,
+    OrderReadProvider,
+    OrderState,
+)
 from portfolio_mcp.fixtures import FixtureMarketDataProvider
+from portfolio_mcp.order_history import (
+    OrderAuditFilters,
+    OrderListFilters,
+    decode_order_cursor,
+    decode_order_event_cursor,
+    encode_order_cursor,
+    encode_order_event_cursor,
+)
+from portfolio_mcp.order_reconciliation import OrderReconciliationService
 from portfolio_mcp.overview import OverviewService
 from portfolio_mcp.provider import (
     InstrumentNotFoundError,
@@ -49,6 +63,10 @@ class ConfirmOrderDraftRequest(BaseModel):
     confirmed: bool
 
 
+class RefreshOrderRequest(BaseModel):
+    mode: Literal["manual", "scheduled"] = "manual"
+
+
 class UpdateTradingSettingsRequest(BaseModel):
     live_trading_enabled: StrictBool
     kill_switch_active: StrictBool
@@ -62,6 +80,7 @@ def create_app(
     *,
     market_data_provider: MarketDataProvider | None = None,
     execution_provider: ExecutionProvider | None = None,
+    order_read_provider: OrderReadProvider | None = None,
     submission_validator: SubmissionValidator | None = None,
     database_url: str = "sqlite:///portfolio.db",
     clock: Callable[[], datetime] | None = None,
@@ -73,7 +92,7 @@ def create_app(
     execution = (
         execution_provider
         if execution_provider is not None
-        else FixtureExecutionProvider()
+        else FixtureExecutionProvider(clock=service_clock)
     )
     validator = submission_validator
     if validator is None:
@@ -87,6 +106,14 @@ def create_app(
     )
     submission_service = OrderSubmissionService(
         repository, execution, service_clock, validator, trading_guard
+    )
+    order_reader = order_read_provider
+    if order_reader is None and type(execution) is FixtureExecutionProvider:
+        order_reader = execution
+    reconciliation = (
+        OrderReconciliationService(repository, order_reader, service_clock)
+        if order_reader is not None
+        else None
     )
     overview_service = OverviewService(repository)
     app = FastAPI(title="Portfolio Dashboard API")
@@ -232,6 +259,189 @@ def create_app(
             draft_id, request.expected_fingerprint, request.confirmed
         )
         return {"order": order.to_dict()}
+
+    @app.get("/api/orders")
+    async def list_orders(
+        account_id: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+        provider: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
+        symbol: Annotated[str | None, Query(min_length=1, max_length=32)] = None,
+        state: Annotated[list[OrderState], Query()] = [],
+        start_date: date | None = None,
+        end_date: date | None = None,
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        cursor: Annotated[str | None, Query(max_length=2048)] = None,
+    ) -> dict[str, object]:
+        if start_date is not None and end_date is not None and start_date > end_date:
+            raise HTTPException(
+                status_code=422, detail="start_date must be on or before end_date"
+            )
+        if account_id is not None and not repository.account_exists(account_id):
+            raise HTTPException(status_code=404, detail="Account not found")
+        normalized_provider = provider.strip() if provider is not None else None
+        normalized_symbol = symbol.strip().upper() if symbol is not None else None
+        filters = OrderListFilters(
+            account_id=account_id,
+            provider=normalized_provider,
+            symbol=normalized_symbol,
+            states=tuple(sorted({value.value for value in state})),
+            start_date=start_date,
+            end_date=end_date,
+        )
+        try:
+            after = decode_order_cursor(cursor, filters, limit)
+        except ValueError as error:
+            raise HTTPException(
+                status_code=422, detail="Invalid order cursor"
+            ) from error
+        page = repository.list_orders(
+            limit=limit,
+            after=after,
+            account_id=account_id,
+            states=tuple(OrderState(value) for value in filters.states),
+            provider=normalized_provider,
+            symbol=normalized_symbol,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        plans = reconciliation.plan_for_orders(page.items) if reconciliation else ()
+        plans_by_group = {(plan.provider, plan.account_id): plan for plan in plans}
+        orders: list[dict[str, object]] = []
+        for order in page.items:
+            plan = plans_by_group.get((order.provider, order.account_id))
+            serialized = order.to_dict()
+            serialized["reconciliation"] = {
+                "status": order.result_code or "pending",
+                "source": (
+                    order.result_source.value
+                    if order.result_source is not None
+                    else None
+                ),
+                "provider_updated_at": (
+                    order.provider_updated_at.isoformat()
+                    if order.provider_updated_at is not None
+                    else None
+                ),
+                "next_refresh_at": (
+                    plan.next_refresh_at.isoformat() if plan is not None else None
+                ),
+                "target_order_id": plan.target_order_id if plan is not None else None,
+            }
+            orders.append(serialized)
+        return {
+            "orders": orders,
+            "next_cursor": encode_order_cursor(page.next_cursor),
+            "refresh_groups": [
+                {
+                    "provider": plan.provider,
+                    "account_id": plan.account_id,
+                    "target_order_id": plan.target_order_id,
+                    "next_refresh_at": plan.next_refresh_at.isoformat(),
+                }
+                for plan in plans
+            ],
+            "server_time": service_clock().astimezone(UTC).isoformat(),
+        }
+
+    @app.get("/api/order-audit")
+    async def list_order_audit(
+        order_id: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+        draft_id: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+        account_id: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+        provider: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
+        symbol: Annotated[str | None, Query(min_length=1, max_length=32)] = None,
+        state: Annotated[list[OrderState], Query()] = [],
+        start_date: date | None = None,
+        end_date: date | None = None,
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        cursor: Annotated[str | None, Query(max_length=2048)] = None,
+    ) -> dict[str, object]:
+        if order_id is not None and draft_id is not None:
+            raise HTTPException(status_code=422, detail="Specify order_id or draft_id")
+        if start_date is not None and end_date is not None and start_date > end_date:
+            raise HTTPException(
+                status_code=422, detail="start_date must be on or before end_date"
+            )
+        if order_id is not None and not repository.order_exists(order_id):
+            raise HTTPException(status_code=404, detail="Order not found")
+        if draft_id is not None and not repository.order_draft_exists(draft_id):
+            raise HTTPException(status_code=404, detail="Order draft not found")
+        if account_id is not None and not repository.account_exists(account_id):
+            raise HTTPException(status_code=404, detail="Account not found")
+        normalized_provider = provider.strip() if provider is not None else None
+        normalized_symbol = symbol.strip().upper() if symbol is not None else None
+        filters = OrderAuditFilters(
+            order_id=order_id,
+            draft_id=draft_id,
+            account_id=account_id,
+            provider=normalized_provider,
+            symbol=normalized_symbol,
+            states=tuple(sorted({value.value for value in state})),
+            start_date=start_date,
+            end_date=end_date,
+        )
+        try:
+            after = decode_order_event_cursor(cursor, filters, limit)
+        except ValueError as error:
+            raise HTTPException(
+                status_code=422, detail="Invalid order-audit cursor"
+            ) from error
+        try:
+            page = repository.list_order_events(
+                limit=limit,
+                after=after,
+                order_id=order_id,
+                draft_id=draft_id,
+                account_id=account_id,
+                provider=normalized_provider,
+                symbol=normalized_symbol,
+                states=filters.states,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        except CorruptedAuditRecordError as error:
+            raise HTTPException(
+                status_code=500, detail="Order audit details are unavailable"
+            ) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return {
+            "events": [event.to_dict() for event in page.items],
+            "next_cursor": encode_order_event_cursor(page.next_cursor),
+        }
+
+    @app.post("/api/orders/{order_id}/refresh")
+    async def refresh_order(
+        order_id: str,
+        request: RefreshOrderRequest = Body(default=RefreshOrderRequest()),
+    ) -> dict[str, object]:
+        if reconciliation is None:
+            if repository.order(order_id) is None:
+                raise HTTPException(status_code=404, detail="Order not found")
+            raise HTTPException(
+                status_code=503, detail="Order reconciliation is unavailable"
+            )
+        try:
+            result = await reconciliation.refresh(order_id, mode=request.mode)
+        except ValueError as error:
+            if str(error) == "Order not found":
+                raise HTTPException(
+                    status_code=404, detail="Order not found"
+                ) from error
+            raise
+        return {
+            "order": result.order.to_dict(),
+            "refresh": {
+                "status": result.status,
+                "provider_read_started": result.provider_read_started,
+                "next_refresh_at": (
+                    result.next_refresh_at.isoformat()
+                    if result.next_refresh_at is not None
+                    else None
+                ),
+                "target_order_id": result.target_order_id,
+                "server_time": result.server_time.isoformat(),
+            },
+        }
 
     @app.get("/api/orders/{order_id}")
     async def get_order(order_id: str) -> dict[str, object]:
