@@ -1,9 +1,13 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.ruff_cache/
 .venv/
 .env
 portfolio.db
 .codex/
+.audit/
+.worktrees/
+/todo.md
 dashboard/node_modules/
 dashboard/dist/
