@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import weakref
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -573,3 +574,184 @@ def _draft_warnings(
     if order_type == "market":
         return tuple(warning for warning in warnings if warning != "quote_unavailable")
     return tuple(warnings)
+
+
+class OrderCancellationService:
+    def __init__(
+        self,
+        repository: PortfolioRepository,
+        execution_provider: ExecutionProvider,
+        clock: Callable[[], datetime],
+    ) -> None:
+        self._repository = repository
+        self._execution_provider = execution_provider
+        self._clock = clock
+        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
+
+    def _lock_for(self, order_id: str) -> asyncio.Lock:
+        lock = self._locks.get(order_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[order_id] = lock
+        return lock
+
+    async def cancel(
+        self,
+        *,
+        order_id: str,
+        expected_version: int,
+        expected_state: OrderState,
+        confirmed: bool,
+        actor: OrderEventActor = OrderEventActor.DASHBOARD,
+    ) -> StoredOrder:
+        if not confirmed:
+            raise TradingValidationError(
+                "confirmation_required", "Order cancellation confirmation is required"
+            )
+        order = self._repository.order(order_id)
+        if order is None:
+            raise TradingValidationError("order_not_found", "Order not found")
+
+        try:
+            capability = await self._execution_provider.get_execution_capability(
+                order.account_id
+            )
+        except Exception as error:
+            raise TradingValidationError(
+                "capability_unavailable", "Trading capability is unavailable"
+            ) from error
+        if (
+            not _capability_is_well_formed(capability, order.account_id)
+            or not capability.permits_cancellation
+        ):
+            raise TradingValidationError(
+                "execution_unsupported", "This account cannot cancel orders"
+            )
+
+        async with self._lock_for(order_id):
+            now = _utc_now(self._clock())
+            try:
+                order_pending, attempt_id, started = (
+                    self._repository.begin_order_cancellation(
+                        order_id,
+                        expected_version=expected_version,
+                        expected_state=expected_state,
+                        now=now,
+                        actor=actor,
+                    )
+                )
+            except ConcurrentOrderUpdate:
+                raise TradingValidationError(
+                    "order_conflict", "Order changed before cancellation"
+                )
+            except ValueError as error:
+                raise TradingValidationError("order_not_cancelable", str(error))
+
+            if not started or attempt_id is None:
+                return order_pending
+
+            assert order_pending.broker_order_id is not None
+            try:
+                result = await asyncio.wait_for(
+                    self._execution_provider.cancel_order(
+                        order_pending.broker_order_id
+                    ),
+                    timeout=10.0,
+                )
+            except asyncio.CancelledError:
+                self._repository.finish_order_cancellation(
+                    order_id,
+                    attempt_id=attempt_id,
+                    state=OrderState.UNKNOWN,
+                    now=_utc_now(self._clock()),
+                    outcome="unknown",
+                    result_code="unknown",
+                    result_message=(
+                        "Cancellation interrupted; outcome is unknown. "
+                        "Reconciliation required."
+                    ),
+                    result_source=OrderStatusSource.SYSTEM,
+                    actor=actor,
+                )
+                raise
+            except (ExecutionIndeterminateError, asyncio.TimeoutError):
+                return self._repository.finish_order_cancellation(
+                    order_id,
+                    attempt_id=attempt_id,
+                    state=OrderState.UNKNOWN,
+                    now=_utc_now(self._clock()),
+                    outcome="unknown",
+                    result_code="unknown",
+                    result_message=(
+                        "Cancellation outcome is unknown. Reconciliation is required."
+                    ),
+                    result_source=OrderStatusSource.SYSTEM,
+                    actor=actor,
+                )
+            except Exception as error:
+                return self._repository.finish_order_cancellation(
+                    order_id,
+                    attempt_id=attempt_id,
+                    state=OrderState.UNKNOWN,
+                    now=_utc_now(self._clock()),
+                    outcome="unknown",
+                    result_code="unknown",
+                    result_message=f"Cancellation failed: {error}",
+                    result_source=OrderStatusSource.SYSTEM,
+                    actor=actor,
+                )
+
+            observed_at = _utc_now(self._clock())
+            if not isinstance(result, ExecutionResult):
+                return self._repository.finish_order_cancellation(
+                    order_id,
+                    attempt_id=attempt_id,
+                    state=OrderState.UNKNOWN,
+                    now=observed_at,
+                    outcome="unknown",
+                    result_code="unknown",
+                    result_message="Cancellation result was malformed.",
+                    result_source=OrderStatusSource.SYSTEM,
+                    actor=actor,
+                )
+
+            if result.state == OrderState.CANCELED:
+                return self._repository.finish_order_cancellation(
+                    order_id,
+                    attempt_id=attempt_id,
+                    state=OrderState.CANCELED,
+                    now=observed_at,
+                    outcome="canceled",
+                    result_code="canceled",
+                    result_message="Order canceled successfully",
+                    result_source=OrderStatusSource.PROVIDER,
+                    fill=result.fill,
+                    actor=actor,
+                )
+            else:
+                target_state = (
+                    result.state
+                    if result.state
+                    in {
+                        OrderState.FILLED,
+                        OrderState.EXPIRED,
+                        OrderState.PARTIALLY_FILLED,
+                        OrderState.ACCEPTED,
+                    }
+                    else expected_state
+                )
+                return self._repository.finish_order_cancellation(
+                    order_id,
+                    attempt_id=attempt_id,
+                    state=target_state,
+                    now=observed_at,
+                    outcome="refused",
+                    result_code="cancel_rejected",
+                    result_message=result.message
+                    or "Cancellation was rejected by the broker.",
+                    result_source=OrderStatusSource.PROVIDER,
+                    fill=result.fill,
+                    actor=actor,
+                )
