@@ -1,15 +1,16 @@
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from alembic.config import Config
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Date,
     ForeignKey,
     Integer,
@@ -27,7 +28,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 from sqlalchemy.types import TypeDecorator
 
 from alembic import command
-from portfolio_mcp.execution import OrderState, require_transition
+from portfolio_mcp.execution import FillSummary, OrderState, require_transition
 from portfolio_mcp.models import (
     Account,
     AccountCapabilities,
@@ -37,6 +38,20 @@ from portfolio_mcp.models import (
     ProviderHealth,
     ProviderHealthState,
     Transaction,
+)
+from portfolio_mcp.order_history import (
+    OrderCursor,
+    OrderEventActor,
+    OrderEventCode,
+    OrderEventCursor,
+    OrderEventPage,
+    OrderEventType,
+    OrderPage,
+    OrderStatusSource,
+    StoredOrderEvent,
+    decode_event_details,
+    encode_event_details,
+    require_aware_utc,
 )
 
 
@@ -249,6 +264,9 @@ class OrderRecord(Base):
     broker_order_id: Mapped[str | None] = mapped_column(String(128))
     result_code: Mapped[str | None] = mapped_column(String(64))
     result_message: Mapped[str | None] = mapped_column(String(256))
+    result_source: Mapped[str | None] = mapped_column(String(16))
+    filled_quantity: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    average_fill_price: Mapped[Decimal | None] = mapped_column(ExactDecimal())
     created_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
@@ -266,6 +284,140 @@ class OrderAuthorizationRecord(Base):
     expires_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
     consumed_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
     created_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+
+
+class OrderEventRecord(Base):
+    __tablename__ = "order_events"
+    __table_args__ = (
+        UniqueConstraint("deduplication_key"),
+        CheckConstraint(
+            "actor IN ('dashboard', 'mcp', 'system')", name="ck_order_events_actor"
+        ),
+        CheckConstraint(
+            "event_type IN ("
+            "'draft_created', 'draft_expired', 'authorization_created', "
+            "'authorization_consumed', 'authorization_failed', "
+            "'submission_started', 'submission_result', 'status_transition', "
+            "'reconciliation_attempted', 'reconciliation_result', "
+            "'cancellation_requested', 'cancellation_result')",
+            name="ck_order_events_type",
+        ),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    draft_id: Mapped[str | None] = mapped_column(
+        ForeignKey("order_drafts.id", ondelete="RESTRICT")
+    )
+    order_id: Mapped[str | None] = mapped_column(
+        ForeignKey("orders.id", ondelete="RESTRICT")
+    )
+    account_id: Mapped[str | None] = mapped_column(String(128))
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    actor: Mapped[str] = mapped_column(String(16), nullable=False)
+    previous_state: Mapped[str | None] = mapped_column(String(32))
+    next_state: Mapped[str | None] = mapped_column(String(32))
+    code: Mapped[str | None] = mapped_column(String(64))
+    details_schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    details_json: Mapped[str] = mapped_column(Text, nullable=False)
+    deduplication_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+
+
+def _append_order_event(
+    session: Session,
+    *,
+    draft_id: str | None,
+    order_id: str | None,
+    account_id: str | None,
+    event_type: OrderEventType,
+    actor: OrderEventActor,
+    occurred_at: datetime,
+    previous_state: OrderState | None = None,
+    next_state: OrderState | None = None,
+    code: OrderEventCode | None = None,
+    details: Mapping[str, object] | None = None,
+    deduplication_key: str,
+) -> None:
+    if not deduplication_key or len(deduplication_key) > 160:
+        raise ValueError("Invalid order event deduplication key")
+    normalized_time = require_aware_utc(occurred_at)
+    session.add(
+        OrderEventRecord(
+            event_id=str(uuid4()),
+            draft_id=draft_id,
+            order_id=order_id,
+            account_id=account_id,
+            event_type=event_type.value,
+            actor=actor.value,
+            previous_state=previous_state.value if previous_state else None,
+            next_state=next_state.value if next_state else None,
+            code=code.value if code else None,
+            details_schema_version=1,
+            details_json=encode_event_details(event_type, details or {}),
+            deduplication_key=deduplication_key,
+            occurred_at=normalized_time,
+        )
+    )
+
+
+class ConcurrentOrderUpdate(RuntimeError):
+    pass
+
+
+def _validate_fill(
+    fill: FillSummary, order_quantity: Decimal, previous_quantity: Decimal | None
+) -> None:
+    if (
+        not fill.quantity.is_finite()
+        or fill.quantity <= 0
+        or fill.quantity > order_quantity
+        or (previous_quantity is not None and fill.quantity < previous_quantity)
+        or (
+            fill.average_price is not None
+            and (not fill.average_price.is_finite() or fill.average_price <= 0)
+        )
+    ):
+        raise ValueError("Invalid order fill")
+    if len(str(fill.quantity)) > 128 or (
+        fill.average_price is not None and len(str(fill.average_price)) > 128
+    ):
+        raise ValueError("Order fill exceeds the supported precision")
+
+
+def _order_event_code(result_code: str | None, state: OrderState) -> OrderEventCode:
+    if result_code is not None:
+        try:
+            return OrderEventCode(result_code)
+        except ValueError:
+            return OrderEventCode.VALIDATION_FAILED
+    return {
+        OrderState.ACCEPTED: OrderEventCode.ACCEPTED,
+        OrderState.PARTIALLY_FILLED: OrderEventCode.PARTIALLY_FILLED,
+        OrderState.FILLED: OrderEventCode.FILLED,
+        OrderState.REJECTED: OrderEventCode.REJECTED,
+        OrderState.UNKNOWN: OrderEventCode.UNKNOWN,
+    }.get(state, OrderEventCode.VALIDATION_FAILED)
+
+
+def _validate_page_limit(limit: int) -> None:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("Page limit must be between 1 and 100")
+
+
+def _stored_order_event(record: OrderEventRecord) -> StoredOrderEvent:
+    return StoredOrderEvent(
+        event_id=UUID(record.event_id),
+        draft_id=record.draft_id,
+        order_id=record.order_id,
+        account_id=record.account_id,
+        event_type=OrderEventType(record.event_type),
+        actor=OrderEventActor(record.actor),
+        previous_state=record.previous_state,
+        next_state=record.next_state,
+        code=OrderEventCode(record.code) if record.code is not None else None,
+        details=decode_event_details(record.details_json),
+        occurred_at=record.occurred_at,
+    )
 
 
 @dataclass(frozen=True)
@@ -459,7 +611,11 @@ class PortfolioRepository:
         )
         self._clock = clock or (lambda: datetime.now(UTC))
 
-    def save_order_draft(self, draft: "OrderDraft") -> None:
+    def save_order_draft(
+        self,
+        draft: "OrderDraft",
+        actor: OrderEventActor = OrderEventActor.DASHBOARD,
+    ) -> None:
         with self._sessions.begin() as session:
             session.add(
                 OrderDraftRecord(
@@ -489,6 +645,18 @@ class PortfolioRepository:
                     created_at=draft.created_at,
                     expires_at=draft.expires_at,
                 )
+            )
+            session.flush()
+            _append_order_event(
+                session,
+                draft_id=draft.id,
+                order_id=None,
+                account_id=draft.account_id,
+                event_type=OrderEventType.DRAFT_CREATED,
+                actor=actor,
+                occurred_at=draft.created_at,
+                details={},
+                deduplication_key=f"draft:{draft.id}:created",
             )
 
     def trading_settings(self) -> StoredTradingSettings:
@@ -560,8 +728,12 @@ class PortfolioRepository:
             return self._order_draft(record) if record is not None else None
 
     def begin_order_submission(
-        self, draft: "OrderDraft", now: datetime
+        self,
+        draft: "OrderDraft",
+        now: datetime,
+        actor: OrderEventActor = OrderEventActor.DASHBOARD,
     ) -> tuple["StoredOrder", bool]:
+        now = require_aware_utc(now)
         order_id = str(uuid4())
         client_order_id = str(uuid4())
         try:
@@ -570,10 +742,13 @@ class PortfolioRepository:
                     select(OrderRecord).where(OrderRecord.draft_id == draft.id)
                 )
                 if existing is not None:
-                    return self._stored_order(existing), False
+                    return self._stored_order(
+                        existing, session.get(OrderDraftRecord, existing.draft_id)
+                    ), False
+                authorization_id = str(uuid4())
                 session.add(
                     OrderAuthorizationRecord(
-                        id=str(uuid4()),
+                        id=authorization_id,
                         draft_id=draft.id,
                         action="submit",
                         expected_fingerprint=draft.fingerprint,
@@ -605,27 +780,271 @@ class PortfolioRepository:
                 )
                 session.add(record)
                 session.flush()
-                return self._stored_order(record), True
+                authorization_details = {
+                    "authorization_id": authorization_id,
+                    "action": "submit",
+                }
+                for event_type in (
+                    OrderEventType.AUTHORIZATION_CREATED,
+                    OrderEventType.AUTHORIZATION_CONSUMED,
+                ):
+                    _append_order_event(
+                        session,
+                        draft_id=draft.id,
+                        order_id=order_id,
+                        account_id=draft.account_id,
+                        event_type=event_type,
+                        actor=actor,
+                        occurred_at=now,
+                        details=authorization_details,
+                        deduplication_key=(
+                            f"authorization:{authorization_id}:"
+                            f"{event_type.value.removeprefix('authorization_')}"
+                        ),
+                    )
+                _append_order_event(
+                    session,
+                    draft_id=draft.id,
+                    order_id=order_id,
+                    account_id=draft.account_id,
+                    event_type=OrderEventType.SUBMISSION_STARTED,
+                    actor=actor,
+                    occurred_at=now,
+                    next_state=OrderState.SUBMITTING,
+                    details={},
+                    deduplication_key=f"order:{order_id}:version:1:started",
+                )
+                return self._stored_order(
+                    record, session.get(OrderDraftRecord, draft.id)
+                ), True
         except IntegrityError:
             with self._sessions() as session:
                 existing = session.scalar(
                     select(OrderRecord).where(OrderRecord.draft_id == draft.id)
                 )
-                if existing is None:
+                if (
+                    existing is None
+                    or existing.fingerprint != draft.fingerprint
+                    or existing.account_id != draft.account_id
+                    or existing.provider != draft.provider
+                ):
                     raise
-                return self._stored_order(existing), False
+                started_event = session.scalar(
+                    select(OrderEventRecord.event_id).where(
+                        OrderEventRecord.order_id == existing.id,
+                        OrderEventRecord.event_type
+                        == OrderEventType.SUBMISSION_STARTED.value,
+                    )
+                )
+                if started_event is None:
+                    raise
+                return self._stored_order(
+                    existing, session.get(OrderDraftRecord, existing.draft_id)
+                ), False
 
     def order(self, order_id: str) -> "StoredOrder | None":
         with self._sessions() as session:
             record = session.get(OrderRecord, order_id)
-            return self._stored_order(record) if record is not None else None
+            if record is None:
+                return None
+            return self._stored_order(
+                record, session.get(OrderDraftRecord, record.draft_id)
+            )
 
     def order_for_draft(self, draft_id: str) -> "StoredOrder | None":
         with self._sessions() as session:
             record = session.scalar(
                 select(OrderRecord).where(OrderRecord.draft_id == draft_id)
             )
-            return self._stored_order(record) if record is not None else None
+            if record is None:
+                return None
+            return self._stored_order(
+                record, session.get(OrderDraftRecord, record.draft_id)
+            )
+
+    def record_draft_expiry(self, draft_id: str, *, observed_at: datetime) -> bool:
+        observed_at = require_aware_utc(observed_at)
+        with self._sessions.begin() as session:
+            draft = session.get(OrderDraftRecord, draft_id)
+            if draft is None or observed_at <= draft.expires_at:
+                return False
+            existing = session.scalar(
+                select(OrderEventRecord.event_id).where(
+                    OrderEventRecord.deduplication_key == f"draft:{draft_id}:expired"
+                )
+            )
+            if existing is not None:
+                return False
+            _append_order_event(
+                session,
+                draft_id=draft.id,
+                order_id=None,
+                account_id=draft.account_id,
+                event_type=OrderEventType.DRAFT_EXPIRED,
+                actor=OrderEventActor.DASHBOARD,
+                occurred_at=observed_at,
+                code=OrderEventCode.DRAFT_EXPIRED,
+                details={"expires_at": draft.expires_at.isoformat()},
+                deduplication_key=f"draft:{draft_id}:expired",
+            )
+            return True
+
+    def record_authorization_failure(
+        self,
+        *,
+        attempt_id: UUID,
+        draft_id: str | None,
+        action: str,
+        actor: OrderEventActor,
+        code: OrderEventCode,
+        occurred_at: datetime,
+    ) -> bool:
+        if action not in {"submit", "cancel"}:
+            raise ValueError("Invalid authorization action")
+        with self._sessions.begin() as session:
+            draft = session.get(OrderDraftRecord, draft_id) if draft_id else None
+            dedupe_key = f"authorization:{attempt_id}:failed"
+            if (
+                session.scalar(
+                    select(OrderEventRecord.event_id).where(
+                        OrderEventRecord.deduplication_key == dedupe_key
+                    )
+                )
+                is not None
+            ):
+                return False
+            _append_order_event(
+                session,
+                draft_id=draft.id if draft is not None else None,
+                order_id=None,
+                account_id=draft.account_id if draft is not None else None,
+                event_type=OrderEventType.AUTHORIZATION_FAILED,
+                actor=actor,
+                occurred_at=occurred_at,
+                code=code,
+                details={"attempt_id": attempt_id, "action": action},
+                deduplication_key=dedupe_key,
+            )
+            return True
+
+    def list_orders(
+        self,
+        *,
+        limit: int = 50,
+        after: OrderCursor | None = None,
+        account_id: str | None = None,
+        states: tuple[OrderState, ...] = (),
+    ) -> OrderPage["StoredOrder"]:
+        _validate_page_limit(limit)
+        normalized_states = tuple(sorted({state.value for state in states}))
+        if after is not None:
+            require_aware_utc(after.updated_at)
+        if after is not None and (
+            after.account_id != account_id or after.states != normalized_states
+        ):
+            raise ValueError("Order cursor does not match the requested filters")
+        with self._sessions() as session:
+            statement = select(OrderRecord, OrderDraftRecord).join(
+                OrderDraftRecord, OrderDraftRecord.id == OrderRecord.draft_id
+            )
+            if account_id is not None:
+                statement = statement.where(OrderRecord.account_id == account_id)
+            if states:
+                statement = statement.where(OrderRecord.state.in_(normalized_states))
+            if after is not None:
+                statement = statement.where(
+                    (OrderRecord.updated_at < after.updated_at)
+                    | (
+                        (OrderRecord.updated_at == after.updated_at)
+                        & (OrderRecord.id < after.order_id)
+                    )
+                )
+            rows = list(
+                session.execute(
+                    statement.order_by(
+                        OrderRecord.updated_at.desc(), OrderRecord.id.desc()
+                    ).limit(limit + 1)
+                )
+            )
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            items = tuple(self._stored_order(order, draft) for order, draft in rows)
+            cursor = None
+            if has_more and rows:
+                last = rows[-1][0]
+                cursor = OrderCursor(
+                    updated_at=last.updated_at,
+                    order_id=last.id,
+                    account_id=account_id,
+                    states=normalized_states,
+                )
+            return OrderPage(items, cursor)
+
+    def list_order_events(
+        self,
+        *,
+        limit: int = 50,
+        after: OrderEventCursor | None = None,
+        draft_id: str | None = None,
+        order_id: str | None = None,
+        account_id: str | None = None,
+    ) -> OrderEventPage:
+        _validate_page_limit(limit)
+        if after is not None:
+            require_aware_utc(after.occurred_at)
+        if order_id is not None:
+            if draft_id is not None:
+                raise ValueError("Specify order_id or draft_id, not both")
+        if after is not None and (
+            after.draft_id != draft_id
+            or after.order_id != order_id
+            or after.account_id != account_id
+        ):
+            raise ValueError("Order event cursor does not match the requested filters")
+        with self._sessions() as session:
+            statement = select(OrderEventRecord)
+            if order_id is not None:
+                order = session.get(OrderRecord, order_id)
+                if order is None:
+                    return OrderEventPage((), None)
+                statement = statement.where(
+                    (OrderEventRecord.order_id == order_id)
+                    | (OrderEventRecord.draft_id == order.draft_id)
+                )
+            elif draft_id is not None:
+                statement = statement.where(OrderEventRecord.draft_id == draft_id)
+            if account_id is not None:
+                statement = statement.where(OrderEventRecord.account_id == account_id)
+            if after is not None:
+                statement = statement.where(
+                    (OrderEventRecord.occurred_at < after.occurred_at)
+                    | (
+                        (OrderEventRecord.occurred_at == after.occurred_at)
+                        & (OrderEventRecord.event_id < str(after.event_id))
+                    )
+                )
+            records = list(
+                session.scalars(
+                    statement.order_by(
+                        OrderEventRecord.occurred_at.desc(),
+                        OrderEventRecord.event_id.desc(),
+                    ).limit(limit + 1)
+                )
+            )
+            has_more = len(records) > limit
+            records = records[:limit]
+            items = tuple(_stored_order_event(record) for record in records)
+            cursor = None
+            if has_more and records:
+                last = records[-1]
+                cursor = OrderEventCursor(
+                    occurred_at=last.occurred_at,
+                    event_id=UUID(last.event_id),
+                    draft_id=draft_id,
+                    order_id=order_id,
+                    account_id=account_id,
+                )
+            return OrderEventPage(items, cursor)
 
     def authorization_for_draft(
         self, draft_id: str
@@ -639,6 +1058,7 @@ class PortfolioRepository:
             return self._stored_authorization(record) if record is not None else None
 
     def recover_stranded_submissions(self, now: datetime) -> int:
+        now = require_aware_utc(now)
         with self._sessions.begin() as session:
             records = list(
                 session.scalars(
@@ -647,15 +1067,51 @@ class PortfolioRepository:
                     )
                 )
             )
+            recovered = 0
             for record in records:
-                record.state = OrderState.UNKNOWN
-                record.result_code = "unknown"
-                record.result_message = (
-                    "Order outcome is unknown. Reconciliation is required."
+                previous_version = record.version
+                updated_at = max(now, record.updated_at)
+                result = cast(
+                    CursorResult[object],
+                    session.execute(
+                        update(OrderRecord)
+                        .where(
+                            OrderRecord.id == record.id,
+                            OrderRecord.version == previous_version,
+                            OrderRecord.state == OrderState.SUBMITTING,
+                        )
+                        .values(
+                            state=OrderState.UNKNOWN,
+                            result_code="unknown",
+                            result_message=(
+                                "Order outcome is unknown. Reconciliation is required."
+                            ),
+                            result_source=OrderStatusSource.SYSTEM.value,
+                            updated_at=updated_at,
+                            version=previous_version + 1,
+                        )
+                    ),
                 )
-                record.updated_at = now
-                record.version += 1
-            return len(records)
+                if result.rowcount != 1:
+                    continue
+                recovered += 1
+                _append_order_event(
+                    session,
+                    draft_id=record.draft_id,
+                    order_id=record.id,
+                    account_id=record.account_id,
+                    event_type=OrderEventType.STATUS_TRANSITION,
+                    actor=OrderEventActor.SYSTEM,
+                    occurred_at=now,
+                    previous_state=OrderState.SUBMITTING,
+                    next_state=OrderState.UNKNOWN,
+                    code=OrderEventCode.UNKNOWN,
+                    details={"status_source": OrderStatusSource.SYSTEM},
+                    deduplication_key=(
+                        f"order:{record.id}:version:{previous_version + 1}:recovery"
+                    ),
+                )
+            return recovered
 
     def has_stranded_submissions(self) -> bool:
         with self._sessions() as session:
@@ -674,23 +1130,98 @@ class PortfolioRepository:
         state: OrderState,
         now: datetime,
         *,
+        expected_version: int,
         broker_order_id: str | None = None,
         result_code: str | None = None,
         result_message: str | None = None,
+        fill: FillSummary | None = None,
+        result_source: OrderStatusSource = OrderStatusSource.SYSTEM,
+        actor: OrderEventActor = OrderEventActor.SYSTEM,
     ) -> "StoredOrder":
+        now = require_aware_utc(now)
         with self._sessions.begin() as session:
             record = session.get(OrderRecord, order_id)
             if record is None:
                 raise ValueError("Order not found")
+            if record.version != expected_version:
+                raise ConcurrentOrderUpdate("Order changed during provider request")
+            previous_state = OrderState(record.state)
             require_transition(OrderState(record.state), state)
+            if fill is not None:
+                _validate_fill(fill, record.quantity, record.filled_quantity)
+                if state == OrderState.FILLED and fill.quantity != record.quantity:
+                    raise ValueError("Filled quantity must equal the order quantity")
+                if (
+                    state == OrderState.PARTIALLY_FILLED
+                    and fill.quantity >= record.quantity
+                ):
+                    raise ValueError("Partial fill must be below the order quantity")
             record.state = state
             record.broker_order_id = broker_order_id
             record.result_code = result_code
             record.result_message = result_message
-            record.updated_at = now
+            record.result_source = result_source.value
+            if fill is not None:
+                record.filled_quantity = fill.quantity
+                record.average_fill_price = fill.average_price
+            event_occurred_at = max(now, record.updated_at)
+            record.updated_at = event_occurred_at
             record.version += 1
             session.flush()
-            return self._stored_order(record)
+            event_type = (
+                OrderEventType.SUBMISSION_RESULT
+                if previous_state == OrderState.SUBMITTING
+                else OrderEventType.STATUS_TRANSITION
+            )
+            details: dict[str, object] = {"status_source": result_source}
+            if fill is not None:
+                details["filled_quantity"] = str(fill.quantity)
+                if fill.average_price is not None:
+                    details["average_fill_price"] = str(fill.average_price)
+            code = _order_event_code(result_code, state)
+            _append_order_event(
+                session,
+                draft_id=record.draft_id,
+                order_id=record.id,
+                account_id=record.account_id,
+                event_type=event_type,
+                actor=actor,
+                occurred_at=event_occurred_at,
+                previous_state=previous_state,
+                next_state=state,
+                code=code,
+                details=details,
+                deduplication_key=(
+                    f"order:{record.id}:version:{record.version}:{event_type.value}"
+                ),
+            )
+            if result_code == OrderEventCode.DRAFT_EXPIRED.value:
+                draft = session.get(OrderDraftRecord, record.draft_id)
+                assert draft is not None
+                expiry_key = f"draft:{draft.id}:expired"
+                if (
+                    session.scalar(
+                        select(OrderEventRecord.event_id).where(
+                            OrderEventRecord.deduplication_key == expiry_key
+                        )
+                    )
+                    is None
+                ):
+                    _append_order_event(
+                        session,
+                        draft_id=draft.id,
+                        order_id=record.id,
+                        account_id=record.account_id,
+                        event_type=OrderEventType.DRAFT_EXPIRED,
+                        actor=actor,
+                        occurred_at=event_occurred_at,
+                        code=OrderEventCode.DRAFT_EXPIRED,
+                        details={"expires_at": draft.expires_at.isoformat()},
+                        deduplication_key=expiry_key,
+                    )
+            return self._stored_order(
+                record, session.get(OrderDraftRecord, record.draft_id)
+            )
 
     def list_accounts(self) -> list[StoredAccount]:
         with self._sessions() as session:
@@ -1215,7 +1746,11 @@ class PortfolioRepository:
             source_refreshed_at=record.refreshed_at,
         )
 
-    def _stored_order(self, record: OrderRecord) -> "StoredOrder":
+    def _stored_order(
+        self, record: OrderRecord, draft: OrderDraftRecord | None = None
+    ) -> "StoredOrder":
+        if draft is None:
+            raise ValueError("Order draft not found")
         return StoredOrder(
             id=record.id,
             draft_id=record.draft_id,
@@ -1234,6 +1769,24 @@ class PortfolioRepository:
             broker_order_id=record.broker_order_id,
             result_code=record.result_code,
             result_message=record.result_message,
+            result_source=(
+                OrderStatusSource(record.result_source)
+                if record.result_source is not None
+                else None
+            ),
+            filled_quantity=record.filled_quantity,
+            average_fill_price=record.average_fill_price,
+            draft=StoredDraftSummary(
+                id=draft.id,
+                created_at=draft.created_at,
+                expires_at=draft.expires_at,
+                instrument_id=draft.instrument_id,
+                symbol=draft.symbol,
+                side=draft.side,
+                order_type=draft.order_type,
+                quantity=draft.quantity,
+                limit_price=draft.limit_price,
+            ),
             created_at=record.created_at,
             updated_at=record.updated_at,
             version=record.version,
@@ -1702,6 +2255,36 @@ class OrderDraft:
 
 
 @dataclass(frozen=True)
+class StoredDraftSummary:
+    id: str
+    created_at: datetime
+    expires_at: datetime
+    instrument_id: str
+    symbol: str
+    side: str
+    order_type: str
+    quantity: Decimal
+    limit_price: Decimal | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "created_at": self.created_at.isoformat(),
+            "expires_at": self.expires_at.isoformat(),
+            "instruction": {
+                "instrument_id": self.instrument_id,
+                "symbol": self.symbol,
+                "side": self.side,
+                "type": self.order_type,
+                "quantity": str(self.quantity),
+                "limit_price": (
+                    str(self.limit_price) if self.limit_price is not None else None
+                ),
+            },
+        }
+
+
+@dataclass(frozen=True)
 class StoredOrder:
     id: str
     draft_id: str
@@ -1720,6 +2303,10 @@ class StoredOrder:
     broker_order_id: str | None
     result_code: str | None
     result_message: str | None
+    result_source: OrderStatusSource | None
+    filled_quantity: Decimal | None
+    average_fill_price: Decimal | None
+    draft: StoredDraftSummary
     created_at: datetime
     updated_at: datetime
     version: int
@@ -1746,7 +2333,23 @@ class StoredOrder:
             "result": {
                 "code": self.result_code,
                 "message": self.result_message,
+                "source": (
+                    self.result_source.value if self.result_source is not None else None
+                ),
             },
+            "fill": (
+                {
+                    "quantity": str(self.filled_quantity),
+                    "average_price": (
+                        str(self.average_fill_price)
+                        if self.average_fill_price is not None
+                        else None
+                    ),
+                }
+                if self.filled_quantity is not None
+                else None
+            ),
+            "draft": self.draft.to_dict(),
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "version": self.version,
