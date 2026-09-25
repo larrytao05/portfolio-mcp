@@ -629,12 +629,18 @@ async def test_repository_enforces_persisted_state_transitions(tmp_path) -> None
     repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
     draft = await create_limit_draft(repository, now)
     order, _ = repository.begin_order_submission(draft, now)
-    repository.finish_order_submission(order.id, OrderState.UNKNOWN, now)
-    reconciled = repository.finish_order_submission(order.id, OrderState.FILLED, now)
+    unknown = repository.finish_order_submission(
+        order.id, OrderState.UNKNOWN, now, expected_version=order.version
+    )
+    reconciled = repository.finish_order_submission(
+        order.id, OrderState.FILLED, now, expected_version=unknown.version
+    )
 
     assert reconciled.state == OrderState.FILLED
     with pytest.raises(ValueError):
-        repository.finish_order_submission(order.id, OrderState.ACCEPTED, now)
+        repository.finish_order_submission(
+            order.id, OrderState.ACCEPTED, now, expected_version=reconciled.version
+        )
 
 
 @pytest.mark.asyncio
@@ -924,6 +930,53 @@ async def test_definite_immediate_fill_results_are_preserved(
             "filled": OrderState.FILLED,
         }[scenario]
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_result",
+    [ExecutionResult(OrderState.ACCEPTED, "fixture-order"), TimeoutError()],
+)
+async def test_submission_result_event_uses_provider_observation_time(
+    tmp_path, provider_result: object
+) -> None:
+    now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+    clock = [now]
+    repository = PortfolioRepository(
+        f"sqlite:///{tmp_path / 'portfolio.db'}", lambda: clock[0]
+    )
+    draft = await create_limit_draft(repository, now)
+
+    class DelayedProvider(IndeterminateExecutionProvider):
+        async def submit_order(self, command: ExecutionCommand) -> ExecutionResult:
+            del command
+            self.invocations += 1
+            clock[0] += timedelta(minutes=1)
+            if isinstance(self.result, BaseException):
+                raise self.result
+            return cast(ExecutionResult, self.result)
+
+    service = OrderSubmissionService(
+        repository,
+        DelayedProvider(provider_result),
+        lambda: clock[0],
+        allow_fixture_submission,
+    )
+
+    order = await service.confirm(draft.id, draft.fingerprint, True)
+
+    events = repository.list_order_events(order_id=order.id, limit=100).items
+    submitted_at = next(
+        event.occurred_at
+        for event in events
+        if event.event_type.value == "submission_started"
+    )
+    result_at = next(
+        event.occurred_at
+        for event in events
+        if event.event_type.value == "submission_result"
+    )
+    assert result_at > submitted_at
 
 
 @pytest.mark.asyncio

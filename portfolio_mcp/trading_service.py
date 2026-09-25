@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 
 from portfolio_mcp.database import (
+    ConcurrentOrderUpdate,
     OrderDraft,
     PortfolioRepository,
     StoredOrder,
@@ -22,6 +23,11 @@ from portfolio_mcp.execution import (
     ExecutionProvider,
     ExecutionResult,
     OrderState,
+)
+from portfolio_mcp.order_history import (
+    OrderEventActor,
+    OrderEventCode,
+    OrderStatusSource,
 )
 from portfolio_mcp.provider import MarketDataProvider, PortfolioProvider
 from portfolio_mcp.trading_safety import (
@@ -39,6 +45,13 @@ class TradingValidationError(ValueError):
 
 
 SubmissionValidator = Callable[[OrderDraft, datetime], Awaitable[None]]
+
+
+def _authorization_failure_code(value: str) -> OrderEventCode:
+    try:
+        return OrderEventCode(value)
+    except ValueError:
+        return OrderEventCode.VALIDATION_FAILED
 
 
 class OrderDraftService:
@@ -178,6 +191,26 @@ class OrderSubmissionService:
     async def confirm(
         self, draft_id: str, expected_fingerprint: str, confirmed: bool
     ) -> StoredOrder:
+        attempt_id = uuid4()
+        try:
+            return await self._confirm(draft_id, expected_fingerprint, confirmed)
+        except TradingValidationError as error:
+            now = _utc_now(self._clock())
+            self._repository.record_authorization_failure(
+                attempt_id=attempt_id,
+                draft_id=draft_id,
+                action="submit",
+                actor=OrderEventActor.DASHBOARD,
+                code=_authorization_failure_code(error.code),
+                occurred_at=now,
+            )
+            if error.code == OrderEventCode.DRAFT_EXPIRED.value:
+                self._repository.record_draft_expiry(draft_id, observed_at=now)
+            raise
+
+    async def _confirm(
+        self, draft_id: str, expected_fingerprint: str, confirmed: bool
+    ) -> StoredOrder:
         if not confirmed:
             raise TradingValidationError(
                 "confirmation_required", "Explicit confirmation is required"
@@ -256,17 +289,26 @@ class OrderSubmissionService:
                 final_now,
                 result_code=error.code,
                 result_message=str(error),
+                expected_version=order.version,
+                result_source=OrderStatusSource.LOCAL,
+                actor=OrderEventActor.DASHBOARD,
             )
         try:
             result = await self._execution_provider.submit_order(command)
-            return self._persist_provider_result(order, result, now)
+            observed_at = _utc_now(self._clock())
+            return self._persist_provider_result(order, result, observed_at)
         except asyncio.CancelledError:
-            self._unknown(order, now)
+            self._unknown(order, _utc_now(self._clock()))
             raise
+        except ConcurrentOrderUpdate:
+            latest = self._repository.order(order.id)
+            if latest is None:
+                raise
+            return latest
         except (ExecutionIndeterminateError, TimeoutError):
-            return self._unknown(order, now)
+            return self._unknown(order, _utc_now(self._clock()))
         except Exception:
-            return self._unknown(order, now)
+            return self._unknown(order, _utc_now(self._clock()))
 
     def _persist_provider_result(
         self, order: StoredOrder, result: object, now: datetime
@@ -296,6 +338,10 @@ class OrderSubmissionService:
             ),
             result_code=result.state.lower(),
             result_message=_safe_message(result.state),
+            expected_version=order.version,
+            fill=result.fill,
+            result_source=OrderStatusSource.PROVIDER,
+            actor=OrderEventActor.DASHBOARD,
         )
 
     def _require_fresh_market_quote(self, draft: OrderDraft, now: datetime) -> None:
@@ -318,6 +364,9 @@ class OrderSubmissionService:
             now,
             result_code="unknown",
             result_message="Order outcome is unknown. Reconciliation is required.",
+            expected_version=order.version,
+            result_source=OrderStatusSource.SYSTEM,
+            actor=OrderEventActor.DASHBOARD,
         )
 
 
