@@ -779,6 +779,9 @@ class PortfolioRepository:
             accounts = list(
                 session.scalars(select(AccountRecord).order_by(AccountRecord.provider))
             )
+            accounts_by_provider: dict[str, list[AccountRecord]] = {}
+            for account in accounts:
+                accounts_by_provider.setdefault(account.provider, []).append(account)
             latest = session.scalar(
                 select(RefreshRunRecord).order_by(RefreshRunRecord.id.desc()).limit(1)
             )
@@ -790,42 +793,29 @@ class PortfolioRepository:
                 if latest is not None
                 else {}
             )
-            return [
-                ProviderHealth(
-                    provider=provider,
-                    state=self._provider_health_state(
-                        outcome=outcomes.get(provider),
-                        accounts=[
-                            account
-                            for account in accounts
-                            if account.provider == provider
-                        ],
-                        refresh_status=latest.status if latest is not None else None,
-                        error_code=latest.error_code if latest is not None else None,
-                    ),
-                    observed_at=latest.completed_at if latest is not None else None,
-                    last_success_at=self._latest_provider_success(session, provider),
-                    blocks=self._health_blocks(
-                        self._provider_health_state(
-                            outcome=outcomes.get(provider),
-                            accounts=[
-                                account
-                                for account in accounts
-                                if account.provider == provider
-                            ],
-                            refresh_status=latest.status
-                            if latest is not None
-                            else None,
-                            error_code=latest.error_code
-                            if latest is not None
-                            else None,
-                        )
-                    ),
+            refresh_status = latest.status if latest is not None else None
+            error_code = latest.error_code if latest is not None else None
+            observed_at = latest.completed_at if latest is not None else None
+            health = []
+            for provider in sorted(set(accounts_by_provider) | set(outcomes)):
+                state = self._provider_health_state(
+                    outcome=outcomes.get(provider),
+                    accounts=accounts_by_provider.get(provider, []),
+                    refresh_status=refresh_status,
+                    error_code=error_code,
                 )
-                for provider in sorted(
-                    {account.provider for account in accounts} | set(outcomes)
+                health.append(
+                    ProviderHealth(
+                        provider=provider,
+                        state=state,
+                        observed_at=observed_at,
+                        last_success_at=self._latest_provider_success(
+                            session, provider
+                        ),
+                        blocks=self._health_blocks(state),
+                    )
                 )
-            ]
+            return health
 
     def save_refresh(
         self,

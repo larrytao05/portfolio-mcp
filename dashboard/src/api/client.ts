@@ -242,11 +242,6 @@ export type DailyRecordedPoint = {
   is_complete: boolean;
 };
 
-export type RecordedHistory = {
-  points: DailyRecordedPoint[];
-  currencies: string[];
-};
-
 export type PortfolioOverview = {
   total_known_usd_value: string | null;
   cash_usd?: string | null;
@@ -274,8 +269,6 @@ export type OverviewResponse = {
 export type HistoryResponse = {
   history: DailyRecordedPoint[];
 };
-
-
 async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.ok) {
@@ -297,10 +290,6 @@ export function getHealth(): Promise<{ status: string }> {
 
 export function getAccounts(): Promise<AccountsResponse> {
   return getJson("/api/accounts");
-}
-
-export function getAccountPositions(accountId: string): Promise<{ positions: Position[] }> {
-  return getJson(`/api/accounts/${encodeURIComponent(accountId)}/positions`);
 }
 
 export function getAccount(accountId: string): Promise<{ account: AccountDetail }> {

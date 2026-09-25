@@ -371,6 +371,58 @@ describe("App", () => {
     ).toBeTruthy();
   });
 
+  it("keeps cached holdings visible when refreshing account details fails", async () => {
+    api.getAccounts.mockResolvedValue({
+      accounts: [
+        {
+          id: "schwab-taxable-demo",
+          provider: "Schwab",
+          label: "Schwab Taxable ••••4821",
+          account_type: "taxable_brokerage",
+          currency: "USD",
+          is_stale: false,
+          source_refreshed_at: new Date().toISOString(),
+        },
+      ],
+    });
+    api.getAccount
+      .mockResolvedValueOnce(
+        savedAccount([
+          {
+            account_id: "schwab-taxable-demo",
+            as_of: "2026-09-12",
+            symbol: "VTI",
+            name: "Vanguard Total Stock Market ETF",
+            asset_class: "equity_etf",
+            quantity: "1",
+            current_price: "333.33",
+            market_value: "333.33",
+            cost_basis: "300.00",
+            gain_loss: "33.33",
+            currency: "USD",
+            is_stale: false,
+            source_refreshed_at: "2026-09-12T14:00:01+00:00",
+          },
+        ]),
+      )
+      .mockRejectedValueOnce(new Error("unavailable"));
+    renderApp();
+
+    expect(
+      await screen.findByText(/Vanguard Total Stock Market ETF/),
+    ).toBeTruthy();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Refresh portfolio" }),
+    );
+
+    expect(
+      await screen.findByText(/Saved account details are unavailable/),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/Vanguard Total Stock Market ETF/),
+    ).toBeTruthy();
+  });
+
   it("shows persisted coverage and warnings before any refresh action", async () => {
     api.getLatestRefresh.mockResolvedValue({
       refresh: {
@@ -938,16 +990,13 @@ describe("App", () => {
     expect(screen.getByText("110,000.25 USD")).toBeTruthy();
     expect(screen.getByText(/8 of 10 positions with cost basis/)).toBeTruthy();
 
-    // Cash and buying power
     expect(screen.getAllByText("Cash").length).toBeGreaterThan(0);
     expect(screen.getByText("Buying power")).toBeTruthy();
     expect(screen.getAllByText("25,000.50 USD").length).toBeGreaterThan(0);
 
-    // Security-type allocation
     expect(screen.getByText("By Security Type")).toBeTruthy();
     expect(screen.getByText("Common Stock")).toBeTruthy();
 
-    // Account contributions
     expect(screen.getByText("Account contributions")).toBeTruthy();
     expect(screen.getAllByText("100.00%").length).toBeGreaterThan(0);
   });
@@ -1069,7 +1118,6 @@ describe("App", () => {
         history: [],
       },
     });
-    // #58 returns {"history": [{"date": "...", "value": "...", "currency": "USD", "accounts_count": 1, "accounts_total": 2, "is_complete": false}]}
     api.getOverviewHistory.mockResolvedValue({
       history: [
         {
