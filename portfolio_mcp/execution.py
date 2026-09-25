@@ -194,10 +194,12 @@ class FixtureExecutionProvider:
     def __init__(
         self,
         scenario: str = "accepted",
+        cancel_scenario: str | None = None,
         capabilities: dict[str, ExecutionCapability] | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.scenario = scenario
+        self.cancel_scenario = cancel_scenario
         self.invocations: list[tuple[str, str]] = []
         self._orders: dict[str, ExecutionResult] = {}
         self._by_client_order_id: dict[str, list[ExecutionResult]] = {}
@@ -283,15 +285,17 @@ class FixtureExecutionProvider:
 
     async def cancel_order(self, broker_order_id: str) -> ExecutionResult:
         self.invocations.append(("cancel", broker_order_id))
-        if self.scenario == "cancel_unknown":
-            raise ExecutionIndeterminateError("Fixture cancellation outcome is unknown")
-        if self.scenario == "cancel_rejected":
-            return ExecutionResult(
-                OrderState.ACCEPTED, broker_order_id, "Cancel rejected"
-            )
-        result = ExecutionResult(OrderState.CANCELED, broker_order_id)
-        self._orders[broker_order_id] = result
+        scenario = self.cancel_scenario or self.scenario
         snapshot = self._snapshots_by_broker_id.get(broker_order_id)
+        fill = snapshot.fill if snapshot is not None else None
+        if scenario == "cancel_unknown":
+            raise ExecutionIndeterminateError("Fixture cancellation outcome is unknown")
+        if scenario == "cancel_rejected":
+            return ExecutionResult(
+                OrderState.ACCEPTED, broker_order_id, "Cancel rejected", fill=fill
+            )
+        result = ExecutionResult(OrderState.CANCELED, broker_order_id, fill=fill)
+        self._orders[broker_order_id] = result
         if snapshot is not None:
             self._snapshots_by_broker_id[broker_order_id] = replace(
                 snapshot,
@@ -354,6 +358,8 @@ class FixtureExecutionProvider:
                 broker_order_id,
                 fill=FillSummary(command.quantity, Decimal("100")),
             )
+        if scenario in {"cancel_unknown", "cancel_rejected"}:
+            return ExecutionResult(OrderState.ACCEPTED, broker_order_id)
         if scenario != "accepted":
             raise ExecutionError("Unsupported fixture execution scenario")
         return ExecutionResult(OrderState.ACCEPTED, broker_order_id)

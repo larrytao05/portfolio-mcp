@@ -352,9 +352,11 @@ _EVENT_DETAILS: dict[OrderEventType, EventDetailsSchema] = {
         ),
         frozenset({"attempt_id", "outcome"}),
     ),
-    OrderEventType.CANCELLATION_REQUESTED: EventDetailsSchema(frozenset()),
+    OrderEventType.CANCELLATION_REQUESTED: EventDetailsSchema(
+        frozenset({"attempt_id"}), frozenset({"attempt_id"})
+    ),
     OrderEventType.CANCELLATION_RESULT: EventDetailsSchema(
-        frozenset({"outcome"}), frozenset({"outcome"})
+        frozenset({"attempt_id", "outcome"}), frozenset({"attempt_id", "outcome"})
     ),
 }
 if set(_EVENT_DETAILS) != set(OrderEventType):

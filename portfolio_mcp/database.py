@@ -1,3 +1,4 @@
+import hashlib
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -377,6 +378,41 @@ def _append_order_event(
             deduplication_key=deduplication_key,
             occurred_at=normalized_time,
         )
+    )
+
+
+def _append_status_transition_event(
+    session: Session,
+    *,
+    record: OrderRecord,
+    previous_state: OrderState,
+    next_state: OrderState,
+    actor: OrderEventActor,
+    occurred_at: datetime,
+    status_source: OrderStatusSource,
+    fill: FillSummary | None = None,
+) -> None:
+    details: dict[str, object] = {"status_source": status_source}
+    filled_qty = fill.quantity if fill is not None else record.filled_quantity
+    avg_price = fill.average_price if fill is not None else record.average_fill_price
+    if filled_qty is not None:
+        details["filled_quantity"] = str(filled_qty)
+        if avg_price is not None:
+            details["average_fill_price"] = str(avg_price)
+    _append_order_event(
+        session,
+        draft_id=record.draft_id,
+        order_id=record.id,
+        account_id=record.account_id,
+        event_type=OrderEventType.STATUS_TRANSITION,
+        actor=actor,
+        occurred_at=occurred_at,
+        previous_state=previous_state,
+        next_state=next_state,
+        details=details,
+        deduplication_key=(
+            f"order:{record.id}:version:{record.version}:status_transition"
+        ),
     )
 
 
@@ -1770,6 +1806,209 @@ class PortfolioRepository:
                 record, session.get(OrderDraftRecord, record.draft_id)
             )
 
+    def begin_order_cancellation(
+        self,
+        order_id: str,
+        *,
+        expected_version: int,
+        expected_state: OrderState,
+        now: datetime,
+        actor: OrderEventActor = OrderEventActor.DASHBOARD,
+    ) -> tuple["StoredOrder", UUID | None, bool]:
+        now = require_aware_utc(now)
+        with self._sessions.begin() as session:
+            record = session.get(OrderRecord, order_id)
+            if record is None:
+                raise ValueError("Order not found")
+
+            draft_record = session.get(OrderDraftRecord, record.draft_id)
+            if record.state == OrderState.CANCELED.value:
+                return self._stored_order(record, draft_record), None, False
+
+            if record.state == OrderState.CANCEL_PENDING.value:
+                attempt_event = session.scalars(
+                    select(OrderEventRecord)
+                    .where(
+                        OrderEventRecord.order_id == order_id,
+                        OrderEventRecord.event_type
+                        == OrderEventType.CANCELLATION_REQUESTED.value,
+                    )
+                    .order_by(OrderEventRecord.occurred_at.desc())
+                ).first()
+                attempt_id = (
+                    UUID(decode_event_details(attempt_event.details_json)["attempt_id"])
+                    if attempt_event is not None
+                    else uuid4()
+                )
+                return self._stored_order(record, draft_record), attempt_id, False
+
+            if (
+                record.version != expected_version
+                or OrderState(record.state) != expected_state
+            ):
+                raise ConcurrentOrderUpdate("Order changed before cancellation")
+
+            stored = self._stored_order(record, draft_record)
+            if not stored.can_cancel:
+                raise ValueError(stored.blocking_reason or "Order cannot be canceled")
+
+            attempt_id = uuid4()
+            unfilled = (
+                str(record.quantity - record.filled_quantity)
+                if record.filled_quantity is not None
+                else str(record.quantity)
+            )
+            cancellation_payload = {
+                "order_id": record.id,
+                "version": record.version,
+                "state": record.state,
+                "account_id": record.account_id,
+                "broker_order_id": record.broker_order_id or "",
+                "action": "cancel",
+                "unfilled_remainder": unfilled,
+            }
+            cancellation_fingerprint = hashlib.sha256(
+                json.dumps(
+                    cancellation_payload, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+
+            session.add(
+                OrderAuthorizationRecord(
+                    id=str(attempt_id),
+                    draft_id=record.draft_id,
+                    action="cancel",
+                    expected_fingerprint=cancellation_fingerprint,
+                    account_id=record.account_id,
+                    actor="dashboard-owner",
+                    created_at=now,
+                    expires_at=now + timedelta(minutes=5),
+                    consumed_at=now,
+                )
+            )
+
+            auth_details = {
+                "authorization_id": str(attempt_id),
+                "action": "cancel",
+            }
+            for event_type in (
+                OrderEventType.AUTHORIZATION_CREATED,
+                OrderEventType.AUTHORIZATION_CONSUMED,
+            ):
+                _append_order_event(
+                    session,
+                    draft_id=record.draft_id,
+                    order_id=record.id,
+                    account_id=record.account_id,
+                    event_type=event_type,
+                    actor=actor,
+                    occurred_at=now,
+                    details=auth_details,
+                    deduplication_key=(
+                        f"authorization:{attempt_id}:"
+                        f"{event_type.value.removeprefix('authorization_')}"
+                    ),
+                )
+
+            _append_order_event(
+                session,
+                draft_id=record.draft_id,
+                order_id=record.id,
+                account_id=record.account_id,
+                event_type=OrderEventType.CANCELLATION_REQUESTED,
+                actor=actor,
+                occurred_at=now,
+                details={"attempt_id": str(attempt_id)},
+                deduplication_key=f"order:{record.id}:cancel:{attempt_id}:requested",
+            )
+
+            previous_state = OrderState(record.state)
+            record.state = OrderState.CANCEL_PENDING.value
+            event_occurred_at = max(now, record.updated_at)
+            record.updated_at = event_occurred_at
+            record.version += 1
+            session.flush()
+
+            _append_status_transition_event(
+                session,
+                record=record,
+                previous_state=previous_state,
+                next_state=OrderState.CANCEL_PENDING,
+                actor=actor,
+                occurred_at=event_occurred_at,
+                status_source=OrderStatusSource.LOCAL,
+            )
+
+            return self._stored_order(record, draft_record), attempt_id, True
+
+    def finish_order_cancellation(
+        self,
+        order_id: str,
+        *,
+        attempt_id: UUID,
+        state: OrderState,
+        now: datetime,
+        outcome: str,
+        result_code: str,
+        result_message: str,
+        result_source: OrderStatusSource,
+        fill: FillSummary | None = None,
+        actor: OrderEventActor = OrderEventActor.SYSTEM,
+    ) -> "StoredOrder":
+        now = require_aware_utc(now)
+        with self._sessions.begin() as session:
+            record = session.get(OrderRecord, order_id)
+            if record is None:
+                raise ValueError("Order not found")
+
+            draft_record = session.get(OrderDraftRecord, record.draft_id)
+            if record.state != OrderState.CANCEL_PENDING.value:
+                return self._stored_order(record, draft_record)
+
+            previous_state = OrderState(record.state)
+            require_transition(previous_state, state)
+
+            if fill is not None:
+                record.filled_quantity = fill.quantity
+                record.average_fill_price = fill.average_price
+
+            record.state = state.value
+            record.result_code = result_code
+            record.result_message = result_message[:256]
+            record.result_source = result_source.value
+            event_occurred_at = max(now, record.updated_at)
+            record.updated_at = event_occurred_at
+            record.version += 1
+            session.flush()
+
+            _append_order_event(
+                session,
+                draft_id=record.draft_id,
+                order_id=record.id,
+                account_id=record.account_id,
+                event_type=OrderEventType.CANCELLATION_RESULT,
+                actor=actor,
+                occurred_at=event_occurred_at,
+                previous_state=previous_state,
+                next_state=state,
+                code=_order_event_code(result_code, state),
+                details={"attempt_id": str(attempt_id), "outcome": outcome},
+                deduplication_key=f"order:{record.id}:cancel:{attempt_id}:result",
+            )
+
+            _append_status_transition_event(
+                session,
+                record=record,
+                previous_state=previous_state,
+                next_state=state,
+                actor=actor,
+                occurred_at=event_occurred_at,
+                status_source=result_source,
+                fill=fill,
+            )
+
+            return self._stored_order(record, draft_record)
+
     def list_accounts(self) -> list[StoredAccount]:
         with self._sessions() as session:
             records = session.scalars(
@@ -2834,6 +3073,17 @@ class StoredDraftSummary:
         }
 
 
+_CANCEL_BLOCKING_REASONS: dict[OrderState, str] = {
+    OrderState.FILLED: "Order is already filled",
+    OrderState.REJECTED: "Order is rejected",
+    OrderState.CANCELED: "Order is already canceled",
+    OrderState.EXPIRED: "Order has expired",
+    OrderState.UNKNOWN: "Order outcome is unknown; reconciliation is required",
+    OrderState.SUBMITTING: "Order submission is in progress",
+    OrderState.CANCEL_PENDING: "Cancellation is already in progress",
+}
+
+
 @dataclass(frozen=True)
 class StoredOrder:
     id: str
@@ -2869,6 +3119,27 @@ class StoredOrder:
         if self.filled_quantity is None:
             return None
         return max(Decimal(0), self.quantity - self.filled_quantity)
+
+    @property
+    def can_cancel(self) -> bool:
+        return self._can_cancel_decision()[0]
+
+    @property
+    def blocking_reason(self) -> str | None:
+        return self._can_cancel_decision()[1]
+
+    def _can_cancel_decision(self) -> tuple[bool, str | None]:
+        blocking = _CANCEL_BLOCKING_REASONS.get(self.state)
+        if blocking is not None:
+            return False, blocking
+        if self.state == OrderState.PARTIALLY_FILLED and (
+            self.remaining_quantity is not None
+            and self.remaining_quantity <= Decimal(0)
+        ):
+            return False, "Order has no remaining quantity to cancel"
+        if not self.broker_order_id or not self.broker_order_id.strip():
+            return False, "Missing broker order ID"
+        return True, None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -2928,6 +3199,8 @@ class StoredOrder:
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "version": self.version,
+            "can_cancel": self.can_cancel,
+            "blocking_reason": self.blocking_reason,
         }
 
 
