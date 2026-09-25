@@ -294,6 +294,11 @@ class OrderSubmissionService:
                 actor=OrderEventActor.DASHBOARD,
             )
         try:
+            order = self._repository.mark_provider_submission_started(
+                order.id,
+                expected_version=order.version,
+                started_at=_utc_now(self._clock()),
+            )
             result = await self._execution_provider.submit_order(command)
             observed_at = _utc_now(self._clock())
             return self._persist_provider_result(order, result, observed_at)

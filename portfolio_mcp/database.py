@@ -267,6 +267,11 @@ class OrderRecord(Base):
     result_source: Mapped[str | None] = mapped_column(String(16))
     filled_quantity: Mapped[Decimal | None] = mapped_column(ExactDecimal())
     average_fill_price: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    provider_submission_started_at: Mapped[datetime | None] = mapped_column(
+        UtcTimestamp()
+    )
+    provider_updated_at: Mapped[datetime | None] = mapped_column(UtcTimestamp())
+    provider_status_label: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
@@ -321,6 +326,16 @@ class OrderEventRecord(Base):
     details_json: Mapped[str] = mapped_column(Text, nullable=False)
     deduplication_key: Mapped[str] = mapped_column(String(160), nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+
+
+class ReconciliationGateRecord(Base):
+    __tablename__ = "order_reconciliation_gates"
+    __table_args__ = (UniqueConstraint("provider", "account_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    account_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    last_attempt_at_us: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
 def _append_order_event(
@@ -395,6 +410,7 @@ def _order_event_code(result_code: str | None, state: OrderState) -> OrderEventC
         OrderState.PARTIALLY_FILLED: OrderEventCode.PARTIALLY_FILLED,
         OrderState.FILLED: OrderEventCode.FILLED,
         OrderState.REJECTED: OrderEventCode.REJECTED,
+        OrderState.EXPIRED: OrderEventCode.EXPIRED,
         OrderState.UNKNOWN: OrderEventCode.UNKNOWN,
     }.get(state, OrderEventCode.VALIDATION_FAILED)
 
@@ -402,6 +418,12 @@ def _order_event_code(result_code: str | None, state: OrderState) -> OrderEventC
 def _validate_page_limit(limit: int) -> None:
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
         raise ValueError("Page limit must be between 1 and 100")
+
+
+def _epoch_microseconds(value: datetime) -> int:
+    normalized = require_aware_utc(value)
+    delta = normalized - datetime(1970, 1, 1, tzinfo=UTC)
+    return delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
 
 
 def _stored_order_event(record: OrderEventRecord) -> StoredOrderEvent:
@@ -842,6 +864,31 @@ class PortfolioRepository:
                     existing, session.get(OrderDraftRecord, existing.draft_id)
                 ), False
 
+    def mark_provider_submission_started(
+        self, order_id: str, *, expected_version: int, started_at: datetime
+    ) -> "StoredOrder":
+        started_at = require_aware_utc(started_at)
+        with self._sessions.begin() as session:
+            result = cast(
+                CursorResult[object],
+                session.execute(
+                    update(OrderRecord)
+                    .where(
+                        OrderRecord.id == order_id,
+                        OrderRecord.version == expected_version,
+                        OrderRecord.state == OrderState.SUBMITTING,
+                    )
+                    .values(provider_submission_started_at=started_at)
+                ),
+            )
+            if result.rowcount != 1:
+                raise ConcurrentOrderUpdate("Order changed before provider submission")
+            record = session.get(OrderRecord, order_id)
+            assert record is not None
+            return self._stored_order(
+                record, session.get(OrderDraftRecord, record.draft_id)
+            )
+
     def order(self, order_id: str) -> "StoredOrder | None":
         with self._sessions() as session:
             record = session.get(OrderRecord, order_id)
@@ -1046,6 +1093,215 @@ class PortfolioRepository:
                 )
             return OrderEventPage(items, cursor)
 
+    def claim_order_reconciliation(
+        self, order_id: str, *, attempt_at: datetime, minimum_interval: timedelta
+    ) -> "ReconciliationClaim | None":
+        attempt_at = require_aware_utc(attempt_at)
+        if minimum_interval < timedelta(0):
+            raise ValueError("Reconciliation interval must be nonnegative")
+        epoch_us = _epoch_microseconds(attempt_at)
+        earliest_next_us = _epoch_microseconds(attempt_at - minimum_interval)
+        attempt_id = uuid4()
+        with self._sessions.begin() as session:
+            record = session.get(OrderRecord, order_id)
+            if record is None:
+                raise ValueError("Order not found")
+            statement = sqlite_insert(ReconciliationGateRecord).values(
+                provider=record.provider,
+                account_id=record.account_id,
+                last_attempt_at_us=epoch_us,
+            )
+            statement = statement.on_conflict_do_update(
+                index_elements=[
+                    ReconciliationGateRecord.provider,
+                    ReconciliationGateRecord.account_id,
+                ],
+                set_={"last_attempt_at_us": epoch_us},
+                where=(ReconciliationGateRecord.last_attempt_at_us <= earliest_next_us),
+            )
+            claim_result = cast(CursorResult[object], session.execute(statement))
+            if claim_result.rowcount != 1:
+                return None
+            _append_order_event(
+                session,
+                draft_id=record.draft_id,
+                order_id=record.id,
+                account_id=record.account_id,
+                event_type=OrderEventType.RECONCILIATION_ATTEMPTED,
+                actor=OrderEventActor.SYSTEM,
+                occurred_at=attempt_at,
+                details={"attempt_id": attempt_id},
+                deduplication_key=f"reconciliation:{attempt_id}:attempted",
+            )
+            return ReconciliationClaim(
+                order=self._stored_order(
+                    record, session.get(OrderDraftRecord, record.draft_id)
+                ),
+                attempt_id=attempt_id,
+            )
+
+    def finish_order_reconciliation(
+        self,
+        order_id: str,
+        *,
+        attempt_id: UUID,
+        expected_version: int,
+        expected_state: OrderState,
+        state: OrderState,
+        now: datetime,
+        outcome: str,
+        result_code: str,
+        result_message: str,
+        broker_order_id: str | None = None,
+        fill: FillSummary | None = None,
+        provider_updated_at: datetime | None = None,
+        provider_status_label: str | None = None,
+        result_source: OrderStatusSource = OrderStatusSource.SYSTEM,
+    ) -> "StoredOrder":
+        now = require_aware_utc(now)
+        if provider_updated_at is not None:
+            provider_updated_at = require_aware_utc(provider_updated_at)
+        allowed_labels = {
+            "OPEN",
+            "PARTIALLY_FILLED",
+            "FILLED",
+            "REJECTED",
+            "CANCELED",
+            "EXPIRED",
+        }
+        if (
+            provider_status_label is not None
+            and provider_status_label not in allowed_labels
+        ):
+            raise ValueError("Unsupported provider status label")
+        if outcome not in {
+            "matched",
+            "not_found",
+            "ambiguous",
+            "incomplete",
+            "mismatch",
+            "stale",
+            "provider_error",
+            "canceled",
+            "unknown",
+            "refused",
+        }:
+            raise ValueError("Unsupported reconciliation outcome")
+        if result_code != outcome:
+            raise ValueError("Reconciliation result code must match its outcome")
+        with self._sessions.begin() as session:
+            record = session.get(OrderRecord, order_id)
+            if record is None:
+                raise ValueError("Order not found")
+            if (
+                record.version != expected_version
+                or OrderState(record.state) != expected_state
+            ):
+                raise ConcurrentOrderUpdate("Order changed during reconciliation")
+            previous_state = OrderState(record.state)
+            if state != previous_state:
+                require_transition(previous_state, state)
+            if fill is not None:
+                _validate_fill(fill, record.quantity, record.filled_quantity)
+            filled_quantity = (
+                fill.quantity if fill is not None else record.filled_quantity
+            )
+            average_fill_price = (
+                fill.average_price if fill is not None else record.average_fill_price
+            )
+            if state == OrderState.FILLED and filled_quantity != record.quantity:
+                raise ValueError("Filled quantity must equal the order quantity")
+            if state == OrderState.PARTIALLY_FILLED and (
+                filled_quantity is not None and filled_quantity >= record.quantity
+            ):
+                raise ValueError("Partial fill must be below the order quantity")
+            updated_at = max(now, record.updated_at)
+            values: dict[str, object] = {
+                "state": state.value,
+                "broker_order_id": broker_order_id or record.broker_order_id,
+                "result_code": result_code,
+                "result_message": result_message[:256],
+                "result_source": result_source.value,
+                "filled_quantity": filled_quantity,
+                "average_fill_price": average_fill_price,
+                "provider_updated_at": provider_updated_at
+                or record.provider_updated_at,
+                "provider_status_label": provider_status_label
+                or record.provider_status_label,
+                "updated_at": updated_at,
+                "version": record.version + 1,
+            }
+            update_result = cast(
+                CursorResult[object],
+                session.execute(
+                    update(OrderRecord)
+                    .where(
+                        OrderRecord.id == order_id,
+                        OrderRecord.version == expected_version,
+                        OrderRecord.state == expected_state,
+                    )
+                    .values(**values)
+                ),
+            )
+            if update_result.rowcount != 1:
+                raise ConcurrentOrderUpdate("Order changed during reconciliation")
+            result_details: dict[str, object] = {
+                "attempt_id": attempt_id,
+                "outcome": outcome,
+                "status_source": result_source,
+            }
+            if fill is not None:
+                result_details["filled_quantity"] = str(fill.quantity)
+                if fill.average_price is not None:
+                    result_details["average_fill_price"] = str(fill.average_price)
+            if provider_updated_at is not None:
+                result_details["provider_updated_at"] = provider_updated_at.isoformat()
+            if provider_status_label is not None:
+                result_details["provider_status_label"] = provider_status_label
+            _append_order_event(
+                session,
+                draft_id=record.draft_id,
+                order_id=record.id,
+                account_id=record.account_id,
+                event_type=OrderEventType.RECONCILIATION_RESULT,
+                actor=OrderEventActor.SYSTEM,
+                occurred_at=updated_at,
+                previous_state=previous_state,
+                next_state=state,
+                code=OrderEventCode(result_code)
+                if result_code in OrderEventCode._value2member_map_
+                else OrderEventCode.UNKNOWN,
+                details=result_details,
+                deduplication_key=f"reconciliation:{attempt_id}:result",
+            )
+            if state != previous_state:
+                details: dict[str, object] = {"status_source": result_source}
+                if fill is not None:
+                    details["filled_quantity"] = str(fill.quantity)
+                    if fill.average_price is not None:
+                        details["average_fill_price"] = str(fill.average_price)
+                _append_order_event(
+                    session,
+                    draft_id=record.draft_id,
+                    order_id=record.id,
+                    account_id=record.account_id,
+                    event_type=OrderEventType.STATUS_TRANSITION,
+                    actor=OrderEventActor.SYSTEM,
+                    occurred_at=updated_at,
+                    previous_state=previous_state,
+                    next_state=state,
+                    code=_order_event_code(result_code, state),
+                    details=details,
+                    deduplication_key=(
+                        f"order:{record.id}:version:{record.version + 1}:reconciliation"
+                    ),
+                )
+            changed = session.get(OrderRecord, order_id)
+            assert changed is not None
+            return self._stored_order(
+                changed, session.get(OrderDraftRecord, changed.draft_id)
+            )
+
     def authorization_for_draft(
         self, draft_id: str
     ) -> "StoredOrderAuthorization | None":
@@ -1157,7 +1413,8 @@ class PortfolioRepository:
                 ):
                     raise ValueError("Partial fill must be below the order quantity")
             record.state = state
-            record.broker_order_id = broker_order_id
+            if broker_order_id is not None:
+                record.broker_order_id = broker_order_id
             record.result_code = result_code
             record.result_message = result_message
             record.result_source = result_source.value
@@ -1776,6 +2033,9 @@ class PortfolioRepository:
             ),
             filled_quantity=record.filled_quantity,
             average_fill_price=record.average_fill_price,
+            provider_submission_started_at=record.provider_submission_started_at,
+            provider_updated_at=record.provider_updated_at,
+            provider_status_label=record.provider_status_label,
             draft=StoredDraftSummary(
                 id=draft.id,
                 created_at=draft.created_at,
@@ -2306,10 +2566,19 @@ class StoredOrder:
     result_source: OrderStatusSource | None
     filled_quantity: Decimal | None
     average_fill_price: Decimal | None
+    provider_submission_started_at: datetime | None
+    provider_updated_at: datetime | None
+    provider_status_label: str | None
     draft: StoredDraftSummary
     created_at: datetime
     updated_at: datetime
     version: int
+
+    @property
+    def remaining_quantity(self) -> Decimal | None:
+        if self.filled_quantity is None:
+            return None
+        return max(Decimal(0), self.quantity - self.filled_quantity)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -2349,11 +2618,33 @@ class StoredOrder:
                 if self.filled_quantity is not None
                 else None
             ),
+            "remaining_quantity": (
+                str(self.remaining_quantity)
+                if self.remaining_quantity is not None
+                else None
+            ),
+            "provider_submission_started_at": (
+                self.provider_submission_started_at.isoformat()
+                if self.provider_submission_started_at is not None
+                else None
+            ),
+            "provider_updated_at": (
+                self.provider_updated_at.isoformat()
+                if self.provider_updated_at is not None
+                else None
+            ),
+            "provider_status_label": self.provider_status_label,
             "draft": self.draft.to_dict(),
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "version": self.version,
         }
+
+
+@dataclass(frozen=True)
+class ReconciliationClaim:
+    order: StoredOrder
+    attempt_id: UUID
 
 
 @dataclass(frozen=True)

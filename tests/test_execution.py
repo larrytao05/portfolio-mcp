@@ -977,6 +977,9 @@ async def test_submission_result_event_uses_provider_observation_time(
         if event.event_type.value == "submission_result"
     )
     assert result_at > submitted_at
+    stored = repository.order(order.id)
+    assert stored is not None
+    assert stored.provider_submission_started_at == submitted_at
 
 
 @pytest.mark.asyncio
