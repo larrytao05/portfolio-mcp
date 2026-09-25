@@ -102,12 +102,26 @@ The instrument-search and quote workflow uses fixture data unless explicitly
 configured otherwise. After completing Schwab's approved production OAuth flow,
 add the locally stored credentials and select the Schwab adapter:
 
+`SCHWAB_CALLBACK_URL` defaults to `https://127.0.0.1:8182`; keep the explicit
+setting below when it matches the callback URL registered with Schwab.
+
 ```sh
 MARKET_DATA_PROVIDER=schwab
 SCHWAB_CLIENT_ID=
 SCHWAB_CLIENT_SECRET=
 SCHWAB_REFRESH_TOKEN=
+SCHWAB_CALLBACK_URL=https://127.0.0.1:8182
 ```
+
+To replace an expired refresh token, run:
+
+```sh
+uv run --env-file .env python -m portfolio_mcp.schwab_oauth
+```
+
+Open the printed authorization URL, complete Schwab authorization, and paste the
+full redirect URL when prompted. The command prints a replacement
+`SCHWAB_REFRESH_TOKEN`; manually replace that value in `.env`.
 
 Start the API with `uv run --env-file .env uvicorn api_main:app --reload`.
 This enables only read-only Schwab instrument search and quote requests; it

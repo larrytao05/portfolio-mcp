@@ -84,6 +84,9 @@ and cost bases remain `None`/`null` rather than becoming zero.
 Fixture providers are the safe default. Optional live integrations are
 read-only:
 
+`SCHWAB_CALLBACK_URL` defaults to `https://127.0.0.1:8182`; keep the explicit
+setting below when it matches the callback URL registered with Schwab.
+
 ```sh
 PORTFOLIO_PROVIDER=snaptrade
 SNAPTRADE_CLIENT_ID=
@@ -93,7 +96,14 @@ MARKET_DATA_PROVIDER=schwab
 SCHWAB_CLIENT_ID=
 SCHWAB_CLIENT_SECRET=
 SCHWAB_REFRESH_TOKEN=
+SCHWAB_CALLBACK_URL=https://127.0.0.1:8182
 ```
+
+To replace an expired refresh token, run
+`uv run --env-file .env python -m portfolio_mcp.schwab_oauth`. Open the printed
+authorization URL, complete Schwab authorization, and paste the full redirect
+URL when prompted. The command prints a replacement `SCHWAB_REFRESH_TOKEN`;
+manually replace that value in `.env`.
 
 Use an uncommitted `.env` file with `uv run --env-file .env ...`. Never commit
 credentials or provider payloads containing private account data.

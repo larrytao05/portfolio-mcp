@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from portfolio_mcp.config import SchwabMarketDataSettings
@@ -66,6 +66,51 @@ class SchwabMarketDataProvider:
         self._settings = settings
         self._http_client = http_client or UrllibSchwabHttpClient()
         self._clock = clock or (lambda: datetime.now(UTC))
+
+    def authorization_url(self) -> str:
+        parameters = urlencode(
+            {
+                "client_id": self._settings.client_id,
+                "response_type": "code",
+                "redirect_uri": self._settings.callback_url,
+            }
+        )
+        return f"https://api.schwabapi.com/v1/oauth/authorize?{parameters}"
+
+    def authorization_code_from_redirect_url(self, redirect_url: str) -> str:
+        redirect = urlparse(redirect_url)
+        callback = urlparse(self._settings.callback_url)
+        redirect_base = urlunparse(
+            (redirect.scheme, redirect.netloc, redirect.path, "", "", "")
+        ).rstrip("/")
+        callback_base = urlunparse(
+            (callback.scheme, callback.netloc, callback.path, "", "", "")
+        ).rstrip("/")
+        if redirect_base != callback_base:
+            raise ProviderResponseError(
+                "Authorization redirect did not match the configured callback URL"
+            )
+
+        code = parse_qs(redirect.query).get("code", [""])[0]
+        if not code:
+            raise ProviderResponseError("Authorization redirect did not include a code")
+        return code
+
+    async def exchange_authorization_code(self, code: str) -> str:
+        status, response = await self._http_request(
+            "POST",
+            self._token_url,
+            self._token_headers(),
+            urlencode(
+                {
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": self._settings.callback_url,
+                }
+            ).encode(),
+        )
+        _raise_for_status(status)
+        return _required_string(_required_mapping(response).get("refresh_token"))
 
     async def search_instruments(self, query: str) -> list[Instrument]:
         normalized_query = query.strip()
@@ -127,8 +172,6 @@ class SchwabMarketDataProvider:
         )
 
     async def _access_token(self) -> str:
-        credentials = f"{self._settings.client_id}:{self._settings.client_secret}"
-        authorization = base64.b64encode(credentials.encode()).decode()
         body = urlencode(
             {
                 "grant_type": "refresh_token",
@@ -138,15 +181,26 @@ class SchwabMarketDataProvider:
         status, response = await self._http_request(
             "POST",
             self._token_url,
-            {
-                "Authorization": f"Basic {authorization}",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-            },
+            self._token_headers(),
             body,
         )
+        if status == 400:
+            raise ProviderAuthenticationError(
+                "Refresh token was rejected by Schwab; run "
+                "`uv run --env-file .env python -m portfolio_mcp.schwab_oauth` "
+                "to replace it"
+            )
         _raise_for_status(status)
         return _required_string(_required_mapping(response).get("access_token"))
+
+    def _token_headers(self) -> dict[str, str]:
+        credentials = f"{self._settings.client_id}:{self._settings.client_secret}"
+        authorization = base64.b64encode(credentials.encode()).decode()
+        return {
+            "Authorization": f"Basic {authorization}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        }
 
     async def _http_request(
         self,
