@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Protocol
@@ -14,6 +15,7 @@ class OrderState(StrEnum):
     REJECTED = "REJECTED"
     CANCEL_PENDING = "CANCEL_PENDING"
     CANCELED = "CANCELED"
+    EXPIRED = "EXPIRED"
     UNKNOWN = "UNKNOWN"
 
 
@@ -42,25 +44,39 @@ _TRANSITIONS: dict[OrderState, set[OrderState]] = {
     OrderState.ACCEPTED: {
         OrderState.PARTIALLY_FILLED,
         OrderState.FILLED,
+        OrderState.CANCELED,
+        OrderState.EXPIRED,
         OrderState.CANCEL_PENDING,
         OrderState.UNKNOWN,
     },
     OrderState.PARTIALLY_FILLED: {
         OrderState.PARTIALLY_FILLED,
         OrderState.FILLED,
+        OrderState.CANCELED,
+        OrderState.EXPIRED,
         OrderState.CANCEL_PENDING,
         OrderState.UNKNOWN,
     },
-    OrderState.CANCEL_PENDING: {OrderState.CANCELED, OrderState.UNKNOWN},
+    OrderState.CANCEL_PENDING: {
+        OrderState.ACCEPTED,
+        OrderState.PARTIALLY_FILLED,
+        OrderState.FILLED,
+        OrderState.REJECTED,
+        OrderState.CANCELED,
+        OrderState.EXPIRED,
+        OrderState.UNKNOWN,
+    },
     OrderState.REJECTED: set(),
     OrderState.FILLED: set(),
     OrderState.CANCELED: set(),
+    OrderState.EXPIRED: set(),
     OrderState.UNKNOWN: {
         OrderState.ACCEPTED,
         OrderState.PARTIALLY_FILLED,
         OrderState.FILLED,
         OrderState.REJECTED,
         OrderState.CANCELED,
+        OrderState.EXPIRED,
         OrderState.UNKNOWN,
     },
 }
@@ -113,6 +129,46 @@ class ExecutionResult:
     broker_order_id: str | None = None
     message: str | None = None
     fill: FillSummary | None = None
+
+
+@dataclass(frozen=True)
+class BrokerOrderSnapshot:
+    broker_order_id: str
+    client_order_id: str | None
+    account_id: str
+    instrument_id: str
+    side: str
+    order_type: str
+    quantity: Decimal | None
+    limit_price: Decimal | None
+    time_in_force: str
+    submitted_at: datetime
+    state: OrderState
+    updated_at: datetime | None = None
+    status_label: str | None = None
+    fill: FillSummary | None = None
+
+
+@dataclass(frozen=True)
+class BrokerOrderSearch:
+    orders: tuple[BrokerOrderSnapshot, ...]
+    complete: bool
+
+
+class OrderReadProvider(Protocol):
+    supports_client_order_id_lookup: bool
+
+    async def find_by_broker_order_id(
+        self, account_id: str, broker_order_id: str
+    ) -> BrokerOrderSnapshot | None: ...
+
+    async def find_by_client_order_id(
+        self, account_id: str, client_order_id: str
+    ) -> BrokerOrderSearch: ...
+
+    async def search_orders(
+        self, account_id: str, start_at: datetime, end_at: datetime
+    ) -> BrokerOrderSearch: ...
 
 
 class ExecutionProvider(Protocol):

@@ -366,14 +366,15 @@ async def test_stale_submission_result_cannot_overwrite_recovered_unknown(
     assert stored.state == OrderState.UNKNOWN
 
 
+@pytest.mark.parametrize("base_revision", ["20260922_0009", "20260925_0010"])
 def test_pre_migration_order_remains_readable_without_synthetic_history(
-    tmp_path,
+    tmp_path, base_revision: str
 ) -> None:
-    database_path = tmp_path / "legacy.db"
+    database_path = tmp_path / f"legacy-{base_revision}.db"
     database_url = f"sqlite:///{database_path}"
     config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
     config.set_main_option("sqlalchemy.url", database_url)
-    command.upgrade(config, "20260922_0009")
+    command.upgrade(config, base_revision)
     now = datetime(2026, 9, 25, 14, 0, tzinfo=UTC).isoformat()
     with connect(database_path) as connection:
         connection.execute(

@@ -34,8 +34,10 @@ class OrderEventCode(StrEnum):
     ACCEPTED = "accepted"
     PARTIALLY_FILLED = "partially_filled"
     FILLED = "filled"
+    EXPIRED = "expired"
     REJECTED = "rejected"
     UNKNOWN = "unknown"
+    MATCHED = "matched"
     DRAFT_EXPIRED = "draft_expired"
     VALIDATION_FAILED = "validation_failed"
     AUTHORIZATION_INVALID = "authorization_invalid"
@@ -49,6 +51,10 @@ class OrderEventCode(StrEnum):
     TRADING_BLOCKED = "trading_blocked"
     NOT_FOUND = "not_found"
     AMBIGUOUS = "ambiguous"
+    INCOMPLETE = "incomplete"
+    MISMATCH = "mismatch"
+    STALE = "stale"
+    PROVIDER_ERROR = "provider_error"
     CANCELED = "canceled"
 
 
@@ -158,7 +164,18 @@ _EVENT_DETAILS: dict[OrderEventType, EventDetailsSchema] = {
         frozenset({"attempt_id"}), frozenset({"attempt_id"})
     ),
     OrderEventType.RECONCILIATION_RESULT: EventDetailsSchema(
-        frozenset({"attempt_id", "outcome"}), frozenset({"attempt_id", "outcome"})
+        frozenset(
+            {
+                "attempt_id",
+                "outcome",
+                "status_source",
+                "filled_quantity",
+                "average_fill_price",
+                "provider_updated_at",
+                "provider_status_label",
+            }
+        ),
+        frozenset({"attempt_id", "outcome"}),
     ),
     OrderEventType.CANCELLATION_REQUESTED: EventDetailsSchema(frozenset()),
     OrderEventType.CANCELLATION_RESULT: EventDetailsSchema(
@@ -195,6 +212,10 @@ def encode_event_details(
             "matched",
             "not_found",
             "ambiguous",
+            "incomplete",
+            "mismatch",
+            "stale",
+            "provider_error",
             "canceled",
             "unknown",
             "refused",
@@ -208,6 +229,29 @@ def encode_event_details(
         if key == "expires_at":
             if not isinstance(value, str) or len(value) > 40:
                 raise ValueError("Invalid expiry for order event")
+            normalized[key] = value
+            continue
+        if key == "provider_status_label":
+            if value not in {
+                "OPEN",
+                "PARTIALLY_FILLED",
+                "FILLED",
+                "REJECTED",
+                "CANCELED",
+                "EXPIRED",
+            }:
+                raise ValueError("Invalid provider status label for order event")
+            normalized[key] = str(value)
+            continue
+        if key == "provider_updated_at":
+            if not isinstance(value, str) or len(value) > 40:
+                raise ValueError("Invalid provider timestamp for order event")
+            try:
+                require_aware_utc(datetime.fromisoformat(value))
+            except ValueError as error:
+                raise ValueError(
+                    "Invalid provider timestamp for order event"
+                ) from error
             normalized[key] = value
             continue
         if isinstance(value, StrEnum):
