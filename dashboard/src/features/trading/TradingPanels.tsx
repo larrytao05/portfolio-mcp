@@ -4,8 +4,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   confirmOrderDraft,
   createOrderDraft,
+  deleteSchwabMapping,
+  getSchwabMapping,
+  getSchwabMappingCandidates,
+  getSchwabReadiness,
   getTradingSettings,
   getTradingStatus,
+  saveSchwabMapping,
   searchInstruments,
   updateTradingSettings,
   type Account,
@@ -58,10 +63,210 @@ export function ExecutionStatus({
             <p>Sides: {capability.supported_sides.join(", ") || "unavailable"} · Time in force: {capability.time_in_force.join(", ") || "unavailable"} · Sizing: {capability.sizing_modes.join(", ") || "unavailable"}</p>
             <p>Preview: {capability.preview_supported ? "available" : "unavailable"} · Cancellation: {capability.cancellation_supported ? "available" : "unavailable"}</p>
             {capability.blocks.map((block) => <p className="inline-alert" key={block.code} role="alert">{block.message}{block.recovery_action ? ` ${block.recovery_action}` : ""}</p>)}
+            {capability.provider.toLowerCase() === "schwab" && (
+              <SchwabAccountMappingItem accountId={capability.account_id} />
+            )}
           </div>
         </article>
       ))}
     </section>
+  );
+}
+
+export function SchwabAccountMappingItem({ accountId }: { accountId: string }) {
+  const queryClient = useQueryClient();
+  const [showMappingFlow, setShowMappingFlow] = useState(false);
+  const [selectedHash, setSelectedHash] = useState<string>("");
+  const [selectedMasked, setSelectedMasked] = useState<string>("");
+  const [confirmed, setConfirmed] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const mappingQuery = useQuery({
+    queryKey: ["schwab", "mapping", accountId],
+    queryFn: async () => {
+      try {
+        const res = await getSchwabMapping(accountId);
+        return res.mapping;
+      } catch {
+        return null;
+      }
+    },
+  });
+
+  const readinessQuery = useQuery({
+    queryKey: ["schwab", "readiness", accountId],
+    queryFn: async () => {
+      try {
+        const res = await getSchwabReadiness(accountId);
+        return res.readiness;
+      } catch {
+        return null;
+      }
+    },
+  });
+
+  const candidatesQuery = useQuery({
+    queryKey: ["schwab", "candidates", accountId],
+    queryFn: async () => {
+      const res = await getSchwabMappingCandidates(accountId);
+      return res.candidates;
+    },
+    enabled: showMappingFlow,
+  });
+
+  const saveMutation = useMutation({
+    mutationFn: async () => {
+      if (!selectedHash || !selectedMasked || !confirmed) return;
+      return await saveSchwabMapping(accountId, {
+        schwab_account_hash: selectedHash,
+        masked_account_number: selectedMasked,
+        confirmed: true,
+      });
+    },
+    onSuccess: async () => {
+      setShowMappingFlow(false);
+      setConfirmed(false);
+      setActionError(null);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["schwab", "mapping", accountId] }),
+        queryClient.invalidateQueries({ queryKey: ["schwab", "readiness", accountId] }),
+        queryClient.invalidateQueries({ queryKey: ["trading", "status"] }),
+      ]);
+    },
+    onError: (err: unknown) => {
+      setActionError(err instanceof Error ? err.message : "Failed to save mapping");
+    },
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: async () => {
+      return await deleteSchwabMapping(accountId);
+    },
+    onSuccess: async () => {
+      setShowMappingFlow(false);
+      setActionError(null);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["schwab", "mapping", accountId] }),
+        queryClient.invalidateQueries({ queryKey: ["schwab", "readiness", accountId] }),
+        queryClient.invalidateQueries({ queryKey: ["trading", "status"] }),
+      ]);
+    },
+    onError: (err: unknown) => {
+      setActionError(err instanceof Error ? err.message : "Failed to revoke mapping");
+    },
+  });
+
+  const mapping = mappingQuery.data;
+  const readiness = readinessQuery.data;
+
+  return (
+    <div className="schwab-mapping-container" style={{ marginTop: "1rem", paddingTop: "0.75rem", borderTop: "1px solid var(--border-subtle, #e2e8f0)" }}>
+      <h4>Schwab Execution Readiness & Mapping</h4>
+      {readiness && (
+        <p>
+          Status: <strong>{readiness.state.replace("_", " ").toUpperCase()}</strong> · {readiness.message}
+        </p>
+      )}
+      {mapping ? (
+        <div className="mapped-details">
+          <p>
+            Mapped to Schwab account: <strong>{mapping.masked_account_number}</strong> (Hash: <code>{mapping.schwab_account_hash.slice(0, 12)}…</code>)
+          </p>
+          <button
+            type="button"
+            className="button button-danger"
+            disabled={deleteMutation.isPending}
+            onClick={() => deleteMutation.mutate()}
+          >
+            {deleteMutation.isPending ? "Revoking…" : "Revoke Schwab mapping"}
+          </button>
+        </div>
+      ) : (
+        <div className="unmapped-details">
+          {!showMappingFlow ? (
+            <button
+              type="button"
+              className="button button-secondary"
+              onClick={() => setShowMappingFlow(true)}
+            >
+              Map to Schwab account
+            </button>
+          ) : (
+            <div className="mapping-selection-form" style={{ marginTop: "0.5rem" }}>
+              <h5>Select Schwab Candidate Account</h5>
+              {candidatesQuery.isLoading && <p className="state">Loading Schwab candidate accounts…</p>}
+              {candidatesQuery.isError && (
+                <p className="inline-alert" role="alert">
+                  {(candidatesQuery.error as Error).message || "Failed to load candidate accounts"}
+                </p>
+              )}
+              {candidatesQuery.data && candidatesQuery.data.length === 0 && (
+                <p className="state state-empty">No Schwab accounts found via API.</p>
+              )}
+              {candidatesQuery.data?.map((cand) => (
+                <div key={cand.schwab_account_hash} style={{ marginBottom: "0.5rem" }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                    <input
+                      type="radio"
+                      name={`schwab-cand-${accountId}`}
+                      value={cand.schwab_account_hash}
+                      checked={selectedHash === cand.schwab_account_hash}
+                      disabled={cand.is_mapped && cand.mapped_to_account_id !== accountId}
+                      onChange={() => {
+                        setSelectedHash(cand.schwab_account_hash);
+                        setSelectedMasked(cand.masked_account_number);
+                      }}
+                    />
+                    <span>
+                      {cand.masked_account_number} (Hash: <code>{cand.schwab_account_hash.slice(0, 8)}…</code>)
+                      {cand.suggested && <strong style={{ marginLeft: "0.5rem", color: "#16a34a" }}>[Suggested match]</strong>}
+                      {cand.is_mapped && cand.mapped_to_account_id !== accountId && (
+                        <span style={{ marginLeft: "0.5rem", color: "#dc2626" }}>(Already mapped)</span>
+                      )}
+                    </span>
+                  </label>
+                </div>
+              ))}
+              <div style={{ marginTop: "0.75rem" }}>
+                <label style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                  <input
+                    type="checkbox"
+                    checked={confirmed}
+                    onChange={(e) => setConfirmed(e.target.checked)}
+                  />
+                  <span>I confirm this is the correct Schwab trading account</span>
+                </label>
+              </div>
+              {actionError && <p className="inline-alert" role="alert">{actionError}</p>}
+              <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.75rem" }}>
+                <button
+                  type="button"
+                  className="button button-primary"
+                  disabled={!selectedHash || !confirmed || saveMutation.isPending}
+                  onClick={() => saveMutation.mutate()}
+                >
+                  {saveMutation.isPending ? "Saving…" : "Confirm and save mapping"}
+                </button>
+                <button
+                  type="button"
+                  className="button button-secondary"
+                  onClick={() => {
+                    setShowMappingFlow(false);
+                    setSelectedHash("");
+                    setSelectedMasked("");
+                    setConfirmed(false);
+                    setActionError(null);
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+      {actionError && <p className="inline-alert" role="alert">{actionError}</p>}
+    </div>
   );
 }
 

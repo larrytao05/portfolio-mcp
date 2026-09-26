@@ -285,6 +285,25 @@ class McpAuthorizationRecord(Base):
     invalidation_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
+class SchwabAccountMappingRecord(Base):
+    __tablename__ = "schwab_account_mappings"
+    __table_args__ = (
+        Index("ix_schwab_account_mappings_account_id", "account_id", unique=True),
+        Index("ix_schwab_account_mappings_hash", "schwab_account_hash", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    account_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("accounts.id"), nullable=False, unique=True
+    )
+    schwab_account_hash: Mapped[str] = mapped_column(
+        String(128), nullable=False, unique=True
+    )
+    masked_account_number: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+
+
 class CancellationRequestRecord(Base):
     __tablename__ = "cancellation_requests"
     __table_args__ = (
@@ -538,6 +557,26 @@ class StoredCancellationRequest:
         }
 
 
+@dataclass(frozen=True)
+class StoredSchwabAccountMapping:
+    id: str
+    account_id: str
+    schwab_account_hash: str
+    masked_account_number: str
+    created_at: datetime
+    updated_at: datetime
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "id": self.id,
+            "account_id": self.account_id,
+            "schwab_account_hash": self.schwab_account_hash,
+            "masked_account_number": self.masked_account_number,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+        }
+
+
 class McpAuthorizationError(ValueError):
     def __init__(
         self, code: str, message: str = "Invalid or expired authorization code"
@@ -612,6 +651,14 @@ def _epoch_microseconds(value: datetime) -> int:
 
 class CorruptedAuditRecordError(ValueError):
     """Raised when an audit record in the database fails decoding."""
+
+
+class AccountNotFoundError(KeyError):
+    pass
+
+
+class SchwabAccountMappingConflictError(ValueError):
+    pass
 
 
 def _stored_order_event(record: OrderEventRecord) -> StoredOrderEvent:
@@ -3530,6 +3577,123 @@ class PortfolioRepository:
             fees=record.fees,
             currency=record.currency,
             imported_at=record.imported_at,
+        )
+
+    def save_schwab_account_mapping(
+        self,
+        account_id: str,
+        schwab_account_hash: str,
+        masked_account_number: str,
+    ) -> StoredSchwabAccountMapping:
+        normalized_account_id = account_id.strip()
+        normalized_hash = schwab_account_hash.strip()
+        normalized_masked = masked_account_number.strip()
+        if not normalized_account_id or not normalized_hash or not normalized_masked:
+            raise ValueError(
+                "account_id, schwab_account_hash, and masked_account_number "
+                "must not be empty"
+            )
+
+        with self._sessions() as session:
+            account = session.get(AccountRecord, normalized_account_id)
+            if account is None:
+                raise AccountNotFoundError(
+                    f"Account '{normalized_account_id}' does not exist"
+                )
+
+            existing_with_hash = session.scalar(
+                select(SchwabAccountMappingRecord).where(
+                    SchwabAccountMappingRecord.schwab_account_hash == normalized_hash,
+                    SchwabAccountMappingRecord.account_id != normalized_account_id,
+                )
+            )
+            if existing_with_hash is not None:
+                raise SchwabAccountMappingConflictError(
+                    "Schwab account hash is already mapped to account "
+                    f"'{existing_with_hash.account_id}'"
+                )
+
+            now = self._clock()
+            existing_mapping = session.scalar(
+                select(SchwabAccountMappingRecord).where(
+                    SchwabAccountMappingRecord.account_id == normalized_account_id
+                )
+            )
+            if existing_mapping is not None:
+                existing_mapping.schwab_account_hash = normalized_hash
+                existing_mapping.masked_account_number = normalized_masked
+                existing_mapping.updated_at = now
+                session.commit()
+                return self._stored_schwab_mapping(existing_mapping)
+
+            record = SchwabAccountMappingRecord(
+                id=str(uuid4()),
+                account_id=normalized_account_id,
+                schwab_account_hash=normalized_hash,
+                masked_account_number=normalized_masked,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(record)
+            session.commit()
+            return self._stored_schwab_mapping(record)
+
+    def get_schwab_account_mapping(
+        self, account_id: str
+    ) -> StoredSchwabAccountMapping | None:
+        with self._sessions() as session:
+            record = session.scalar(
+                select(SchwabAccountMappingRecord).where(
+                    SchwabAccountMappingRecord.account_id == account_id.strip()
+                )
+            )
+            return self._stored_schwab_mapping(record) if record is not None else None
+
+    def get_schwab_account_mapping_by_hash(
+        self, schwab_account_hash: str
+    ) -> StoredSchwabAccountMapping | None:
+        with self._sessions() as session:
+            record = session.scalar(
+                select(SchwabAccountMappingRecord).where(
+                    SchwabAccountMappingRecord.schwab_account_hash
+                    == schwab_account_hash.strip()
+                )
+            )
+            return self._stored_schwab_mapping(record) if record is not None else None
+
+    def list_schwab_account_mappings(self) -> list[StoredSchwabAccountMapping]:
+        with self._sessions() as session:
+            records = session.scalars(
+                select(SchwabAccountMappingRecord).order_by(
+                    SchwabAccountMappingRecord.created_at
+                )
+            )
+            return [self._stored_schwab_mapping(r) for r in records]
+
+    def delete_schwab_account_mapping(self, account_id: str) -> bool:
+        with self._sessions() as session:
+            record = session.scalar(
+                select(SchwabAccountMappingRecord).where(
+                    SchwabAccountMappingRecord.account_id == account_id.strip()
+                )
+            )
+            if record is None:
+                return False
+            session.delete(record)
+            session.commit()
+            return True
+
+    @staticmethod
+    def _stored_schwab_mapping(
+        record: SchwabAccountMappingRecord,
+    ) -> StoredSchwabAccountMapping:
+        return StoredSchwabAccountMapping(
+            id=record.id,
+            account_id=record.account_id,
+            schwab_account_hash=record.schwab_account_hash,
+            masked_account_number=record.masked_account_number,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
         )
 
 

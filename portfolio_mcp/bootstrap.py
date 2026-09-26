@@ -1,7 +1,12 @@
 import os
 from collections.abc import Mapping
 
-from portfolio_mcp.config import SchwabMarketDataSettings, SnapTradeSettings
+from portfolio_mcp.config import (
+    ExecutionSettings,
+    SchwabMarketDataSettings,
+    SchwabSettings,
+    SnapTradeSettings,
+)
 from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
 from portfolio_mcp.provider import (
     MarketDataProvider,
@@ -48,3 +53,18 @@ def create_market_data_provider(
 def create_database_url(environment: Mapping[str, str] | None = None) -> str:
     source = os.environ if environment is None else environment
     return source.get("PORTFOLIO_DATABASE_URL", "sqlite:///portfolio.db")
+
+
+def create_execution_settings(
+    environment: Mapping[str, str] | None = None,
+) -> ExecutionSettings:
+    return ExecutionSettings.from_environment(environment)
+
+
+def create_schwab_settings(
+    environment: Mapping[str, str] | None = None,
+) -> SchwabSettings | None:
+    try:
+        return SchwabSettings.from_environment(environment)
+    except ProviderConfigurationError:
+        return None
