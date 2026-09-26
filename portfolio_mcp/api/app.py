@@ -22,10 +22,12 @@ from portfolio_mcp.order_history import (
     OrderListFilters,
     decode_order_cursor,
     decode_order_event_cursor,
-    encode_order_cursor,
     encode_order_event_cursor,
 )
-from portfolio_mcp.order_reconciliation import OrderReconciliationService
+from portfolio_mcp.order_reconciliation import (
+    OrderReconciliationService,
+    format_order_page_response,
+)
 from portfolio_mcp.overview import OverviewService
 from portfolio_mcp.provider import (
     InstrumentNotFoundError,
@@ -315,44 +317,7 @@ def create_app(
             start_date=start_date,
             end_date=end_date,
         )
-        plans = reconciliation.plan_for_orders(page.items) if reconciliation else ()
-        plans_by_group = {(plan.provider, plan.account_id): plan for plan in plans}
-        orders: list[dict[str, object]] = []
-        for order in page.items:
-            plan = plans_by_group.get((order.provider, order.account_id))
-            serialized = order.to_dict()
-            serialized["reconciliation"] = {
-                "status": order.result_code or "pending",
-                "source": (
-                    order.result_source.value
-                    if order.result_source is not None
-                    else None
-                ),
-                "provider_updated_at": (
-                    order.provider_updated_at.isoformat()
-                    if order.provider_updated_at is not None
-                    else None
-                ),
-                "next_refresh_at": (
-                    plan.next_refresh_at.isoformat() if plan is not None else None
-                ),
-                "target_order_id": plan.target_order_id if plan is not None else None,
-            }
-            orders.append(serialized)
-        return {
-            "orders": orders,
-            "next_cursor": encode_order_cursor(page.next_cursor),
-            "refresh_groups": [
-                {
-                    "provider": plan.provider,
-                    "account_id": plan.account_id,
-                    "target_order_id": plan.target_order_id,
-                    "next_refresh_at": plan.next_refresh_at.isoformat(),
-                }
-                for plan in plans
-            ],
-            "server_time": service_clock().astimezone(UTC).isoformat(),
-        }
+        return format_order_page_response(page, reconciliation, service_clock())
 
     @app.get("/api/order-audit")
     async def list_order_audit(
