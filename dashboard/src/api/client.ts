@@ -614,4 +614,53 @@ export function issueMcpAuthorization(
   );
 }
 
+export type StoredCancellationRequest = {
+  id: string;
+  order_id: string;
+  expected_version: number;
+  expected_state: string;
+  account_id: string;
+  provider: string;
+  symbol: string;
+  broker_order_id: string | null;
+  remaining_quantity: string;
+  fingerprint: string;
+  created_at: string;
+  expires_at: string;
+  status: string;
+  invalidation_reason: string | null;
+};
+
+export type CreateCancellationMcpAuthorizationResult = {
+  authorization_id: string;
+  code: string;
+  expires_at: string;
+  cancellation_request: StoredCancellationRequest;
+};
+
+export function getCancellationRequest(
+  requestId: string,
+): Promise<{ cancellation_request: StoredCancellationRequest }> {
+  return getJson(`/api/cancellation-requests/${encodeURIComponent(requestId)}`);
+}
+
+export function createCancellationMcpAuthorization(
+  requestId: string,
+  expectedFingerprint: string,
+  confirmed: boolean = true,
+): Promise<CreateCancellationMcpAuthorizationResult> {
+  return getJson(
+    `/api/cancellation-requests/${encodeURIComponent(requestId)}/mcp-authorization`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        expected_fingerprint: expectedFingerprint,
+        confirmed,
+      }),
+    },
+  );
+}
+
+
 
