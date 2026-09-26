@@ -1647,6 +1647,19 @@ class PortfolioRepository:
                 record, session.get(OrderDraftRecord, record.draft_id)
             )
 
+    def order_by_broker_id(self, broker_order_id: str) -> "StoredOrder | None":
+        with self._sessions() as session:
+            record = session.scalar(
+                select(OrderRecord).where(
+                    OrderRecord.broker_order_id == broker_order_id
+                )
+            )
+            if record is None:
+                return None
+            return self._stored_order(
+                record, session.get(OrderDraftRecord, record.draft_id)
+            )
+
     def record_draft_expiry(self, draft_id: str, *, observed_at: datetime) -> bool:
         observed_at = require_aware_utc(observed_at)
         with self._sessions.begin() as session:

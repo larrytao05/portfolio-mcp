@@ -15,9 +15,11 @@ from portfolio_mcp.schwab_transport import (
     UrllibSchwabHttpClient,
     decode_body,
     raise_for_status,
+    schwab_asset_class,
 )
 
 _decode_body = decode_body
+_asset_class = schwab_asset_class
 
 
 class SchwabMarketDataProvider:
@@ -179,16 +181,6 @@ def _observation_time(value: object, clock: Callable[[], datetime]) -> datetime:
     if now.tzinfo is None:
         raise ValueError("Clock must return a timezone-aware timestamp")
     return now.astimezone(UTC)
-
-
-def _asset_class(value: str) -> str:
-    return {
-        "EQUITY": "equity",
-        "ETF": "etf",
-        "MUTUAL_FUND": "mutual_fund",
-        "OPTION": "option",
-        "FIXED_INCOME": "fixed_income",
-    }.get(value, value.casefold())
 
 
 def _instrument_id_parts(instrument_id: str) -> tuple[str, str]:

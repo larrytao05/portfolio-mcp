@@ -725,10 +725,17 @@ class OrderCancellationService:
 
             assert order_pending.broker_order_id is not None
             try:
-                result = await asyncio.wait_for(
-                    self._execution_provider.cancel_order(
+                try:
+                    cancel_coro = self._execution_provider.cancel_order(
+                        order_pending.broker_order_id,
+                        account_id=order_pending.account_id,
+                    )
+                except TypeError:
+                    cancel_coro = self._execution_provider.cancel_order(
                         order_pending.broker_order_id
-                    ),
+                    )
+                result = await asyncio.wait_for(
+                    cancel_coro,
                     timeout=10.0,
                 )
             except asyncio.CancelledError:

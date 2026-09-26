@@ -344,9 +344,11 @@ def test_cancellation_partially_filled_order_preserves_fills(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_concurrent_cancellations_call_provider_at_most_once(tmp_path) -> None:
     class SlowExecutionProvider(FixtureExecutionProvider):
-        async def cancel_order(self, broker_order_id: str) -> ExecutionResult:
+        async def cancel_order(
+            self, broker_order_id: str, account_id: str | None = None
+        ) -> ExecutionResult:
             await asyncio.sleep(0.05)
-            return await super().cancel_order(broker_order_id)
+            return await super().cancel_order(broker_order_id, account_id=account_id)
 
     execution = SlowExecutionProvider()
     app = _app(tmp_path, execution)

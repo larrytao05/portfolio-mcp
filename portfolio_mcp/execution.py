@@ -185,7 +185,9 @@ class ExecutionProvider(Protocol):
         self, client_order_id: str, limit: int
     ) -> list[ExecutionResult]: ...
 
-    async def cancel_order(self, broker_order_id: str) -> ExecutionResult: ...
+    async def cancel_order(
+        self, broker_order_id: str, account_id: str | None = None
+    ) -> ExecutionResult: ...
 
 
 class FixtureExecutionProvider:
@@ -283,7 +285,9 @@ class FixtureExecutionProvider:
         self.invocations.append(("recent", client_order_id))
         return self._by_client_order_id.get(client_order_id, [])[:limit]
 
-    async def cancel_order(self, broker_order_id: str) -> ExecutionResult:
+    async def cancel_order(
+        self, broker_order_id: str, account_id: str | None = None
+    ) -> ExecutionResult:
         self.invocations.append(("cancel", broker_order_id))
         scenario = self.cancel_scenario or self.scenario
         snapshot = self._snapshots_by_broker_id.get(broker_order_id)

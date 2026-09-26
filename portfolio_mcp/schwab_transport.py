@@ -3,7 +3,7 @@ import base64
 import json
 import time
 from collections.abc import Mapping
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
@@ -28,11 +28,32 @@ class SchwabHttpClient(Protocol):
     ) -> tuple[int, object]: ...
 
 
+@runtime_checkable
+class SchwabHttpClientWithHeaders(Protocol):
+    def request_with_headers(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None = None,
+    ) -> tuple[int, object, dict[str, str]]: ...
+
+
 def decode_body(body: bytes) -> object:
     try:
         return json.loads(body)
     except (TypeError, ValueError):
         return None
+
+
+def schwab_asset_class(value: str) -> str:
+    return {
+        "EQUITY": "equity",
+        "ETF": "etf",
+        "MUTUAL_FUND": "mutual_fund",
+        "OPTION": "option",
+        "FIXED_INCOME": "fixed_income",
+    }.get(value, value.casefold())
 
 
 class UrllibSchwabHttpClient:
@@ -46,12 +67,24 @@ class UrllibSchwabHttpClient:
         headers: dict[str, str],
         body: bytes | None = None,
     ) -> tuple[int, object]:
+        status, resp_body, _ = self.request_with_headers(method, url, headers, body)
+        return status, resp_body
+
+    def request_with_headers(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None = None,
+    ) -> tuple[int, object, dict[str, str]]:
         request = Request(url, data=body, headers=headers, method=method)
         try:
             with urlopen(request, timeout=15) as response:
-                return response.status, decode_body(response.read())
+                resp_headers = dict(response.headers)
+                return response.status, decode_body(response.read()), resp_headers
         except HTTPError as error:
-            return error.code, decode_body(error.read())
+            resp_headers = dict(error.headers) if hasattr(error, "headers") else {}
+            return error.code, decode_body(error.read()), resp_headers
         except URLError:
             raise ProviderUnavailableError(
                 f"{self._context} is temporarily unavailable"
@@ -213,6 +246,18 @@ class SchwabOAuthTransport:
         body: bytes | None = None,
         additional_headers: dict[str, str] | None = None,
     ) -> tuple[int, object]:
+        status, response, _ = await self.request_with_headers(
+            method, url, body=body, additional_headers=additional_headers
+        )
+        return status, response
+
+    async def request_with_headers(
+        self,
+        method: str,
+        url: str,
+        body: bytes | None = None,
+        additional_headers: dict[str, str] | None = None,
+    ) -> tuple[int, object, dict[str, str]]:
         token = await self.access_token()
         headers = {
             "Authorization": f"Bearer {token}",
@@ -220,14 +265,18 @@ class SchwabOAuthTransport:
         }
         if additional_headers:
             headers.update(additional_headers)
-        status, response = await self.http_request(method, url, headers, body)
+        status, response, resp_headers = await self.http_request_with_headers(
+            method, url, headers, body
+        )
         if status == 401 and self._cached_access_token is not None:
             self._cached_access_token = None
             self._token_expires_at = 0.0
             token = await self.access_token(force_refresh=True)
             headers["Authorization"] = f"Bearer {token}"
-            status, response = await self.http_request(method, url, headers, body)
-        return status, response
+            status, response, resp_headers = await self.http_request_with_headers(
+                method, url, headers, body
+            )
+        return status, response, resp_headers
 
     async def http_request(
         self,
@@ -236,14 +285,35 @@ class SchwabOAuthTransport:
         headers: dict[str, str],
         body: bytes | None = None,
     ) -> tuple[int, object]:
+        status, response, _ = await self.http_request_with_headers(
+            method, url, headers, body
+        )
+        return status, response
+
+    async def http_request_with_headers(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None = None,
+    ) -> tuple[int, object, dict[str, str]]:
         try:
-            return await asyncio.to_thread(
+            if isinstance(self._http_client, SchwabHttpClientWithHeaders):
+                return await asyncio.to_thread(
+                    self._http_client.request_with_headers,
+                    method,
+                    url,
+                    headers,
+                    body,
+                )
+            status, resp = await asyncio.to_thread(
                 self._http_client.request,
                 method,
                 url,
                 headers,
                 body,
             )
+            return status, resp, {}
         except TimeoutError:
             raise ProviderUnavailableError(
                 f"{self._context} is temporarily unavailable"

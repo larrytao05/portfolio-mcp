@@ -250,8 +250,11 @@ class IndeterminateExecutionProvider:
         del limit
         return []
 
-    async def cancel_order(self, broker_order_id: str) -> ExecutionResult:
+    async def cancel_order(
+        self, broker_order_id: str, account_id: str | None = None
+    ) -> ExecutionResult:
         del broker_order_id
+        del account_id
         return ExecutionResult(OrderState.UNKNOWN)
 
 
