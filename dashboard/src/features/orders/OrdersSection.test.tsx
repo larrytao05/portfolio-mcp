@@ -9,6 +9,8 @@ const api = vi.hoisted(() => ({
   getOrders: vi.fn(),
   getOrderAudit: vi.fn(),
   refreshOrder: vi.fn(),
+  confirmOrderCancellation: vi.fn(),
+  getOrder: vi.fn(),
 }));
 
 vi.mock("../../api/client", () => api);
@@ -519,5 +521,143 @@ describe("OrdersSection", () => {
 
     const matches = await screen.findAllByText(/Next:/);
     expect(matches).toHaveLength(1);
+  });
+
+  it("renders Cancel button only for cancelable orders, and opens cancellation modal upon click", async () => {
+    const cancelableOrder: StoredOrder = {
+      ...sampleOrder,
+      id: "ord-cancelable",
+      can_cancel: true,
+      blocking_reason: null,
+    };
+    const nonCancelableOrder: StoredOrder = {
+      ...sampleOrder,
+      id: "ord-noncancelable",
+      state: "FILLED",
+      can_cancel: false,
+      blocking_reason: "Order is already filled",
+    };
+
+    const page: OrderListPage = {
+      orders: [cancelableOrder, nonCancelableOrder],
+      next_cursor: null,
+      refresh_groups: [],
+      server_time: "2026-09-12T20:00:00Z",
+    };
+    api.getOrders.mockResolvedValue(page);
+
+    renderOrdersSection();
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+    });
+
+    const cancelButtons = screen.getAllByRole("button", { name: "Cancel" });
+    expect(cancelButtons).toHaveLength(1);
+
+    fireEvent.click(cancelButtons[0]);
+
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(screen.getByText(/Cancel Order/i)).toBeTruthy();
+
+    api.confirmOrderCancellation.mockResolvedValueOnce({
+      order: { ...cancelableOrder, state: "CANCELED", can_cancel: false },
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Confirm cancellation/i }),
+    );
+
+    await waitFor(() => {
+      expect(api.confirmOrderCancellation).toHaveBeenCalledWith("ord-cancelable", {
+        expected_version: cancelableOrder.version,
+        expected_state: cancelableOrder.state,
+        confirmed: true,
+      });
+      expect(screen.getByText(/was canceled/i)).toBeTruthy();
+    });
+  });
+
+  it("does not render Cancel button for terminal or unknown orders", async () => {
+    const terminalOrder: StoredOrder = {
+      ...sampleOrder,
+      id: "ord-terminal",
+      state: "CANCELED",
+      can_cancel: false,
+    };
+    const unknownOrder: StoredOrder = {
+      ...sampleOrder,
+      id: "ord-unknown",
+      state: "UNKNOWN",
+      can_cancel: false,
+    };
+
+    const page: OrderListPage = {
+      orders: [terminalOrder, unknownOrder],
+      next_cursor: null,
+      refresh_groups: [],
+      server_time: "2026-09-12T20:00:00Z",
+    };
+    api.getOrders.mockResolvedValue(page);
+
+    renderOrdersSection();
+
+    await waitFor(() => {
+      expect(screen.getByText("Reconcile")).toBeTruthy();
+    });
+
+    expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
+  });
+
+  it("triggers reconciliation when modal reports UNKNOWN outcome and user clicks Reconcile order", async () => {
+    const cancelableOrder: StoredOrder = {
+      ...sampleOrder,
+      id: "ord-to-unknown",
+      can_cancel: true,
+    };
+
+    const page: OrderListPage = {
+      orders: [cancelableOrder],
+      next_cursor: null,
+      refresh_groups: [],
+      server_time: "2026-09-12T20:00:00Z",
+    };
+    api.getOrders.mockResolvedValue(page);
+    api.refreshOrder.mockResolvedValue({
+      order: { ...cancelableOrder, state: "UNKNOWN" },
+      refresh: {
+        status: "attempted",
+        provider_read_started: true,
+        next_refresh_at: "2026-09-12T20:00:30Z",
+        target_order_id: "ord-to-unknown",
+        server_time: "2026-09-12T20:00:00Z",
+      },
+    });
+
+    renderOrdersSection();
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    api.confirmOrderCancellation.mockResolvedValueOnce({
+      order: { ...cancelableOrder, state: "UNKNOWN", can_cancel: false },
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Confirm cancellation/i }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /Reconcile order/i })).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Reconcile order/i }));
+
+    await waitFor(() => {
+      expect(api.refreshOrder).toHaveBeenCalledWith("ord-to-unknown", "manual");
+    });
   });
 });
