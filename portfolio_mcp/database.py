@@ -1,7 +1,7 @@
 import hashlib
 import json
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -14,10 +14,12 @@ from sqlalchemy import (
     CheckConstraint,
     Date,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    case,
     delete,
     func,
     select,
@@ -246,6 +248,32 @@ class OrderDraftRecord(Base):
     expires_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
 
 
+class McpAuthorizationRecord(Base):
+    __tablename__ = "mcp_authorizations"
+    __table_args__ = (
+        Index(
+            "ix_mcp_authorizations_action_target_draft",
+            "action",
+            "target_draft_id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    target_draft_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("order_drafts.id"), nullable=False
+    )
+    payload_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    account_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    salt: Mapped[str] = mapped_column(String(64), nullable=False)
+    digest: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(UtcTimestamp(), nullable=True)
+    failed_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    invalidation_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
 class OrderRecord(Base):
     __tablename__ = "orders"
     __table_args__ = (
@@ -418,6 +446,28 @@ def _append_status_transition_event(
 
 class ConcurrentOrderUpdate(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class ActiveMcpAuthorization:
+    id: str
+    action: str
+    target_draft_id: str
+    payload_fingerprint: str
+    account_id: str
+    salt: str = field(repr=False)
+    digest: str = field(repr=False)
+    created_at: datetime
+    expires_at: datetime
+
+
+class McpAuthorizationError(ValueError):
+    def __init__(
+        self, code: str, message: str = "Invalid or expired authorization code"
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 @dataclass(frozen=True)
@@ -751,6 +801,133 @@ class PortfolioRepository:
                 details={},
                 deduplication_key=f"draft:{draft.id}:created",
             )
+
+    def create_mcp_authorization(
+        self,
+        *,
+        authorization_id: str,
+        action: str,
+        target_draft_id: str,
+        payload_fingerprint: str,
+        account_id: str,
+        salt_hex: str,
+        digest_hex: str,
+        created_at: datetime,
+        expires_at: datetime,
+    ) -> None:
+        with self._sessions.begin() as session:
+            session.execute(
+                update(McpAuthorizationRecord)
+                .where(
+                    McpAuthorizationRecord.action == action,
+                    McpAuthorizationRecord.target_draft_id == target_draft_id,
+                    McpAuthorizationRecord.consumed_at.is_(None),
+                    McpAuthorizationRecord.invalidation_reason.is_(None),
+                )
+                .values(invalidation_reason="superseded")
+            )
+            session.add(
+                McpAuthorizationRecord(
+                    id=authorization_id,
+                    action=action,
+                    target_draft_id=target_draft_id,
+                    payload_fingerprint=payload_fingerprint,
+                    account_id=account_id,
+                    salt=salt_hex,
+                    digest=digest_hex,
+                    created_at=created_at,
+                    expires_at=expires_at,
+                    failed_attempts=0,
+                )
+            )
+
+    def _active_mcp_authorization(
+        self, record: McpAuthorizationRecord
+    ) -> ActiveMcpAuthorization:
+        return ActiveMcpAuthorization(
+            id=record.id,
+            action=record.action,
+            target_draft_id=record.target_draft_id,
+            payload_fingerprint=record.payload_fingerprint,
+            account_id=record.account_id,
+            salt=record.salt,
+            digest=record.digest,
+            created_at=record.created_at,
+            expires_at=record.expires_at,
+        )
+
+    def active_mcp_authorization(
+        self, *, action: str, target_draft_id: str
+    ) -> ActiveMcpAuthorization | None:
+        with self._sessions() as session:
+            record = session.scalars(
+                select(McpAuthorizationRecord)
+                .where(
+                    McpAuthorizationRecord.action == action,
+                    McpAuthorizationRecord.target_draft_id == target_draft_id,
+                    McpAuthorizationRecord.consumed_at.is_(None),
+                    McpAuthorizationRecord.invalidation_reason.is_(None),
+                )
+                .order_by(McpAuthorizationRecord.created_at.desc())
+            ).first()
+            if record is None:
+                return None
+            return self._active_mcp_authorization(record)
+
+    def record_mcp_authorization_failure(
+        self, *, authorization_id: str, max_attempts: int = 5
+    ) -> None:
+        with self._sessions.begin() as session:
+            stmt = (
+                update(McpAuthorizationRecord)
+                .where(
+                    McpAuthorizationRecord.id == authorization_id,
+                    McpAuthorizationRecord.consumed_at.is_(None),
+                    McpAuthorizationRecord.invalidation_reason.is_(None),
+                )
+                .values(
+                    failed_attempts=McpAuthorizationRecord.failed_attempts + 1,
+                    invalidation_reason=case(
+                        (
+                            McpAuthorizationRecord.failed_attempts + 1 >= max_attempts,
+                            "max_attempts_exceeded",
+                        ),
+                        else_=None,
+                    ),
+                )
+            )
+            session.execute(stmt)
+
+    def invalidate_mcp_authorization(
+        self, *, authorization_id: str, reason: str
+    ) -> None:
+        with self._sessions.begin() as session:
+            stmt = (
+                update(McpAuthorizationRecord)
+                .where(
+                    McpAuthorizationRecord.id == authorization_id,
+                    McpAuthorizationRecord.consumed_at.is_(None),
+                    McpAuthorizationRecord.invalidation_reason.is_(None),
+                )
+                .values(invalidation_reason=reason)
+            )
+            session.execute(stmt)
+
+    def mark_mcp_authorization_consumed(
+        self, *, authorization_id: str, now: datetime
+    ) -> bool:
+        with self._sessions.begin() as session:
+            stmt = (
+                update(McpAuthorizationRecord)
+                .where(
+                    McpAuthorizationRecord.id == authorization_id,
+                    McpAuthorizationRecord.consumed_at.is_(None),
+                    McpAuthorizationRecord.invalidation_reason.is_(None),
+                )
+                .values(consumed_at=now)
+            )
+            res = cast(CursorResult[object], session.execute(stmt))
+            return res.rowcount == 1
 
     def trading_settings(self) -> StoredTradingSettings:
         with self._sessions() as session:
