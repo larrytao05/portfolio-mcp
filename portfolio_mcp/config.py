@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Mapping, Self
 
 from portfolio_mcp.provider import ProviderConfigurationError
 
@@ -32,16 +32,14 @@ class SnapTradeSettings:
 
 
 @dataclass(frozen=True)
-class SchwabMarketDataSettings:
+class SchwabSettings:
     client_id: str
     client_secret: str
     refresh_token: str
     callback_url: str = DEFAULT_SCHWAB_CALLBACK_URL
 
     @classmethod
-    def from_environment(
-        cls, environment: Mapping[str, str] | None = None
-    ) -> "SchwabMarketDataSettings":
+    def from_environment(cls, environment: Mapping[str, str] | None = None) -> Self:
         source = os.environ if environment is None else environment
         required = (
             "SCHWAB_CLIENT_ID",
@@ -59,4 +57,36 @@ class SchwabMarketDataSettings:
             client_secret=source["SCHWAB_CLIENT_SECRET"],
             refresh_token=source["SCHWAB_REFRESH_TOKEN"],
             callback_url=source.get("SCHWAB_CALLBACK_URL", DEFAULT_SCHWAB_CALLBACK_URL),
+        )
+
+
+@dataclass(frozen=True)
+class SchwabMarketDataSettings(SchwabSettings):
+    pass
+
+
+@dataclass(frozen=True)
+class ExecutionSettings:
+    provider: str = "fixture"
+    schwab_execution_enabled: bool = False
+
+    @property
+    def permits_schwab_execution(self) -> bool:
+        return self.provider == "schwab" and self.schwab_execution_enabled
+
+    @classmethod
+    def from_environment(
+        cls, environment: Mapping[str, str] | None = None
+    ) -> "ExecutionSettings":
+        source = os.environ if environment is None else environment
+        provider = source.get("EXECUTION_PROVIDER", "fixture").lower().strip()
+        if provider not in ("fixture", "schwab"):
+            raise ProviderConfigurationError(
+                "EXECUTION_PROVIDER must be either 'fixture' or 'schwab'"
+            )
+        opt_in_raw = source.get("SCHWAB_EXECUTION_ENABLED", "").lower().strip()
+        schwab_execution_enabled = opt_in_raw in ("true", "1", "yes")
+        return cls(
+            provider=provider,
+            schwab_execution_enabled=schwab_execution_enabled,
         )

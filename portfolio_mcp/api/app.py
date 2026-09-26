@@ -9,7 +9,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
-from portfolio_mcp.database import CorruptedAuditRecordError, PortfolioRepository
+from portfolio_mcp.bootstrap import (
+    create_execution_settings,
+    create_schwab_settings,
+)
+from portfolio_mcp.config import ExecutionSettings, SchwabSettings
+from portfolio_mcp.database import (
+    AccountNotFoundError,
+    CorruptedAuditRecordError,
+    PortfolioRepository,
+    SchwabAccountMappingConflictError,
+)
 from portfolio_mcp.execution import (
     ExecutionProvider,
     FixtureExecutionProvider,
@@ -33,9 +43,18 @@ from portfolio_mcp.provider import (
     InstrumentNotFoundError,
     MarketDataProvider,
     PortfolioProvider,
+    ProviderAuthenticationError,
+    ProviderAuthorizationError,
     ProviderError,
+    ProviderResponseError,
+    ProviderUnavailableError,
 )
 from portfolio_mcp.refresh import PortfolioRefreshService
+from portfolio_mcp.schwab_readiness import (
+    SchwabReadinessService,
+    mask_account_number,
+)
+from portfolio_mcp.schwab_transport import SchwabOAuthTransport
 from portfolio_mcp.trading_safety import (
     TradingGuard,
     TradingSettingsError,
@@ -53,6 +72,14 @@ from portfolio_mcp.trading_service import (
     TradingValidationError,
     fixture_submission_validator,
 )
+
+
+class SaveSchwabMappingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schwab_account_hash: str = Field(min_length=1, max_length=128)
+    masked_account_number: str = Field(min_length=1, max_length=32)
+    confirmed: StrictBool
 
 
 class CreateCancellationMcpAuthorizationRequest(BaseModel):
@@ -115,9 +142,36 @@ def create_app(
     cancellation_service: OrderCancellationService | None = None,
     cancellation_request_service: OrderCancellationRequestService | None = None,
     mcp_auth_service: McpAuthorizationService | None = None,
+    schwab_readiness_service: SchwabReadinessService | None = None,
+    execution_settings: ExecutionSettings | None = None,
+    schwab_settings: SchwabSettings | None = None,
 ) -> FastAPI:
     service_clock = clock or (lambda: datetime.now(UTC))
     repository = PortfolioRepository(database_url, service_clock)
+    exec_settings = (
+        execution_settings
+        if execution_settings is not None
+        else create_execution_settings()
+    )
+    schwab_conf = (
+        schwab_settings if schwab_settings is not None else create_schwab_settings()
+    )
+
+    schwab_transport = (
+        SchwabOAuthTransport(schwab_conf, context="Schwab Trader API")
+        if schwab_conf is not None
+        else None
+    )
+    readiness_service = (
+        schwab_readiness_service
+        if schwab_readiness_service is not None
+        else SchwabReadinessService(
+            repository,
+            schwab_transport,
+            exec_settings,
+            schwab_conf,
+        )
+    )
     refresh_service = PortfolioRefreshService(provider, repository, service_clock)
     market_data = market_data_provider or FixtureMarketDataProvider()
     execution = (
@@ -250,6 +304,117 @@ def create_app(
                 detail={"code": "account_not_found", "message": "Account not found"},
             )
         return {"capability": capability.to_dict()}
+
+    @app.get("/api/schwab/mapping")
+    async def list_schwab_mappings() -> dict[str, object]:
+        return {
+            "mappings": [
+                mapping.to_dict()
+                for mapping in repository.list_schwab_account_mappings()
+            ]
+        }
+
+    @app.get("/api/schwab/mapping/candidates")
+    async def list_schwab_candidates(
+        account_id: Annotated[str, Query(min_length=1)],
+    ) -> dict[str, object]:
+        try:
+            candidates = await readiness_service.list_candidates_for_account(account_id)
+            return {
+                "account_id": account_id,
+                "candidates": [candidate.to_dict() for candidate in candidates],
+            }
+        except ProviderUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ProviderResponseError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/schwab/mapping/{account_id}")
+    async def get_schwab_mapping(account_id: str) -> dict[str, object]:
+        mapping = repository.get_schwab_account_mapping(account_id)
+        if mapping is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No Schwab mapping for account '{account_id}'",
+            )
+        return {"mapping": mapping.to_dict()}
+
+    @app.post("/api/schwab/mapping/{account_id}")
+    async def save_schwab_mapping(
+        account_id: str, request: SaveSchwabMappingRequest
+    ) -> dict[str, object]:
+        if not request.confirmed:
+            raise HTTPException(
+                status_code=400,
+                detail="Owner confirmation is required to save account mapping",
+            )
+        if not request.schwab_account_hash.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="schwab_account_hash cannot be empty",
+            )
+        if repository.stored_account(account_id) is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Account '{account_id}' does not exist",
+            )
+        if readiness_service.is_configured:
+            try:
+                candidates = await readiness_service.list_candidates_for_account(
+                    account_id
+                )
+                valid_hashes = {c.schwab_account_hash for c in candidates}
+                if request.schwab_account_hash not in valid_hashes:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Invalid candidate account hash; hash is not recognized "
+                            "among Schwab accounts for this owner"
+                        ),
+                    )
+            except (
+                ProviderUnavailableError,
+                ProviderResponseError,
+                ProviderAuthenticationError,
+                ProviderAuthorizationError,
+            ):
+                pass
+        masked = mask_account_number(request.masked_account_number)
+        try:
+            mapping = repository.save_schwab_account_mapping(
+                account_id=account_id,
+                schwab_account_hash=request.schwab_account_hash,
+                masked_account_number=masked,
+            )
+            return {"mapping": mapping.to_dict()}
+        except AccountNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except SchwabAccountMappingConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/schwab/mapping/{account_id}")
+    async def delete_schwab_mapping(account_id: str) -> dict[str, object]:
+        deleted = repository.delete_schwab_account_mapping(account_id)
+        if not deleted:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No Schwab mapping for account '{account_id}'",
+            )
+        return {"deleted": True, "account_id": account_id}
+
+    @app.get("/api/schwab/readiness")
+    async def all_schwab_readiness() -> dict[str, object]:
+        readiness_list = await readiness_service.check_all_readiness()
+        return {"readiness": [r.to_dict() for r in readiness_list]}
+
+    @app.get("/api/schwab/readiness/{account_id}")
+    async def account_schwab_readiness(account_id: str) -> dict[str, object]:
+        readiness = await readiness_service.check_account_readiness(account_id)
+        return {"readiness": readiness.to_dict()}
 
     @app.get("/api/refreshes/latest")
     async def latest_refresh() -> dict[str, object]:
