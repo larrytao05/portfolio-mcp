@@ -32,6 +32,8 @@ EXPECTED_TOOLS = [
     "get_order",
     "submit_authorized_order",
     "request_order_cancellation",
+    "create_order_cancellation",
+    "cancel_authorized_order",
 ]
 
 

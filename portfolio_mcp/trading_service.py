@@ -647,10 +647,12 @@ class OrderCancellationService:
         repository: PortfolioRepository,
         execution_provider: ExecutionProvider | None = None,
         clock: Callable[[], datetime] | None = None,
+        mcp_auth_service: McpAuthorizationService | None = None,
     ) -> None:
         self._repository = repository
         self._execution_provider = execution_provider
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._mcp_auth_service = mcp_auth_service
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
@@ -842,6 +844,107 @@ class OrderCancellationService:
 
     def get_request(self, request_id: str) -> StoredCancellationRequest | None:
         return self._repository.get_cancellation_request(request_id)
+
+    async def cancel_authorized(
+        self,
+        *,
+        cancellation_request_id: str,
+        code: str,
+    ) -> StoredOrder:
+        if not cancellation_request_id or not cancellation_request_id.strip():
+            raise TradingValidationError(
+                "invalid_cancellation_request_id",
+                "Cancellation request ID is required",
+            )
+        if not code or not code.strip():
+            raise TradingValidationError(
+                "invalid_code", "Authorization code is required"
+            )
+        if self._mcp_auth_service is None:
+            raise TradingValidationError(
+                "mcp_auth_unavailable", "MCP authorization service is unavailable"
+            )
+
+        req = self._repository.get_cancellation_request(cancellation_request_id.strip())
+        if req is None:
+            raise TradingValidationError(
+                "cancellation_request_not_found", "Cancellation request not found"
+            )
+        if req.status != "authorized":
+            if req.status == "pending":
+                raise TradingValidationError(
+                    "cancellation_request_not_authorized",
+                    "Cancellation request has not been authorized on the dashboard",
+                )
+            if req.status in ("invalidated", "expired"):
+                raise TradingValidationError(
+                    f"cancellation_request_{req.status}",
+                    f"Cancellation request is {req.status}",
+                )
+            if req.status == "executed":
+                raise TradingValidationError(
+                    "cancellation_request_already_consumed",
+                    "Cancellation request has already been executed",
+                )
+            raise TradingValidationError(
+                "cancellation_request_not_authorized",
+                f"Cancellation request is {req.status}",
+            )
+
+        now = _utc_now(self._clock())
+        if now > req.expires_at:
+            self._repository.update_cancellation_request_status(
+                req.id, status="expired"
+            )
+            raise TradingValidationError(
+                "cancellation_request_expired",
+                "Cancellation request has expired",
+            )
+
+        order = self._repository.order(req.order_id)
+        if order is None:
+            raise TradingValidationError("order_not_found", "Order not found")
+        if (
+            order.version != req.expected_order_version
+            or order.state != req.expected_order_state
+        ):
+            self._repository.invalidate_cancellation_requests_for_order(
+                req.order_id, reason="order_state_changed"
+            )
+            raise TradingValidationError(
+                "order_conflict", "Order changed before cancellation"
+            )
+        if not order.can_cancel:
+            self._repository.invalidate_cancellation_requests_for_order(
+                req.order_id, reason="order_not_cancelable"
+            )
+            raise TradingValidationError(
+                "order_not_cancelable",
+                order.blocking_reason or "Order cannot be canceled",
+            )
+
+        try:
+            self._mcp_auth_service.consume_authorization(
+                action="cancel",
+                target_cancellation_request_id=req.id,
+                expected_fingerprint=req.action_fingerprint,
+                account_id=req.account_id,
+                candidate_code=code.strip(),
+            )
+        except McpAuthorizationError as error:
+            raise TradingValidationError(
+                error.code, "Authorization code is invalid or expired"
+            ) from error
+
+        cancelled_order = await self.cancel(
+            order_id=req.order_id,
+            expected_version=req.expected_order_version,
+            expected_state=OrderState(req.expected_order_state),
+            confirmed=True,
+            actor=OrderEventActor.MCP,
+        )
+        self._repository.update_cancellation_request_status(req.id, status="executed")
+        return cancelled_order
 
 
 OrderCancellationRequestService = OrderCancellationService
