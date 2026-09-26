@@ -8,6 +8,7 @@ import {
   getOrders,
   refreshOrder,
 } from "../../api/client";
+import { OrderCancellationModal } from "./OrderCancellationModal";
 
 export function OrdersSection({ accounts }: { accounts: Account[] }) {
   const queryClient = useQueryClient();
@@ -20,6 +21,10 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
   const [symbolFilter, setSymbolFilter] = useState("");
   const [cursor, setCursor] = useState<string | undefined>(undefined);
   const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
+  const [orderToCancel, setOrderToCancel] = useState<StoredOrder | null>(null);
+  const [cancellationMessage, setCancellationMessage] = useState<string | null>(
+    null,
+  );
   const [lastRefreshMessage, setLastRefreshMessage] = useState<string | null>(
     null,
   );
@@ -163,6 +168,7 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
     setStateFilter((data.get("state") as string) || "");
     setSymbolFilter((data.get("symbol") as string) || "");
     setCursor(undefined);
+    setCancellationMessage(null);
   }
 
   const offPageGroup = ordersQuery.data?.refresh_groups.find(
@@ -232,6 +238,11 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
         <button type="submit">Filter</button>
       </form>
 
+      {cancellationMessage && (
+        <p className="inline-alert" role="status">
+          {cancellationMessage}
+        </p>
+      )}
       {lastRefreshMessage && (
         <p className="inline-alert" role="status">
           {lastRefreshMessage}
@@ -322,6 +333,17 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
                     </td>
                     <td>
                       <div className="compact-controls">
+                        {order.can_cancel && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setCancellationMessage(null);
+                              setOrderToCancel(order);
+                            }}
+                          >
+                            Cancel
+                          </button>
+                        )}
                         {isUnknown && (
                           <button
                             type="button"
@@ -434,6 +456,29 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
             )}
           </div>
         </div>
+      )}
+
+      {orderToCancel && (
+        <OrderCancellationModal
+          order={orderToCancel}
+          isOpen={true}
+          onClose={() => setOrderToCancel(null)}
+          onOrderUpdated={() => {
+            void queryClient.invalidateQueries({ queryKey: ["orders"] });
+            void queryClient.invalidateQueries({ queryKey: ["order-audit"] });
+          }}
+          onSuccess={(canceledOrder) => {
+            setOrderToCancel(null);
+            setCancellationMessage(
+              `Order ${canceledOrder.id} (${canceledOrder.instrument.symbol}) was canceled.`,
+            );
+            void queryClient.invalidateQueries({ queryKey: ["orders"] });
+            void queryClient.invalidateQueries({ queryKey: ["order-audit"] });
+          }}
+          onReconcileRequested={(orderId) => {
+            mutateRefresh({ orderId, mode: "manual" });
+          }}
+        />
       )}
     </section>
   );
