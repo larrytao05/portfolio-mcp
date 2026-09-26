@@ -43,6 +43,8 @@ from portfolio_mcp.trading_safety import (
     settings_dict,
 )
 from portfolio_mcp.trading_service import (
+    McpAuthorizationError,
+    McpAuthorizationService,
     OrderCancellationService,
     OrderDraftService,
     OrderSubmissionService,
@@ -64,6 +66,13 @@ class CreateOrderDraftRequest(BaseModel):
 class ConfirmOrderDraftRequest(BaseModel):
     expected_fingerprint: str
     confirmed: bool
+
+
+class CreateMcpAuthorizationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_fingerprint: str = Field(min_length=1, max_length=128)
+    confirmed: StrictBool
 
 
 class ConfirmOrderCancellationRequest(BaseModel):
@@ -95,11 +104,14 @@ def create_app(
     submission_validator: SubmissionValidator | None = None,
     database_url: str = "sqlite:///portfolio.db",
     clock: Callable[[], datetime] | None = None,
+    draft_service: OrderDraftService | None = None,
+    submission_service: OrderSubmissionService | None = None,
+    mcp_auth_service: McpAuthorizationService | None = None,
 ) -> FastAPI:
-    repository = PortfolioRepository(database_url, clock)
-    refresh_service = PortfolioRefreshService(provider, repository, clock)
-    market_data = market_data_provider or FixtureMarketDataProvider()
     service_clock = clock or (lambda: datetime.now(UTC))
+    repository = PortfolioRepository(database_url, service_clock)
+    refresh_service = PortfolioRefreshService(provider, repository, service_clock)
+    market_data = market_data_provider or FixtureMarketDataProvider()
     execution = (
         execution_provider
         if execution_provider is not None
@@ -112,11 +124,27 @@ def create_app(
         validator = fixture_submission_validator(provider)
     settings_service = TradingSettingsService(repository, service_clock)
     trading_guard = TradingGuard(repository, settings_service)
-    draft_service = OrderDraftService(
-        repository, market_data, service_clock, trading_guard
+    active_mcp_auth = (
+        mcp_auth_service
+        if mcp_auth_service is not None
+        else McpAuthorizationService(repository, clock=service_clock)
     )
-    submission_service = OrderSubmissionService(
-        repository, execution, service_clock, validator, trading_guard
+    draft_service = (
+        draft_service
+        if draft_service is not None
+        else OrderDraftService(repository, market_data, service_clock, trading_guard)
+    )
+    submission_service = (
+        submission_service
+        if submission_service is not None
+        else OrderSubmissionService(
+            repository,
+            execution,
+            service_clock,
+            validator,
+            trading_guard,
+            mcp_auth_service=active_mcp_auth,
+        )
     )
     cancellation_service = OrderCancellationService(
         repository, execution, service_clock
@@ -273,6 +301,55 @@ def create_app(
             draft_id, request.expected_fingerprint, request.confirmed
         )
         return {"order": order.to_dict()}
+
+    @app.post("/api/order-drafts/{draft_id}/mcp-authorization")
+    async def create_mcp_authorization(
+        draft_id: str, request: CreateMcpAuthorizationRequest
+    ) -> dict[str, object]:
+        if not request.confirmed:
+            raise HTTPException(
+                status_code=422,
+                detail="Explicit confirmation is required",
+            )
+        draft = repository.order_draft(draft_id)
+        if draft is None:
+            raise HTTPException(status_code=404, detail="Order draft not found")
+        if draft.fingerprint != request.expected_fingerprint:
+            raise HTTPException(
+                status_code=409,
+                detail="The reviewed draft no longer matches",
+            )
+        now = service_clock()
+        if now > draft.expires_at:
+            raise HTTPException(status_code=409, detail="Order draft has expired")
+        existing = repository.order_for_draft(draft_id)
+        if existing is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="An order has already been created for this draft",
+            )
+        try:
+            created = active_mcp_auth.create_authorization(
+                action="submit", target_draft_id=draft_id
+            )
+        except McpAuthorizationError as error:
+            raise HTTPException(status_code=409, detail=str(error))
+        return {
+            "authorization_id": created.id,
+            "code": created.plaintext_code,
+            "expires_at": created.expires_at.isoformat(),
+            "draft": {
+                "id": draft.id,
+                "symbol": draft.symbol,
+                "side": draft.side,
+                "quantity": str(draft.quantity),
+                "order_type": draft.order_type,
+                "limit_price": (
+                    str(draft.limit_price) if draft.limit_price is not None else None
+                ),
+                "fingerprint": draft.fingerprint,
+            },
+        }
 
     @app.get("/api/orders")
     async def list_orders(

@@ -182,6 +182,7 @@ class OrderSubmissionService:
         clock: Callable[[], datetime],
         validator: SubmissionValidator,
         trading_guard: TradingGuard | None = None,
+        mcp_auth_service: McpAuthorizationService | None = None,
     ) -> None:
         self._repository = repository
         self._execution_provider = execution_provider
@@ -190,6 +191,7 @@ class OrderSubmissionService:
         self._trading_guard = trading_guard or TradingGuard(
             repository, TradingSettingsService(repository, clock)
         )
+        self._mcp_auth_service = mcp_auth_service
         if self._repository.has_stranded_submissions():
             self._repository.recover_stranded_submissions(_utc_now(self._clock()))
 
@@ -242,6 +244,43 @@ class OrderSubmissionService:
                     "authorization_invalid", "Order authorization is invalid"
                 )
             return existing
+        return await self._execute_submission(draft, OrderEventActor.DASHBOARD)
+
+    async def submit_authorized(self, draft_id: str, code: str) -> StoredOrder:
+        if self._mcp_auth_service is None:
+            raise TradingValidationError(
+                "mcp_auth_unavailable", "MCP authorization service is unavailable"
+            )
+        draft = self._repository.order_draft(draft_id)
+        if draft is None:
+            raise TradingValidationError("draft_not_found", "Order draft not found")
+        now = _utc_now(self._clock())
+        if now > draft.expires_at:
+            raise TradingValidationError("draft_expired", "Order draft has expired")
+        existing = self._repository.order_for_draft(draft_id)
+        if existing is not None:
+            raise TradingValidationError(
+                "draft_already_submitted",
+                "An order has already been created for this draft",
+            )
+        try:
+            self._mcp_auth_service.consume_authorization(
+                action="submit",
+                target_draft_id=draft.id,
+                expected_fingerprint=draft.fingerprint,
+                account_id=draft.account_id,
+                candidate_code=code,
+            )
+        except McpAuthorizationError as error:
+            raise TradingValidationError(
+                error.code, "Authorization code is invalid or expired"
+            ) from error
+
+        return await self._execute_submission(draft, OrderEventActor.MCP)
+
+    async def _execute_submission(
+        self, draft: OrderDraft, actor: OrderEventActor
+    ) -> StoredOrder:
         await self._validator(draft, _utc_now(self._clock()))
         try:
             capability = await self._execution_provider.get_execution_capability(
@@ -266,7 +305,9 @@ class OrderSubmissionService:
         if now > draft.expires_at:
             raise TradingValidationError("draft_expired", "Order draft has expired")
         self._require_fresh_market_quote(draft, now)
-        order, created = self._repository.begin_order_submission(draft, now)
+        order, created = self._repository.begin_order_submission(
+            draft, now, actor=actor
+        )
         if not created:
             return order
         command = ExecutionCommand(
@@ -296,7 +337,7 @@ class OrderSubmissionService:
                 result_message=str(error),
                 expected_version=order.version,
                 result_source=OrderStatusSource.LOCAL,
-                actor=OrderEventActor.DASHBOARD,
+                actor=actor,
             )
         try:
             order = self._repository.mark_provider_submission_started(
@@ -306,9 +347,11 @@ class OrderSubmissionService:
             )
             result = await self._execution_provider.submit_order(command)
             observed_at = _utc_now(self._clock())
-            return self._persist_provider_result(order, result, observed_at)
+            return self._persist_provider_result(
+                order, result, observed_at, actor=actor
+            )
         except asyncio.CancelledError:
-            self._unknown(order, _utc_now(self._clock()))
+            self._unknown(order, _utc_now(self._clock()), actor=actor)
             raise
         except ConcurrentOrderUpdate:
             latest = self._repository.order(order.id)
@@ -316,29 +359,33 @@ class OrderSubmissionService:
                 raise
             return latest
         except (ExecutionIndeterminateError, TimeoutError):
-            return self._unknown(order, _utc_now(self._clock()))
+            return self._unknown(order, _utc_now(self._clock()), actor=actor)
         except Exception:
-            return self._unknown(order, _utc_now(self._clock()))
+            return self._unknown(order, _utc_now(self._clock()), actor=actor)
 
     def _persist_provider_result(
-        self, order: StoredOrder, result: object, now: datetime
+        self,
+        order: StoredOrder,
+        result: object,
+        now: datetime,
+        actor: OrderEventActor = OrderEventActor.DASHBOARD,
     ) -> StoredOrder:
         if not isinstance(result, ExecutionResult):
-            return self._unknown(order, now)
+            return self._unknown(order, now, actor=actor)
         if not isinstance(result.state, OrderState):
-            return self._unknown(order, now)
+            return self._unknown(order, now, actor=actor)
         if result.state not in {
             OrderState.ACCEPTED,
             OrderState.PARTIALLY_FILLED,
             OrderState.FILLED,
             OrderState.REJECTED,
         }:
-            return self._unknown(order, now)
+            return self._unknown(order, now, actor=actor)
         broker_order_id = result.broker_order_id
         if result.state != OrderState.REJECTED and (
             not isinstance(broker_order_id, str) or not broker_order_id.strip()
         ):
-            return self._unknown(order, now)
+            return self._unknown(order, now, actor=actor)
         return self._repository.finish_order_submission(
             order.id,
             result.state,
@@ -351,7 +398,7 @@ class OrderSubmissionService:
             expected_version=order.version,
             fill=result.fill,
             result_source=OrderStatusSource.PROVIDER,
-            actor=OrderEventActor.DASHBOARD,
+            actor=actor,
         )
 
     def _require_fresh_market_quote(self, draft: OrderDraft, now: datetime) -> None:
@@ -367,7 +414,12 @@ class OrderSubmissionService:
                 "quote_stale", "The market quote is stale; create a new draft"
             )
 
-    def _unknown(self, order: StoredOrder, now: datetime) -> StoredOrder:
+    def _unknown(
+        self,
+        order: StoredOrder,
+        now: datetime,
+        actor: OrderEventActor = OrderEventActor.DASHBOARD,
+    ) -> StoredOrder:
         return self._repository.finish_order_submission(
             order.id,
             OrderState.UNKNOWN,
@@ -376,7 +428,7 @@ class OrderSubmissionService:
             result_message="Order outcome is unknown. Reconciliation is required.",
             expected_version=order.version,
             result_source=OrderStatusSource.SYSTEM,
-            actor=OrderEventActor.DASHBOARD,
+            actor=actor,
         )
 
 
