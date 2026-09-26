@@ -35,6 +35,8 @@ from portfolio_mcp.trading_safety import (
 from portfolio_mcp.trading_service import (
     McpAuthorizationError,
     McpAuthorizationService,
+    OrderCancellationRequestService,
+    OrderCancellationService,
     OrderDraftService,
     OrderSubmissionService,
     TradingValidationError,
@@ -54,6 +56,8 @@ def create_server(
     draft_service: OrderDraftService | None = None,
     reconciliation_service: OrderReconciliationService | None = None,
     submission_service: OrderSubmissionService | None = None,
+    cancellation_service: OrderCancellationService | None = None,
+    cancellation_request_service: OrderCancellationRequestService | None = None,
     mcp_auth_service: McpAuthorizationService | None = None,
 ) -> MCPServer:
     mcp = MCPServer("portfolio-mcp")
@@ -100,6 +104,12 @@ def create_server(
             trading_guard=trading_guard,
             mcp_auth_service=active_mcp_auth,
         )
+
+    active_cancellation_service = (
+        cancellation_service
+        or cancellation_request_service
+        or OrderCancellationService(repo, execution, service_clock)
+    )
 
     @mcp.tool()
     async def list_accounts() -> dict[str, list[dict[str, str]]]:
@@ -289,6 +299,30 @@ def create_server(
         except TradingValidationError as error:
             raise ToolError(f"{error.code}: {error}") from error
         except McpAuthorizationError as error:
+            raise ToolError(f"{error.code}: {error}") from error
+
+    @mcp.tool()
+    async def request_order_cancellation(order_id: str) -> dict[str, object]:
+        """Request cancellation of an active order.
+
+        Creates a pending cancellation request that must be independently confirmed
+        and authorized on the dashboard with a one-time code. Does NOT cancel
+        the order or call broker execution providers directly.
+        """
+        if not order_id or not order_id.strip():
+            raise ToolError("invalid_order_id: Order ID is required")
+        try:
+            req = active_cancellation_service.create_request(order_id.strip())
+            return {
+                "cancellation_request": req.to_dict(),
+                "disclaimer": (
+                    "Cancellation request created. No broker cancellation has "
+                    "been performed. You must confirm this request on the "
+                    "dashboard and obtain a one-time authorization code to "
+                    "execute cancellation."
+                ),
+            }
+        except TradingValidationError as error:
             raise ToolError(f"{error.code}: {error}") from error
 
     return mcp

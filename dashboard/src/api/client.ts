@@ -269,15 +269,30 @@ export type OverviewResponse = {
 export type HistoryResponse = {
   history: DailyRecordedPoint[];
 };
+export class ApiError extends Error {
+  status: number;
+  code?: string;
+
+  constructor(status: number, message: string, code?: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
 async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     const message = body?.error?.message;
-    throw new Error(
+    const code = body?.error?.code;
+    throw new ApiError(
+      response.status,
       typeof message === "string"
         ? message
         : `Request failed with status ${response.status}`,
+      typeof code === "string" ? code : undefined,
     );
   }
 
@@ -417,6 +432,8 @@ export type StoredOrder = {
   created_at: string;
   updated_at: string;
   version: number;
+  can_cancel?: boolean;
+  blocking_reason?: string | null;
   reconciliation?: {
     status: string;
     source: string | null;
@@ -539,6 +556,31 @@ export function refreshOrder(
   });
 }
 
+export type ConfirmOrderCancellationInput = {
+  expected_version: number;
+  expected_state: string;
+  confirmed: boolean;
+};
+
+export type ConfirmOrderCancellationResponse = {
+  order: StoredOrder;
+};
+
+export function confirmOrderCancellation(
+  orderId: string,
+  input: ConfirmOrderCancellationInput,
+): Promise<ConfirmOrderCancellationResponse> {
+  return getJson(`/api/orders/${encodeURIComponent(orderId)}/cancel/confirm`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export function getOrder(orderId: string): Promise<{ order: StoredOrder }> {
+  return getJson(`/api/orders/${encodeURIComponent(orderId)}`);
+}
+
 export type CreateMcpAuthorizationResult = {
   authorization_id: string;
   code: string;
@@ -571,4 +613,54 @@ export function issueMcpAuthorization(
     },
   );
 }
+
+export type StoredCancellationRequest = {
+  id: string;
+  order_id: string;
+  expected_version: number;
+  expected_state: string;
+  account_id: string;
+  provider: string;
+  symbol: string;
+  broker_order_id: string | null;
+  remaining_quantity: string;
+  fingerprint: string;
+  created_at: string;
+  expires_at: string;
+  status: string;
+  invalidation_reason: string | null;
+};
+
+export type CreateCancellationMcpAuthorizationResult = {
+  authorization_id: string;
+  code: string;
+  expires_at: string;
+  cancellation_request: StoredCancellationRequest;
+};
+
+export function getCancellationRequest(
+  requestId: string,
+): Promise<{ cancellation_request: StoredCancellationRequest }> {
+  return getJson(`/api/cancellation-requests/${encodeURIComponent(requestId)}`);
+}
+
+export function createCancellationMcpAuthorization(
+  requestId: string,
+  expectedFingerprint: string,
+  confirmed: boolean = true,
+): Promise<CreateCancellationMcpAuthorizationResult> {
+  return getJson(
+    `/api/cancellation-requests/${encodeURIComponent(requestId)}/mcp-authorization`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        expected_fingerprint: expectedFingerprint,
+        confirmed,
+      }),
+    },
+  );
+}
+
+
 

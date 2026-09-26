@@ -256,12 +256,23 @@ class McpAuthorizationRecord(Base):
             "action",
             "target_draft_id",
         ),
+        Index(
+            "ix_mcp_authorizations_action_target_req",
+            "action",
+            "target_cancellation_request_id",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     action: Mapped[str] = mapped_column(String(32), nullable=False)
-    target_draft_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("order_drafts.id"), nullable=False
+    target_draft_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("order_drafts.id"), nullable=True
+    )
+    target_cancellation_request_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("cancellation_requests.id"), nullable=True
+    )
+    target_order_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("orders.id"), nullable=True
     )
     payload_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     account_id: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -271,6 +282,34 @@ class McpAuthorizationRecord(Base):
     expires_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
     consumed_at: Mapped[datetime | None] = mapped_column(UtcTimestamp(), nullable=True)
     failed_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    invalidation_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class CancellationRequestRecord(Base):
+    __tablename__ = "cancellation_requests"
+    __table_args__ = (
+        Index(
+            "ix_cancellation_requests_order_status",
+            "order_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    order_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("orders.id"), nullable=False
+    )
+    expected_order_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_order_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    account_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    broker_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    remaining_quantity: Mapped[Decimal] = mapped_column(ExactDecimal(), nullable=False)
+    action_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
     invalidation_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
@@ -452,13 +491,51 @@ class ConcurrentOrderUpdate(RuntimeError):
 class ActiveMcpAuthorization:
     id: str
     action: str
-    target_draft_id: str
+    target_draft_id: str | None
+    target_cancellation_request_id: str | None
+    target_order_id: str | None
     payload_fingerprint: str
     account_id: str
     salt: str = field(repr=False)
     digest: str = field(repr=False)
     created_at: datetime
     expires_at: datetime
+
+
+@dataclass(frozen=True)
+class StoredCancellationRequest:
+    id: str
+    order_id: str
+    expected_order_version: int
+    expected_order_state: str
+    account_id: str
+    provider: str
+    symbol: str
+    broker_order_id: str | None
+    remaining_quantity: Decimal
+    action_fingerprint: str
+    created_at: datetime
+    expires_at: datetime
+    status: str
+    invalidation_reason: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "order_id": self.order_id,
+            "expected_version": self.expected_order_version,
+            "expected_state": self.expected_order_state,
+            "account_id": self.account_id,
+            "provider": self.provider,
+            "symbol": self.symbol,
+            "broker_order_id": self.broker_order_id,
+            "remaining_quantity": str(self.remaining_quantity),
+            "fingerprint": self.action_fingerprint,
+            "created_at": self.created_at.isoformat(),
+            "expires_at": self.expires_at.isoformat(),
+            "status": self.status,
+            "invalidation_reason": self.invalidation_reason,
+        }
 
 
 class McpAuthorizationError(ValueError):
@@ -742,6 +819,25 @@ def upgrade_database(database_url: str) -> None:
     command.upgrade(config, "head")
 
 
+def compute_cancellation_fingerprint(
+    *,
+    order_id: str,
+    expected_version: int,
+    expected_state: str,
+    account_id: str,
+    remaining_quantity: Decimal,
+) -> str:
+    payload = {
+        "order_id": order_id,
+        "expected_version": expected_version,
+        "expected_state": expected_state,
+        "account_id": account_id,
+        "remaining_quantity": format(remaining_quantity.normalize(), "f"),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
 class PortfolioRepository:
     def __init__(
         self,
@@ -807,30 +903,39 @@ class PortfolioRepository:
         *,
         authorization_id: str,
         action: str,
-        target_draft_id: str,
         payload_fingerprint: str,
         account_id: str,
         salt_hex: str,
         digest_hex: str,
         created_at: datetime,
         expires_at: datetime,
+        target_draft_id: str | None = None,
+        target_cancellation_request_id: str | None = None,
+        target_order_id: str | None = None,
     ) -> None:
         with self._sessions.begin() as session:
-            session.execute(
-                update(McpAuthorizationRecord)
-                .where(
-                    McpAuthorizationRecord.action == action,
-                    McpAuthorizationRecord.target_draft_id == target_draft_id,
-                    McpAuthorizationRecord.consumed_at.is_(None),
-                    McpAuthorizationRecord.invalidation_reason.is_(None),
-                )
-                .values(invalidation_reason="superseded")
+            supersede_stmt = update(McpAuthorizationRecord).where(
+                McpAuthorizationRecord.action == action,
+                McpAuthorizationRecord.consumed_at.is_(None),
+                McpAuthorizationRecord.invalidation_reason.is_(None),
             )
+            if target_draft_id is not None:
+                supersede_stmt = supersede_stmt.where(
+                    McpAuthorizationRecord.target_draft_id == target_draft_id
+                )
+            if target_cancellation_request_id is not None:
+                supersede_stmt = supersede_stmt.where(
+                    McpAuthorizationRecord.target_cancellation_request_id
+                    == target_cancellation_request_id
+                )
+            session.execute(supersede_stmt.values(invalidation_reason="superseded"))
             session.add(
                 McpAuthorizationRecord(
                     id=authorization_id,
                     action=action,
                     target_draft_id=target_draft_id,
+                    target_cancellation_request_id=target_cancellation_request_id,
+                    target_order_id=target_order_id,
                     payload_fingerprint=payload_fingerprint,
                     account_id=account_id,
                     salt=salt_hex,
@@ -843,7 +948,7 @@ class PortfolioRepository:
             _append_order_event(
                 session,
                 draft_id=target_draft_id,
-                order_id=None,
+                order_id=target_order_id,
                 account_id=account_id,
                 event_type=OrderEventType.AUTHORIZATION_CREATED,
                 actor=OrderEventActor.DASHBOARD,
@@ -862,6 +967,8 @@ class PortfolioRepository:
             id=record.id,
             action=record.action,
             target_draft_id=record.target_draft_id,
+            target_cancellation_request_id=record.target_cancellation_request_id,
+            target_order_id=record.target_order_id,
             payload_fingerprint=record.payload_fingerprint,
             account_id=record.account_id,
             salt=record.salt,
@@ -871,18 +978,29 @@ class PortfolioRepository:
         )
 
     def active_mcp_authorization(
-        self, *, action: str, target_draft_id: str
+        self,
+        *,
+        action: str,
+        target_draft_id: str | None = None,
+        target_cancellation_request_id: str | None = None,
     ) -> ActiveMcpAuthorization | None:
         with self._sessions() as session:
-            record = session.scalars(
-                select(McpAuthorizationRecord)
-                .where(
-                    McpAuthorizationRecord.action == action,
-                    McpAuthorizationRecord.target_draft_id == target_draft_id,
-                    McpAuthorizationRecord.consumed_at.is_(None),
-                    McpAuthorizationRecord.invalidation_reason.is_(None),
+            stmt = select(McpAuthorizationRecord).where(
+                McpAuthorizationRecord.action == action,
+                McpAuthorizationRecord.consumed_at.is_(None),
+                McpAuthorizationRecord.invalidation_reason.is_(None),
+            )
+            if target_draft_id is not None:
+                stmt = stmt.where(
+                    McpAuthorizationRecord.target_draft_id == target_draft_id
                 )
-                .order_by(McpAuthorizationRecord.created_at.desc())
+            if target_cancellation_request_id is not None:
+                stmt = stmt.where(
+                    McpAuthorizationRecord.target_cancellation_request_id
+                    == target_cancellation_request_id
+                )
+            record = session.scalars(
+                stmt.order_by(McpAuthorizationRecord.created_at.desc())
             ).first()
             if record is None:
                 return None
@@ -918,7 +1036,7 @@ class PortfolioRepository:
                 _append_order_event(
                     session,
                     draft_id=record.target_draft_id,
-                    order_id=None,
+                    order_id=record.target_order_id,
                     account_id=record.account_id,
                     event_type=OrderEventType.AUTHORIZATION_FAILED,
                     actor=OrderEventActor.MCP,
@@ -963,7 +1081,7 @@ class PortfolioRepository:
                 _append_order_event(
                     session,
                     draft_id=record.target_draft_id,
-                    order_id=None,
+                    order_id=record.target_order_id,
                     account_id=record.account_id,
                     event_type=OrderEventType.AUTHORIZATION_CONSUMED,
                     actor=OrderEventActor.MCP,
@@ -975,6 +1093,281 @@ class PortfolioRepository:
                     deduplication_key=f"mcp_authorization:{authorization_id}:consumed",
                 )
             return consumed
+
+    def _stored_cancellation_request(
+        self, record: CancellationRequestRecord
+    ) -> StoredCancellationRequest:
+        return StoredCancellationRequest(
+            id=record.id,
+            order_id=record.order_id,
+            expected_order_version=record.expected_order_version,
+            expected_order_state=record.expected_order_state,
+            account_id=record.account_id,
+            provider=record.provider,
+            symbol=record.symbol,
+            broker_order_id=record.broker_order_id,
+            remaining_quantity=record.remaining_quantity,
+            action_fingerprint=record.action_fingerprint,
+            created_at=record.created_at,
+            expires_at=record.expires_at,
+            status=record.status,
+            invalidation_reason=record.invalidation_reason,
+        )
+
+    def create_cancellation_request(
+        self,
+        *,
+        order: "StoredOrder",
+        now: datetime,
+        expires_at: datetime,
+    ) -> StoredCancellationRequest:
+        req_id = str(uuid4())
+        remaining = (
+            order.remaining_quantity
+            if order.remaining_quantity is not None
+            else order.quantity
+        )
+        fingerprint = compute_cancellation_fingerprint(
+            order_id=order.id,
+            expected_version=order.version,
+            expected_state=order.state.value,
+            account_id=order.account_id,
+            remaining_quantity=remaining,
+        )
+        with self._sessions.begin() as session:
+            self._invalidate_cancellation_requests_for_order_in_session(
+                session, order.id, "superseded", now
+            )
+            record = CancellationRequestRecord(
+                id=req_id,
+                order_id=order.id,
+                expected_order_version=order.version,
+                expected_order_state=order.state.value,
+                account_id=order.account_id,
+                provider=order.provider,
+                symbol=order.symbol,
+                broker_order_id=order.broker_order_id,
+                remaining_quantity=remaining,
+                action_fingerprint=fingerprint,
+                created_at=now,
+                expires_at=expires_at,
+                status="pending",
+                invalidation_reason=None,
+            )
+            session.add(record)
+            session.flush()
+            return self._stored_cancellation_request(record)
+
+    def _invalidate_cancellation_requests_for_order_in_session(
+        self, session: Session, order_id: str, reason: str, now: datetime
+    ) -> None:
+        superseded_req_ids = session.scalars(
+            select(CancellationRequestRecord.id).where(
+                CancellationRequestRecord.order_id == order_id,
+                CancellationRequestRecord.status.in_(["pending", "authorized"]),
+            )
+        ).all()
+        if superseded_req_ids:
+            session.execute(
+                update(CancellationRequestRecord)
+                .where(CancellationRequestRecord.id.in_(superseded_req_ids))
+                .values(status="invalidated", invalidation_reason=reason)
+            )
+            session.execute(
+                update(McpAuthorizationRecord)
+                .where(
+                    McpAuthorizationRecord.target_cancellation_request_id.in_(
+                        superseded_req_ids
+                    ),
+                    McpAuthorizationRecord.consumed_at.is_(None),
+                    McpAuthorizationRecord.invalidation_reason.is_(None),
+                )
+                .values(invalidation_reason=reason)
+            )
+
+    def invalidate_cancellation_requests_for_order(
+        self, order_id: str, reason: str = "order_state_changed"
+    ) -> None:
+        now = require_aware_utc(self._clock())
+        with self._sessions.begin() as session:
+            self._invalidate_cancellation_requests_for_order_in_session(
+                session, order_id, reason, now
+            )
+
+    def authorize_cancellation_request(
+        self,
+        request_id: str,
+        *,
+        expected_fingerprint: str,
+        authorization_id: str,
+        salt_hex: str,
+        digest_hex: str,
+        now: datetime,
+        expires_at: datetime,
+    ) -> tuple[StoredCancellationRequest, str]:
+        now = require_aware_utc(now)
+        expires_at = require_aware_utc(expires_at)
+        with self._sessions() as session:
+            req = session.get(CancellationRequestRecord, request_id)
+            if req is None:
+                raise McpAuthorizationError(
+                    "cancellation_request_not_found", "Cancellation request not found"
+                )
+            if req.status != "pending":
+                raise McpAuthorizationError(
+                    "cancellation_request_not_pending",
+                    f"Cancellation request is already {req.status}",
+                )
+            if now > req.expires_at:
+                req.status = "expired"
+                session.commit()
+                raise McpAuthorizationError(
+                    "cancellation_request_expired",
+                    "Cancellation request has expired",
+                )
+            if req.action_fingerprint != expected_fingerprint:
+                raise McpAuthorizationError(
+                    "fingerprint_mismatch",
+                    "The reviewed cancellation request no longer matches",
+                )
+
+            order = session.get(OrderRecord, req.order_id)
+            draft = (
+                session.get(OrderDraftRecord, order.draft_id)
+                if order is not None
+                else None
+            )
+            if (
+                order is None
+                or order.version != req.expected_order_version
+                or order.state != req.expected_order_state
+            ):
+                req.status = "invalidated"
+                req.invalidation_reason = "order_state_changed"
+                session.commit()
+                raise McpAuthorizationError(
+                    "order_state_changed",
+                    "The order state or version has changed since the "
+                    "cancellation request was created",
+                )
+
+            stored = self._stored_order(order, draft)
+            if not stored.can_cancel:
+                req.status = "invalidated"
+                req.invalidation_reason = "order_not_cancelable"
+                session.commit()
+                raise McpAuthorizationError(
+                    "order_not_cancelable",
+                    stored.blocking_reason or "Order cannot be canceled",
+                )
+
+            req.status = "authorized"
+            session.execute(
+                update(McpAuthorizationRecord)
+                .where(
+                    McpAuthorizationRecord.target_cancellation_request_id == req.id,
+                    McpAuthorizationRecord.consumed_at.is_(None),
+                    McpAuthorizationRecord.invalidation_reason.is_(None),
+                )
+                .values(invalidation_reason="superseded")
+            )
+
+            auth_record = McpAuthorizationRecord(
+                id=authorization_id,
+                action="cancel",
+                target_draft_id=None,
+                target_cancellation_request_id=req.id,
+                target_order_id=order.id,
+                payload_fingerprint=req.action_fingerprint,
+                account_id=order.account_id,
+                salt=salt_hex,
+                digest=digest_hex,
+                created_at=now,
+                expires_at=expires_at,
+                consumed_at=None,
+                invalidation_reason=None,
+                failed_attempts=0,
+            )
+            session.add(auth_record)
+
+            _append_order_event(
+                session,
+                draft_id=order.draft_id,
+                order_id=order.id,
+                account_id=order.account_id,
+                event_type=OrderEventType.AUTHORIZATION_CREATED,
+                actor=OrderEventActor.DASHBOARD,
+                occurred_at=now,
+                previous_state=None,
+                next_state=None,
+                code=None,
+                details={
+                    "authorization_id": authorization_id,
+                    "action": "cancel",
+                },
+                deduplication_key=f"order:{order.id}:auth:cancel:{authorization_id}",
+            )
+            session.commit()
+            return self._stored_cancellation_request(req), order.id
+
+    def get_cancellation_request(
+        self, request_id: str
+    ) -> StoredCancellationRequest | None:
+        with self._sessions.begin() as session:
+            record = session.get(CancellationRequestRecord, request_id)
+            if record is None:
+                return None
+            now = require_aware_utc(self._clock())
+            if record.status == "pending" and now > record.expires_at:
+                record.status = "expired"
+                session.flush()
+            return self._stored_cancellation_request(record)
+
+    def active_cancellation_request_for_order(
+        self, order_id: str
+    ) -> StoredCancellationRequest | None:
+        with self._sessions.begin() as session:
+            now = require_aware_utc(self._clock())
+            record = session.scalars(
+                select(CancellationRequestRecord)
+                .where(
+                    CancellationRequestRecord.order_id == order_id,
+                    CancellationRequestRecord.status.in_(["pending", "authorized"]),
+                    CancellationRequestRecord.expires_at > now,
+                )
+                .order_by(CancellationRequestRecord.created_at.desc())
+            ).first()
+            if record is None:
+                return None
+            return self._stored_cancellation_request(record)
+
+    def invalidate_cancellation_request(self, request_id: str, reason: str) -> None:
+        with self._sessions.begin() as session:
+            session.execute(
+                update(CancellationRequestRecord)
+                .where(
+                    CancellationRequestRecord.id == request_id,
+                    CancellationRequestRecord.status.in_(["pending", "authorized"]),
+                )
+                .values(status="invalidated", invalidation_reason=reason)
+            )
+            session.execute(
+                update(McpAuthorizationRecord)
+                .where(
+                    McpAuthorizationRecord.target_cancellation_request_id == request_id,
+                    McpAuthorizationRecord.consumed_at.is_(None),
+                    McpAuthorizationRecord.invalidation_reason.is_(None),
+                )
+                .values(invalidation_reason=reason)
+            )
+
+    def update_cancellation_request_status(self, request_id: str, status: str) -> None:
+        with self._sessions.begin() as session:
+            session.execute(
+                update(CancellationRequestRecord)
+                .where(CancellationRequestRecord.id == request_id)
+                .values(status=status)
+            )
 
     def trading_settings(self) -> StoredTradingSettings:
         with self._sessions() as session:
@@ -1977,6 +2370,9 @@ class PortfolioRepository:
             event_occurred_at = max(now, record.updated_at)
             record.updated_at = event_occurred_at
             record.version += 1
+            self._invalidate_cancellation_requests_for_order_in_session(
+                session, record.id, "order_state_changed", event_occurred_at
+            )
             session.flush()
             event_type = (
                 OrderEventType.SUBMISSION_RESULT
@@ -2154,6 +2550,9 @@ class PortfolioRepository:
             event_occurred_at = max(now, record.updated_at)
             record.updated_at = event_occurred_at
             record.version += 1
+            self._invalidate_cancellation_requests_for_order_in_session(
+                session, record.id, "cancellation_started", event_occurred_at
+            )
             session.flush()
 
             _append_status_transition_event(
@@ -2206,6 +2605,9 @@ class PortfolioRepository:
             event_occurred_at = max(now, record.updated_at)
             record.updated_at = event_occurred_at
             record.version += 1
+            self._invalidate_cancellation_requests_for_order_in_session(
+                session, record.id, f"order_{state.value.lower()}", event_occurred_at
+            )
             session.flush()
 
             _append_order_event(
