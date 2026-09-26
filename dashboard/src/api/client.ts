@@ -662,5 +662,89 @@ export function createCancellationMcpAuthorization(
   );
 }
 
+export type StoredSchwabAccountMapping = {
+  id: string;
+  account_id: string;
+  schwab_account_hash: string;
+  masked_account_number: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type SchwabAccountCandidate = {
+  schwab_account_hash: string;
+  masked_account_number: string;
+  is_mapped: boolean;
+  mapped_to_account_id: string | null;
+  suggested: boolean;
+};
+
+export type SchwabAccountReadiness = {
+  account_id: string;
+  state:
+    | "ready"
+    | "not_configured"
+    | "not_opted_in"
+    | "auth_failed"
+    | "not_entitled"
+    | "unmapped"
+    | "account_unavailable"
+    | "unsupported_account";
+  ready: boolean;
+  schwab_account_hash: string | null;
+  masked_account_number: string | null;
+  message: string;
+  details: Record<string, unknown>;
+};
+
+export function getSchwabMappings(): Promise<{ mappings: StoredSchwabAccountMapping[] }> {
+  return getJson("/api/schwab/mapping");
+}
+
+export function getSchwabMapping(
+  accountId: string,
+): Promise<{ mapping: StoredSchwabAccountMapping }> {
+  return getJson(`/api/schwab/mapping/${encodeURIComponent(accountId)}`);
+}
+
+export function getSchwabMappingCandidates(
+  accountId: string,
+): Promise<{ account_id: string; candidates: SchwabAccountCandidate[] }> {
+  return getJson(`/api/schwab/mapping/candidates?account_id=${encodeURIComponent(accountId)}`);
+}
+
+export function saveSchwabMapping(
+  accountId: string,
+  data: {
+    schwab_account_hash: string;
+    masked_account_number: string;
+    confirmed: boolean;
+  },
+): Promise<{ mapping: StoredSchwabAccountMapping }> {
+  return getJson(`/api/schwab/mapping/${encodeURIComponent(accountId)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+export function deleteSchwabMapping(
+  accountId: string,
+): Promise<{ deleted: boolean; account_id: string }> {
+  return getJson(`/api/schwab/mapping/${encodeURIComponent(accountId)}`, {
+    method: "DELETE",
+  });
+}
+
+export function getSchwabReadiness(
+  accountId: string,
+): Promise<{ readiness: SchwabAccountReadiness }> {
+  return getJson(`/api/schwab/readiness/${encodeURIComponent(accountId)}`);
+}
+
+export function getAllSchwabReadiness(): Promise<{ readiness: SchwabAccountReadiness[] }> {
+  return getJson("/api/schwab/readiness");
+}
+
 
 
