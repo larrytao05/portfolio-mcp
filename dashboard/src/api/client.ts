@@ -538,3 +538,37 @@ export function refreshOrder(
     body: JSON.stringify({ mode }),
   });
 }
+
+export type CreateMcpAuthorizationResult = {
+  authorization_id: string;
+  code: string;
+  expires_at: string;
+  draft: {
+    id: string;
+    symbol: string;
+    side: string;
+    quantity: string;
+    order_type: string;
+    limit_price: string | null;
+    fingerprint: string;
+  };
+};
+
+export function issueMcpAuthorization(
+  draftId: string,
+  expectedFingerprint: string,
+  confirmed: boolean = true,
+): Promise<CreateMcpAuthorizationResult> {
+  return getJson(
+    `/api/order-drafts/${encodeURIComponent(draftId)}/mcp-authorization`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        expected_fingerprint: expectedFingerprint,
+        confirmed,
+      }),
+    },
+  );
+}
+

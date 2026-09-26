@@ -840,6 +840,20 @@ class PortfolioRepository:
                     failed_attempts=0,
                 )
             )
+            _append_order_event(
+                session,
+                draft_id=target_draft_id,
+                order_id=None,
+                account_id=account_id,
+                event_type=OrderEventType.AUTHORIZATION_CREATED,
+                actor=OrderEventActor.DASHBOARD,
+                occurred_at=created_at,
+                details={
+                    "authorization_id": authorization_id,
+                    "action": action,
+                },
+                deduplication_key=f"mcp_authorization:{authorization_id}:created",
+            )
 
     def _active_mcp_authorization(
         self, record: McpAuthorizationRecord
@@ -878,6 +892,7 @@ class PortfolioRepository:
         self, *, authorization_id: str, max_attempts: int = 5
     ) -> None:
         with self._sessions.begin() as session:
+            record = session.get(McpAuthorizationRecord, authorization_id)
             stmt = (
                 update(McpAuthorizationRecord)
                 .where(
@@ -897,6 +912,21 @@ class PortfolioRepository:
                 )
             )
             session.execute(stmt)
+            if record is not None:
+                attempt_id = str(uuid4())
+                now = require_aware_utc(self._clock())
+                _append_order_event(
+                    session,
+                    draft_id=record.target_draft_id,
+                    order_id=None,
+                    account_id=record.account_id,
+                    event_type=OrderEventType.AUTHORIZATION_FAILED,
+                    actor=OrderEventActor.MCP,
+                    occurred_at=now,
+                    code=OrderEventCode.AUTHORIZATION_INVALID,
+                    details={"attempt_id": attempt_id, "action": record.action},
+                    deduplication_key=f"mcp_authorization:{authorization_id}:failure:{attempt_id}",
+                )
 
     def invalidate_mcp_authorization(
         self, *, authorization_id: str, reason: str
@@ -917,6 +947,7 @@ class PortfolioRepository:
         self, *, authorization_id: str, now: datetime
     ) -> bool:
         with self._sessions.begin() as session:
+            record = session.get(McpAuthorizationRecord, authorization_id)
             stmt = (
                 update(McpAuthorizationRecord)
                 .where(
@@ -927,7 +958,23 @@ class PortfolioRepository:
                 .values(consumed_at=now)
             )
             res = cast(CursorResult[object], session.execute(stmt))
-            return res.rowcount == 1
+            consumed = res.rowcount == 1
+            if consumed and record is not None:
+                _append_order_event(
+                    session,
+                    draft_id=record.target_draft_id,
+                    order_id=None,
+                    account_id=record.account_id,
+                    event_type=OrderEventType.AUTHORIZATION_CONSUMED,
+                    actor=OrderEventActor.MCP,
+                    occurred_at=now,
+                    details={
+                        "authorization_id": authorization_id,
+                        "action": record.action,
+                    },
+                    deduplication_key=f"mcp_authorization:{authorization_id}:consumed",
+                )
+            return consumed
 
     def trading_settings(self) -> StoredTradingSettings:
         with self._sessions() as session:
@@ -1023,7 +1070,9 @@ class PortfolioRepository:
                         action="submit",
                         expected_fingerprint=draft.fingerprint,
                         account_id=draft.account_id,
-                        actor="dashboard-owner",
+                        actor="dashboard-owner"
+                        if actor == OrderEventActor.DASHBOARD
+                        else actor.value,
                         created_at=now,
                         expires_at=draft.expires_at,
                         consumed_at=now,
@@ -1050,28 +1099,29 @@ class PortfolioRepository:
                 )
                 session.add(record)
                 session.flush()
-                authorization_details = {
-                    "authorization_id": authorization_id,
-                    "action": "submit",
-                }
-                for event_type in (
-                    OrderEventType.AUTHORIZATION_CREATED,
-                    OrderEventType.AUTHORIZATION_CONSUMED,
-                ):
-                    _append_order_event(
-                        session,
-                        draft_id=draft.id,
-                        order_id=order_id,
-                        account_id=draft.account_id,
-                        event_type=event_type,
-                        actor=actor,
-                        occurred_at=now,
-                        details=authorization_details,
-                        deduplication_key=(
-                            f"authorization:{authorization_id}:"
-                            f"{event_type.value.removeprefix('authorization_')}"
-                        ),
-                    )
+                if actor == OrderEventActor.DASHBOARD:
+                    authorization_details = {
+                        "authorization_id": authorization_id,
+                        "action": "submit",
+                    }
+                    for event_type in (
+                        OrderEventType.AUTHORIZATION_CREATED,
+                        OrderEventType.AUTHORIZATION_CONSUMED,
+                    ):
+                        _append_order_event(
+                            session,
+                            draft_id=draft.id,
+                            order_id=order_id,
+                            account_id=draft.account_id,
+                            event_type=event_type,
+                            actor=actor,
+                            occurred_at=now,
+                            details=authorization_details,
+                            deduplication_key=(
+                                f"authorization:{authorization_id}:"
+                                f"{event_type.value.removeprefix('authorization_')}"
+                            ),
+                        )
                 _append_order_event(
                     session,
                     draft_id=draft.id,
