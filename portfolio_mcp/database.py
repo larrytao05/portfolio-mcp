@@ -2496,42 +2496,43 @@ class PortfolioRepository:
                 ).encode("utf-8")
             ).hexdigest()
 
-            session.add(
-                OrderAuthorizationRecord(
-                    id=str(attempt_id),
-                    draft_id=record.draft_id,
-                    action="cancel",
-                    expected_fingerprint=cancellation_fingerprint,
-                    account_id=record.account_id,
-                    actor="dashboard-owner",
-                    created_at=now,
-                    expires_at=now + timedelta(minutes=5),
-                    consumed_at=now,
+            if actor == OrderEventActor.DASHBOARD:
+                session.add(
+                    OrderAuthorizationRecord(
+                        id=str(attempt_id),
+                        draft_id=record.draft_id,
+                        action="cancel",
+                        expected_fingerprint=cancellation_fingerprint,
+                        account_id=record.account_id,
+                        actor="dashboard-owner",
+                        created_at=now,
+                        expires_at=now + timedelta(minutes=5),
+                        consumed_at=now,
+                    )
                 )
-            )
 
-            auth_details = {
-                "authorization_id": str(attempt_id),
-                "action": "cancel",
-            }
-            for event_type in (
-                OrderEventType.AUTHORIZATION_CREATED,
-                OrderEventType.AUTHORIZATION_CONSUMED,
-            ):
-                _append_order_event(
-                    session,
-                    draft_id=record.draft_id,
-                    order_id=record.id,
-                    account_id=record.account_id,
-                    event_type=event_type,
-                    actor=actor,
-                    occurred_at=now,
-                    details=auth_details,
-                    deduplication_key=(
-                        f"authorization:{attempt_id}:"
-                        f"{event_type.value.removeprefix('authorization_')}"
-                    ),
-                )
+                auth_details = {
+                    "authorization_id": str(attempt_id),
+                    "action": "cancel",
+                }
+                for event_type in (
+                    OrderEventType.AUTHORIZATION_CREATED,
+                    OrderEventType.AUTHORIZATION_CONSUMED,
+                ):
+                    _append_order_event(
+                        session,
+                        draft_id=record.draft_id,
+                        order_id=record.id,
+                        account_id=record.account_id,
+                        event_type=event_type,
+                        actor=actor,
+                        occurred_at=now,
+                        details=auth_details,
+                        deduplication_key=(
+                            f"authorization:{attempt_id}:"
+                            f"{event_type.value.removeprefix('authorization_')}"
+                        ),
+                    )
 
             _append_order_event(
                 session,
