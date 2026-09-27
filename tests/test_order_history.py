@@ -74,6 +74,7 @@ def test_order_detail_has_a_compact_legacy_safe_draft_summary(tmp_path) -> None:
             "quantity": str(draft.quantity),
             "limit_price": str(draft.limit_price),
         },
+        "warnings": list(draft.warnings),
     }
     assert order.state == OrderState.SUBMITTING
 
