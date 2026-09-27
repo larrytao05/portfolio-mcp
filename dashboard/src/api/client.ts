@@ -669,7 +669,7 @@ export function getCancellationRequest(
 export function createCancellationMcpAuthorization(
   requestId: string,
   expectedFingerprint: string,
-  confirmed: boolean = true,
+  confirmed: boolean,
 ): Promise<CreateCancellationMcpAuthorizationResult> {
   return getJson(
     `/api/cancellation-requests/${encodeURIComponent(requestId)}/mcp-authorization`,

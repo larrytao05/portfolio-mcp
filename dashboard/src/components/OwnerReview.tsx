@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 
 import {
-  type CreateMcpAuthorizationResult,
   type OrderDraft,
+  type StoredCancellationRequest,
+  createCancellationMcpAuthorization,
+  getCancellationRequest,
   getOrderDraft,
   issueMcpAuthorization,
 } from "../api/client";
@@ -19,6 +21,78 @@ export type OwnerReviewProps =
       onClose?: () => void;
     };
 
+interface AuthCodeBoxProps {
+  code: string;
+  expiresAt: string;
+  actionNoun: "submission" | "cancellation";
+  onClose?: () => void;
+}
+
+function AuthCodeBox({
+  code,
+  expiresAt,
+  actionNoun,
+  onClose,
+}: AuthCodeBoxProps) {
+  return (
+    <div className="auth-code-box" role="status">
+      <p>
+        <strong>One-Time Authorization Code:</strong>
+      </p>
+      <p className="auth-code-display">{code}</p>
+      <p className="muted">
+        Expires at: {new Date(expiresAt).toLocaleTimeString()}
+      </p>
+      <p className="muted">
+        Provide this 8-digit code to the MCP client to authorize {actionNoun}.
+        The code can only be used once.
+      </p>
+      {onClose && (
+        <button type="button" onClick={onClose}>
+          Done
+        </button>
+      )}
+    </div>
+  );
+}
+
+interface ReviewActionButtonsProps {
+  confirmed: boolean;
+  onConfirmChange: (checked: boolean) => void;
+  issuing: boolean;
+  onIssue: () => void;
+  confirmLabel: string;
+}
+
+function ReviewActionButtons({
+  confirmed,
+  onConfirmChange,
+  issuing,
+  onIssue,
+  confirmLabel,
+}: ReviewActionButtonsProps) {
+  return (
+    <div className="owner-review-actions">
+      <label>
+        <input
+          type="checkbox"
+          checked={confirmed}
+          onChange={(e) => onConfirmChange(e.target.checked)}
+        />
+        {confirmLabel}
+      </label>
+      <button
+        type="button"
+        className="button-primary"
+        disabled={!confirmed || issuing}
+        onClick={onIssue}
+      >
+        {issuing ? "Issuing code…" : "Issue code"}
+      </button>
+    </div>
+  );
+}
+
 export function OwnerReview(props: OwnerReviewProps) {
   const { action, onClose } = props;
   const targetId = action === "submit" ? props.draftId : props.requestId;
@@ -26,16 +100,21 @@ export function OwnerReview(props: OwnerReviewProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [draft, setDraft] = useState<OrderDraft | null>(null);
+  const [cancellationRequest, setCancellationRequest] =
+    useState<StoredCancellationRequest | null>(null);
   const [confirmed, setConfirmed] = useState(false);
   const [issuing, setIssuing] = useState(false);
-  const [issuedCode, setIssuedCode] =
-    useState<CreateMcpAuthorizationResult | null>(null);
+  const [issuedCode, setIssuedCode] = useState<{
+    code: string;
+    expires_at: string;
+  } | null>(null);
 
   useEffect(() => {
     let active = true;
     setLoading(true);
     setError(null);
     setDraft(null);
+    setCancellationRequest(null);
     setConfirmed(false);
     setIssuedCode(null);
 
@@ -58,8 +137,23 @@ export function OwnerReview(props: OwnerReviewProps) {
           }
         });
     } else {
-      // Cancellation review is handled in #81
-      setLoading(false);
+      getCancellationRequest(targetId)
+        .then((res) => {
+          if (active) {
+            setCancellationRequest(res.cancellation_request);
+            setLoading(false);
+          }
+        })
+        .catch((err: unknown) => {
+          if (active) {
+            setError(
+              err instanceof Error
+                ? err.message
+                : "Unable to load cancellation review.",
+            );
+            setLoading(false);
+          }
+        });
     }
 
     return () => {
@@ -70,16 +164,28 @@ export function OwnerReview(props: OwnerReviewProps) {
   }, [action, targetId]);
 
   async function handleIssueCode() {
-    if (!draft || !confirmed) return;
+    if (!confirmed) return;
     setIssuing(true);
     setError(null);
     try {
-      const result = await issueMcpAuthorization(
-        draft.id,
-        draft.fingerprint,
-        true,
-      );
-      setIssuedCode(result);
+      if (action === "submit") {
+        if (!draft) return;
+        const result = await issueMcpAuthorization(
+          draft.id,
+          draft.fingerprint,
+          true,
+        );
+        setIssuedCode(result);
+      } else {
+        if (!cancellationRequest) return;
+        const result = await createCancellationMcpAuthorization(
+          cancellationRequest.id,
+          cancellationRequest.fingerprint,
+          true,
+        );
+        setCancellationRequest(result.cancellation_request);
+        setIssuedCode(result);
+      }
     } catch (err: unknown) {
       setError(
         err instanceof Error
@@ -173,44 +279,108 @@ export function OwnerReview(props: OwnerReviewProps) {
           )}
 
           {issuedCode ? (
-            <div className="auth-code-box" role="status">
-              <p>
-                <strong>One-Time Authorization Code:</strong>
-              </p>
-              <p className="auth-code-display">{issuedCode.code}</p>
-              <p className="muted">
-                Expires at:{" "}
-                {new Date(issuedCode.expires_at).toLocaleTimeString()}
-              </p>
-              <p className="muted">
-                Provide this 8-digit code to the MCP client to authorize submission.
-                The code can only be used once.
-              </p>
-              {onClose && (
-                <button type="button" onClick={onClose}>
-                  Done
-                </button>
-              )}
-            </div>
+            <AuthCodeBox
+              code={issuedCode.code}
+              expiresAt={issuedCode.expires_at}
+              actionNoun="submission"
+              onClose={onClose}
+            />
           ) : (
-            <div className="owner-review-actions">
-              <label>
-                <input
-                  type="checkbox"
-                  checked={confirmed}
-                  onChange={(e) => setConfirmed(e.target.checked)}
-                />
-                I confirm this order instruction
-              </label>
-              <button
-                type="button"
-                className="button-primary"
-                disabled={!confirmed || issuing}
-                onClick={handleIssueCode}
-              >
-                {issuing ? "Issuing code…" : "Issue code"}
-              </button>
+            <ReviewActionButtons
+              confirmed={confirmed}
+              onConfirmChange={setConfirmed}
+              issuing={issuing}
+              onIssue={handleIssueCode}
+              confirmLabel="I confirm this order instruction"
+            />
+          )}
+        </div>
+      )}
+
+      {action === "cancel" && cancellationRequest && (
+        <div>
+          <p>
+            {cancellationRequest.account_id} · {cancellationRequest.symbol} · Order{" "}
+            {cancellationRequest.order_id}
+          </p>
+
+          <dl>
+            <div>
+              <dt>Symbol</dt>
+              <dd>{cancellationRequest.symbol}</dd>
             </div>
+            <div>
+              <dt>Account</dt>
+              <dd>{cancellationRequest.account_id}</dd>
+            </div>
+            <div>
+              <dt>Provider</dt>
+              <dd>{cancellationRequest.provider}</dd>
+            </div>
+            <div>
+              <dt>Order ID</dt>
+              <dd>{cancellationRequest.order_id}</dd>
+            </div>
+            {cancellationRequest.broker_order_id && (
+              <div>
+                <dt>Broker Order ID</dt>
+                <dd>{cancellationRequest.broker_order_id}</dd>
+              </div>
+            )}
+            <div>
+              <dt>Remaining Quantity</dt>
+              <dd>{cancellationRequest.remaining_quantity}</dd>
+            </div>
+            <div>
+              <dt>Expected State</dt>
+              <dd>{cancellationRequest.expected_state}</dd>
+            </div>
+            <div>
+              <dt>Expected Version</dt>
+              <dd>{cancellationRequest.expected_version}</dd>
+            </div>
+            <div>
+              <dt>Fingerprint</dt>
+              <dd>{cancellationRequest.fingerprint}</dd>
+            </div>
+            <div>
+              <dt>Expires</dt>
+              <dd>{new Date(cancellationRequest.expires_at).toLocaleString()}</dd>
+            </div>
+            <div>
+              <dt>Status</dt>
+              <dd>{cancellationRequest.status}</dd>
+            </div>
+          </dl>
+
+          {cancellationRequest.status !== "pending" && (
+            <p className="inline-alert" role="alert">
+              This cancellation request is not pending (status:{" "}
+              {cancellationRequest.status}
+              {cancellationRequest.invalidation_reason
+                ? `, reason: ${cancellationRequest.invalidation_reason}`
+                : ""}
+              ).
+            </p>
+          )}
+
+          {issuedCode ? (
+            <AuthCodeBox
+              code={issuedCode.code}
+              expiresAt={issuedCode.expires_at}
+              actionNoun="cancellation"
+              onClose={onClose}
+            />
+          ) : (
+            cancellationRequest.status === "pending" && (
+              <ReviewActionButtons
+                confirmed={confirmed}
+                onConfirmChange={setConfirmed}
+                issuing={issuing}
+                onIssue={handleIssueCode}
+                confirmLabel="I confirm this cancellation request"
+              />
+            )
           )}
         </div>
       )}

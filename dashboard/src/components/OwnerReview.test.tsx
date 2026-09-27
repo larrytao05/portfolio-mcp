@@ -11,6 +11,8 @@ vi.mock("../api/client", async (importOriginal) => {
     ...actual,
     getOrderDraft: vi.fn(),
     issueMcpAuthorization: vi.fn(),
+    getCancellationRequest: vi.fn(),
+    createCancellationMcpAuthorization: vi.fn(),
   };
 });
 
@@ -51,6 +53,23 @@ const sampleDraft: OrderDraft = {
   fingerprint: "fp-sample-123",
   created_at: "2026-09-25T20:00:00Z",
   expires_at: "2026-09-25T20:05:00Z",
+};
+
+const sampleCancellationRequest = {
+  id: "cancel-req-1",
+  order_id: "ord-456",
+  expected_version: 2,
+  expected_state: "ACCEPTED",
+  account_id: "schwab-taxable-demo",
+  provider: "schwab",
+  symbol: "VTI",
+  broker_order_id: "brk-789",
+  remaining_quantity: "5",
+  fingerprint: "fp-cancel-456",
+  created_at: "2026-09-25T20:00:00Z",
+  expires_at: "2026-09-25T20:05:00Z",
+  status: "pending",
+  invalidation_reason: null,
 };
 
 describe("OwnerReview", () => {
@@ -180,5 +199,116 @@ describe("OwnerReview", () => {
       expect(screen.getByRole("alert")).toBeTruthy();
       expect(screen.getByText(/Order draft has expired/i)).toBeTruthy();
     });
+  });
+
+  it("loads saved cancellation request with GET and displays version, state, remaining quantity, fingerprint", async () => {
+    vi.mocked(client.getCancellationRequest).mockResolvedValueOnce({
+      cancellation_request: sampleCancellationRequest,
+    });
+
+    render(<OwnerReview action="cancel" requestId="cancel-req-1" />);
+
+    expect(screen.getByText(/Loading review details…/i)).toBeTruthy();
+
+    await waitFor(() => {
+      expect(client.getCancellationRequest).toHaveBeenCalledWith("cancel-req-1");
+      expect(screen.getByText("Owner Review: MCP Order Cancellation")).toBeTruthy();
+      expect(screen.getByText("fp-cancel-456")).toBeTruthy();
+      expect(screen.getByText("ACCEPTED")).toBeTruthy();
+      expect(screen.getByText("2")).toBeTruthy();
+      expect(screen.getByText("5")).toBeTruthy();
+    });
+
+    // Code is never issued on GET load
+    expect(client.createCancellationMcpAuthorization).not.toHaveBeenCalled();
+  });
+
+  it("disables Issue code button until confirmation checkbox is checked for cancellation", async () => {
+    vi.mocked(client.getCancellationRequest).mockResolvedValueOnce({
+      cancellation_request: sampleCancellationRequest,
+    });
+
+    render(<OwnerReview action="cancel" requestId="cancel-req-1" />);
+
+    await waitFor(() => {
+      expect(screen.getByText("fp-cancel-456")).toBeTruthy();
+    });
+
+    const issueButton = screen.getByRole("button", { name: "Issue code" });
+    expect(issueButton.hasAttribute("disabled")).toBe(true);
+
+    const checkbox = screen.getByRole("checkbox", {
+      name: /I confirm this cancellation request/i,
+    });
+    fireEvent.click(checkbox);
+
+    expect(issueButton.hasAttribute("disabled")).toBe(false);
+  });
+
+  it("issues cancellation authorization code only upon explicit confirmed action", async () => {
+    vi.mocked(client.getCancellationRequest).mockResolvedValueOnce({
+      cancellation_request: sampleCancellationRequest,
+    });
+    vi.mocked(client.createCancellationMcpAuthorization).mockResolvedValueOnce({
+      authorization_id: "auth-cancel-123",
+      code: "12345678",
+      expires_at: "2026-09-25T20:05:00Z",
+      cancellation_request: {
+        ...sampleCancellationRequest,
+        status: "authorized",
+      },
+    });
+
+    render(<OwnerReview action="cancel" requestId="cancel-req-1" />);
+
+    await waitFor(() => {
+      expect(screen.getByText("fp-cancel-456")).toBeTruthy();
+      expect(screen.getByText("pending")).toBeTruthy();
+    });
+
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: /I confirm this cancellation request/i,
+      }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Issue code" }));
+
+    await waitFor(() => {
+      expect(client.createCancellationMcpAuthorization).toHaveBeenCalledWith(
+        "cancel-req-1",
+        "fp-cancel-456",
+        true,
+      );
+      expect(screen.getByText("12345678")).toBeTruthy();
+      expect(screen.getByText("authorized")).toBeTruthy();
+      expect(screen.getByText(/One-Time Authorization Code:/i)).toBeTruthy();
+      expect(screen.getByRole("status")).toBeTruthy();
+      expect(
+        screen.getByText(/Provide this 8-digit code to the MCP client to authorize cancellation/i),
+      ).toBeTruthy();
+    });
+  });
+
+  it("displays alert and hides confirmation when cancellation request is not pending", async () => {
+    vi.mocked(client.getCancellationRequest).mockResolvedValueOnce({
+      cancellation_request: {
+        ...sampleCancellationRequest,
+        status: "invalidated",
+        invalidation_reason: "order_state_changed",
+      },
+    });
+
+    render(<OwnerReview action="cancel" requestId="cancel-req-1" />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toBeTruthy();
+      expect(
+        screen.getByText(/This cancellation request is not pending \(status: invalidated, reason: order_state_changed\)/i),
+      ).toBeTruthy();
+    });
+
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Issue code" })).toBeNull();
   });
 });

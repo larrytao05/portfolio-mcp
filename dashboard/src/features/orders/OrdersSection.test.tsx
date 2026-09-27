@@ -11,6 +11,8 @@ const api = vi.hoisted(() => ({
   refreshOrder: vi.fn(),
   confirmOrderCancellation: vi.fn(),
   getOrder: vi.fn(),
+  getCancellationRequest: vi.fn(),
+  createCancellationMcpAuthorization: vi.fn(),
 }));
 
 vi.mock("../../api/client", () => api);
@@ -913,6 +915,57 @@ describe("OrdersSection", () => {
 
     // Check sparse order has explicit unavailable placeholders
     expect(screen.getAllByText("—").length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("mounts OwnerReview for cancellation request when MCP Cancellation Request ID is entered", async () => {
+    api.getOrders.mockResolvedValue({
+      orders: [],
+      next_cursor: null,
+      refresh_groups: [],
+      server_time: "2026-09-12T20:00:00Z",
+    });
+    api.getCancellationRequest.mockResolvedValue({
+      cancellation_request: {
+        id: "cancel-req-999",
+        order_id: "ord-999",
+        expected_version: 1,
+        expected_state: "ACCEPTED",
+        account_id: "schwab-taxable-demo",
+        provider: "schwab",
+        symbol: "VTI",
+        broker_order_id: null,
+        remaining_quantity: "10",
+        fingerprint: "fp-999",
+        created_at: "2026-09-12T20:00:00Z",
+        expires_at: "2026-09-12T20:05:00Z",
+        status: "pending",
+        invalidation_reason: null,
+      },
+    });
+
+    renderOrdersSection();
+
+    const input = screen.getByLabelText(/MCP Cancellation Request ID/i);
+    fireEvent.change(input, { target: { value: "cancel-req-999" } });
+
+    const reviewButton = screen.getByRole("button", {
+      name: /Review MCP Cancellation/i,
+    });
+    fireEvent.click(reviewButton);
+
+    await waitFor(() => {
+      expect(api.getCancellationRequest).toHaveBeenCalledWith("cancel-req-999");
+      expect(
+        screen.getByText("Owner Review: MCP Order Cancellation"),
+      ).toBeTruthy();
+      expect(screen.getByText("ID: cancel-req-999")).toBeTruthy();
+    });
+
+    // Close button dismisses the review
+    const closeBtn = screen.getByRole("button", { name: "Close review" });
+    fireEvent.click(closeBtn);
+
+    expect(screen.queryByText("Owner Review: MCP Order Cancellation")).toBeNull();
   });
 });
 

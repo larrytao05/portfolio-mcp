@@ -2739,7 +2739,10 @@ class PortfolioRepository:
             record.updated_at = event_occurred_at
             record.version += 1
             self._invalidate_cancellation_requests_for_order_in_session(
-                session, record.id, f"order_{state.value.lower()}", event_occurred_at
+                session,
+                record.id,
+                f"order_{target_state.value.lower()}",
+                event_occurred_at,
             )
             session.flush()
 
