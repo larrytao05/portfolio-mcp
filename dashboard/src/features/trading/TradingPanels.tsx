@@ -64,7 +64,7 @@ export function ExecutionStatus({
             <p>Sides: {capability.supported_sides.join(", ") || "unavailable"} · Time in force: {capability.time_in_force.join(", ") || "unavailable"} · Sizing: {capability.sizing_modes.join(", ") || "unavailable"}</p>
             <p>Preview: {capability.preview_supported ? "available" : "unavailable"} · Cancellation: {capability.cancellation_supported ? "available" : "unavailable"}</p>
             {capability.blocks.map((block) => <p className="inline-alert" key={block.code} role="alert">{block.message}{block.recovery_action ? ` ${block.recovery_action}` : ""}</p>)}
-            {capability.provider.toLowerCase() === "schwab" && (
+            {Boolean(capability.schwab_mapping_eligible) && (
               <SchwabAccountMappingItem accountId={capability.account_id} />
             )}
           </div>
@@ -77,8 +77,7 @@ export function ExecutionStatus({
 export function SchwabAccountMappingItem({ accountId }: { accountId: string }) {
   const queryClient = useQueryClient();
   const [showMappingFlow, setShowMappingFlow] = useState(false);
-  const [selectedHash, setSelectedHash] = useState<string>("");
-  const [selectedMasked, setSelectedMasked] = useState<string>("");
+  const [selectedCandidateId, setSelectedCandidateId] = useState<string>("");
   const [confirmed, setConfirmed] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -117,20 +116,23 @@ export function SchwabAccountMappingItem({ accountId }: { accountId: string }) {
 
   const saveMutation = useMutation({
     mutationFn: async () => {
-      if (!selectedHash || !selectedMasked || !confirmed) return;
+      if (!selectedCandidateId || !confirmed) {
+        throw new Error("Candidate selection and confirmation are required");
+      }
       return await saveSchwabMapping(accountId, {
-        schwab_account_hash: selectedHash,
-        masked_account_number: selectedMasked,
+        candidate_id: selectedCandidateId,
         confirmed: true,
       });
     },
     onSuccess: async () => {
       setShowMappingFlow(false);
       setConfirmed(false);
+      setSelectedCandidateId("");
       setActionError(null);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["schwab", "mapping", accountId] }),
         queryClient.invalidateQueries({ queryKey: ["schwab", "readiness", accountId] }),
+        queryClient.invalidateQueries({ queryKey: ["schwab", "candidates", accountId] }),
         queryClient.invalidateQueries({ queryKey: ["trading", "status"] }),
       ]);
     },
@@ -149,6 +151,7 @@ export function SchwabAccountMappingItem({ accountId }: { accountId: string }) {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["schwab", "mapping", accountId] }),
         queryClient.invalidateQueries({ queryKey: ["schwab", "readiness", accountId] }),
+        queryClient.invalidateQueries({ queryKey: ["schwab", "candidates", accountId] }),
         queryClient.invalidateQueries({ queryKey: ["trading", "status"] }),
       ]);
     },
@@ -171,7 +174,7 @@ export function SchwabAccountMappingItem({ accountId }: { accountId: string }) {
       {mapping ? (
         <div className="mapped-details">
           <p>
-            Mapped to Schwab account: <strong>{mapping.masked_account_number}</strong> (Hash: <code>{mapping.schwab_account_hash.slice(0, 12)}…</code>)
+            Mapped to Schwab account: <strong>{mapping.masked_account_number}</strong>
           </p>
           <button
             type="button"
@@ -205,21 +208,20 @@ export function SchwabAccountMappingItem({ accountId }: { accountId: string }) {
                 <p className="state state-empty">No Schwab accounts found via API.</p>
               )}
               {candidatesQuery.data?.map((cand) => (
-                <div key={cand.schwab_account_hash} style={{ marginBottom: "0.5rem" }}>
+                <div key={cand.candidate_id} style={{ marginBottom: "0.5rem" }}>
                   <label style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
                     <input
                       type="radio"
                       name={`schwab-cand-${accountId}`}
-                      value={cand.schwab_account_hash}
-                      checked={selectedHash === cand.schwab_account_hash}
+                      value={cand.candidate_id}
+                      checked={selectedCandidateId === cand.candidate_id}
                       disabled={cand.is_mapped && cand.mapped_to_account_id !== accountId}
                       onChange={() => {
-                        setSelectedHash(cand.schwab_account_hash);
-                        setSelectedMasked(cand.masked_account_number);
+                        setSelectedCandidateId(cand.candidate_id);
                       }}
                     />
                     <span>
-                      {cand.masked_account_number} (Hash: <code>{cand.schwab_account_hash.slice(0, 8)}…</code>)
+                      {cand.masked_account_number}
                       {cand.suggested && <strong style={{ marginLeft: "0.5rem", color: "#16a34a" }}>[Suggested match]</strong>}
                       {cand.is_mapped && cand.mapped_to_account_id !== accountId && (
                         <span style={{ marginLeft: "0.5rem", color: "#dc2626" }}>(Already mapped)</span>
@@ -243,7 +245,7 @@ export function SchwabAccountMappingItem({ accountId }: { accountId: string }) {
                 <button
                   type="button"
                   className="button button-primary"
-                  disabled={!selectedHash || !confirmed || saveMutation.isPending}
+                  disabled={!selectedCandidateId || !confirmed || saveMutation.isPending}
                   onClick={() => saveMutation.mutate()}
                 >
                   {saveMutation.isPending ? "Saving…" : "Confirm and save mapping"}
@@ -253,8 +255,7 @@ export function SchwabAccountMappingItem({ accountId }: { accountId: string }) {
                   className="button button-secondary"
                   onClick={() => {
                     setShowMappingFlow(false);
-                    setSelectedHash("");
-                    setSelectedMasked("");
+                    setSelectedCandidateId("");
                     setConfirmed(false);
                     setActionError(null);
                   }}
@@ -266,7 +267,7 @@ export function SchwabAccountMappingItem({ accountId }: { accountId: string }) {
           )}
         </div>
       )}
-      {actionError && <p className="inline-alert" role="alert">{actionError}</p>}
+      {actionError && !showMappingFlow && <p className="inline-alert" role="alert">{actionError}</p>}
     </div>
   );
 }

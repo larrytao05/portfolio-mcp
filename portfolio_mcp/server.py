@@ -114,7 +114,7 @@ def create_server(
     )
 
     @mcp.tool()
-    async def list_accounts() -> dict[str, list[dict[str, str]]]:
+    async def list_accounts() -> dict[str, object]:
         """List connected taxable brokerage and Roth IRA accounts. Read-only."""
         accounts = await provider.list_accounts()
         return {"accounts": [account.to_dict() for account in accounts]}

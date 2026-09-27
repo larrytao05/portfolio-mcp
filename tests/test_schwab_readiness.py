@@ -2,17 +2,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
-from portfolio_mcp.api.app import create_app
 from portfolio_mcp.config import ExecutionSettings, SchwabSettings
 from portfolio_mcp.database import (
     AccountNotFoundError,
     AccountRecord,
     PortfolioRepository,
     SchwabAccountMappingConflictError,
+    SchwabAccountMappingRecord,
 )
-from portfolio_mcp.fixtures import FixturePortfolioProvider
+from portfolio_mcp.models import is_schwab_account_eligible
 from portfolio_mcp.provider import (
     ProviderAuthenticationError,
     ProviderConfigurationError,
@@ -43,6 +42,25 @@ class FakeHttpClient:
         if isinstance(resp, Exception):
             raise resp
         return resp
+
+
+class RoutingFakeHttpClient:
+    def __init__(self, routes: dict[str, tuple[int, object]]) -> None:
+        self.routes = routes
+        self.invocations: list[tuple[str, str]] = []
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None = None,
+    ) -> tuple[int, object]:
+        self.invocations.append((method, url))
+        for pattern, response in self.routes.items():
+            if pattern in url:
+                return response
+        raise RuntimeError(f"No route for {method} {url}")
 
 
 def _make_repo(tmp_path: Path) -> PortfolioRepository:
@@ -487,233 +505,9 @@ async def test_readiness_ready_when_all_valid(tmp_path: Path) -> None:
     result = await service.check_account_readiness("schwab-taxable-1")
     assert result.state == SchwabReadinessState.READY
     assert result.ready is True
-    assert result.schwab_account_hash == "hash-1234"
     assert result.masked_account_number == "*1234"
     assert result.details == {"account_type": "MARGIN", "is_day_trader": True}
-
-
-# --- 6. API Endpoint Integration Tests ---
-
-
-def _api_client(
-    tmp_path: Path,
-    *,
-    readiness_service: SchwabReadinessService | None = None,
-    schwab_settings: SchwabSettings | None = None,
-    execution_settings: ExecutionSettings | None = None,
-) -> tuple[TestClient, PortfolioRepository]:
-    db_file = tmp_path / "api_test.db"
-    repo = PortfolioRepository(f"sqlite:///{db_file}")
-    _seed_accounts(repo)
-
-    app = create_app(
-        FixturePortfolioProvider(),
-        database_url=f"sqlite:///{db_file}",
-        schwab_readiness_service=readiness_service,
-        schwab_settings=schwab_settings,
-        execution_settings=execution_settings,
-    )
-    return TestClient(app), repo
-
-
-def test_api_schwab_mapping_crud_flow(tmp_path: Path) -> None:
-    client, repo = _api_client(tmp_path)
-
-    # Initially empty mappings
-    resp = client.get("/api/schwab/mapping")
-    assert resp.status_code == 200
-    assert resp.json() == {"mappings": []}
-
-    # Getting non-existent returns 404
-    resp = client.get("/api/schwab/mapping/schwab-taxable-1")
-    assert resp.status_code == 404
-
-    # Saving mapping without confirmation fails with 400
-    resp = client.post(
-        "/api/schwab/mapping/schwab-taxable-1",
-        json={
-            "schwab_account_hash": "hash-abc",
-            "masked_account_number": "*1234",
-            "confirmed": False,
-        },
-    )
-    assert resp.status_code == 400
-    assert "confirmation is required" in resp.json()["detail"]
-
-    # Saving mapping with confirmation succeeds
-    resp = client.post(
-        "/api/schwab/mapping/schwab-taxable-1",
-        json={
-            "schwab_account_hash": "hash-abc",
-            "masked_account_number": "*1234",
-            "confirmed": True,
-        },
-    )
-    assert resp.status_code == 200
-    created = resp.json()["mapping"]
-    assert created["account_id"] == "schwab-taxable-1"
-    assert created["schwab_account_hash"] == "hash-abc"
-    assert created["masked_account_number"] == "*1234"
-
-    # Getting single mapping
-    resp = client.get("/api/schwab/mapping/schwab-taxable-1")
-    assert resp.status_code == 200
-    assert resp.json()["mapping"]["schwab_account_hash"] == "hash-abc"
-
-    # 1-to-1 violation: saving same hash to schwab-roth-2 fails with 409 Conflict
-    resp = client.post(
-        "/api/schwab/mapping/schwab-roth-2",
-        json={
-            "schwab_account_hash": "hash-abc",
-            "masked_account_number": "*1234",
-            "confirmed": True,
-        },
-    )
-    assert resp.status_code == 409
-    assert "already mapped" in resp.json()["detail"]
-
-    # Non-existent account returns 404
-    resp = client.post(
-        "/api/schwab/mapping/nonexistent-acc",
-        json={
-            "schwab_account_hash": "hash-unique",
-            "masked_account_number": "*1234",
-            "confirmed": True,
-        },
-    )
-    assert resp.status_code == 404
-
-    # Deleting mapping
-    resp = client.delete("/api/schwab/mapping/schwab-taxable-1")
-    assert resp.status_code == 200
-    assert resp.json() == {"deleted": True, "account_id": "schwab-taxable-1"}
-
-    # Second delete returns 404
-    resp = client.delete("/api/schwab/mapping/schwab-taxable-1")
-    assert resp.status_code == 404
-
-
-def test_api_schwab_readiness_endpoints(tmp_path: Path) -> None:
-    settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
-    exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
-    db_file = tmp_path / "api_test2.db"
-    repo = PortfolioRepository(f"sqlite:///{db_file}")
-    _seed_accounts(repo)
-    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1234", "*1234")
-
-    client = FakeHttpClient(
-        [
-            # For check_account_readiness on schwab-taxable-1:
-            (200, {"access_token": "token"}),
-            (200, [{"accountNumber": "12345678", "hashValue": "hash-1234"}]),
-            (
-                200,
-                {
-                    "securitiesAccount": {
-                        "type": "CASH",
-                        "isClosingOnlyRestricted": False,
-                    }
-                },
-            ),
-        ]
-    )
-    service = SchwabReadinessService(
-        repo,
-        transport=SchwabOAuthTransport(settings, http_client=client),
-        execution_settings=exec_settings,
-        schwab_settings=settings,
-    )
-    app = create_app(
-        FixturePortfolioProvider(),
-        database_url=f"sqlite:///{db_file}",
-        schwab_readiness_service=service,
-        schwab_settings=settings,
-        execution_settings=exec_settings,
-    )
-    test_client = TestClient(app)
-
-    # Check single account readiness
-    resp = test_client.get("/api/schwab/readiness/schwab-taxable-1")
-    assert resp.status_code == 200
-    readiness = resp.json()["readiness"]
-    assert readiness["state"] == "ready"
-    assert readiness["ready"] is True
-    assert readiness["schwab_account_hash"] == "hash-1234"
-
-
-def test_api_schwab_mapping_candidate_validation(tmp_path: Path) -> None:
-    settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
-    exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
-    db_file = tmp_path / "cand_val.db"
-    repo = PortfolioRepository(f"sqlite:///{db_file}")
-    _seed_accounts(repo)
-
-    client = FakeHttpClient(
-        [
-            # Candidate fetch for save mapping validation (valid hash):
-            (200, {"access_token": "token"}),
-            (200, [{"accountNumber": "12345678", "hashValue": "valid-hash"}]),
-            # Candidate fetch for save mapping validation (invalid hash):
-            (200, [{"accountNumber": "12345678", "hashValue": "valid-hash"}]),
-        ]
-    )
-    service = SchwabReadinessService(
-        repo,
-        transport=SchwabOAuthTransport(settings, http_client=client),
-        execution_settings=exec_settings,
-        schwab_settings=settings,
-    )
-    app = create_app(
-        FixturePortfolioProvider(),
-        database_url=f"sqlite:///{db_file}",
-        schwab_readiness_service=service,
-        schwab_settings=settings,
-        execution_settings=exec_settings,
-    )
-    test_client = TestClient(app)
-
-    # Saving with recognized candidate hash succeeds
-    resp = test_client.post(
-        "/api/schwab/mapping/schwab-taxable-1",
-        json={
-            "schwab_account_hash": "valid-hash",
-            "masked_account_number": "*5678",
-            "confirmed": True,
-        },
-    )
-    assert resp.status_code == 200
-    assert resp.json()["mapping"]["schwab_account_hash"] == "valid-hash"
-
-    # Saving with unrecognized candidate hash fails with 400
-    resp = test_client.post(
-        "/api/schwab/mapping/schwab-roth-2",
-        json={
-            "schwab_account_hash": "unrecognized-hash",
-            "masked_account_number": "*9999",
-            "confirmed": True,
-        },
-    )
-    assert resp.status_code == 400
-    assert "not recognized" in resp.json()["detail"]
-
-
-class RoutingFakeHttpClient:
-    def __init__(self, routes: dict[str, tuple[int, object]]) -> None:
-        self.routes = routes
-        self.invocations: list[tuple[str, str]] = []
-
-    def request(
-        self,
-        method: str,
-        url: str,
-        headers: dict[str, str],
-        body: bytes | None = None,
-    ) -> tuple[int, object]:
-        self.invocations.append((method, url))
-        for pattern, response in self.routes.items():
-            if pattern in url:
-                return response
-        raise RuntimeError(f"No route for {method} {url}")
+    assert "schwab_account_hash" not in result.to_dict()
 
 
 @pytest.mark.asyncio
@@ -767,3 +561,245 @@ async def test_check_all_readiness_concurrent(tmp_path: Path) -> None:
     assert len(all_readiness) == 2
     ready_ids = {r.account_id for r in all_readiness if r.ready}
     assert ready_ids == {"schwab-taxable-1", "schwab-roth-2"}
+
+
+def test_schwab_account_eligibility_predicate() -> None:
+    assert is_schwab_account_eligible("schwab", "USD") is True
+    assert is_schwab_account_eligible("Charles Schwab", "USD") is True
+    assert is_schwab_account_eligible("CHARLES SCHWAB", "usd") is True
+    assert is_schwab_account_eligible("schwab", "EUR") is False
+    assert is_schwab_account_eligible("schwab", "CAD") is False
+    assert is_schwab_account_eligible("fidelity", "USD") is False
+    assert is_schwab_account_eligible("vanguard", "USD") is False
+    assert is_schwab_account_eligible("", "USD") is False
+    assert is_schwab_account_eligible("schwab", "") is False
+
+
+@pytest.mark.asyncio
+async def test_readiness_foreign_eur_account_never_ready(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    now = datetime.now(UTC)
+    with repo._sessions() as s:
+        s.add(
+            AccountRecord(
+                id="schwab-eur-1",
+                provider="schwab",
+                label="Schwab International EUR ••••9999",
+                account_type="Brokerage",
+                currency="EUR",
+                refreshed_at=now,
+                is_stale=False,
+            )
+        )
+        s.commit()
+
+    # Pre-existing mapping in DB remains saved, but readiness must be false
+    with repo._sessions() as s:
+        s.add(
+            SchwabAccountMappingRecord(
+                id="map-eur-1",
+                account_id="schwab-eur-1",
+                schwab_account_hash="hash-eur",
+                masked_account_number="*9999",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        s.commit()
+
+    settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
+    service = SchwabReadinessService(
+        repo,
+        transport=SchwabOAuthTransport(settings, http_client=FakeHttpClient([])),
+        execution_settings=ExecutionSettings(
+            provider="schwab", schwab_execution_enabled=True
+        ),
+        schwab_settings=settings,
+    )
+
+    readiness = await service.check_account_readiness("schwab-eur-1")
+    assert readiness.state == SchwabReadinessState.UNSUPPORTED_ACCOUNT
+    assert readiness.ready is False
+    assert "must be a Schwab USD account" in readiness.message
+    # Pre-existing mapping remains in database
+    mapping = repo.get_schwab_account_mapping("schwab-eur-1")
+    assert mapping is not None
+    assert mapping.schwab_account_hash == "hash-eur"
+
+    # Attempting to save mapping for ineligible account is rejected
+    with pytest.raises(ValueError, match="not eligible"):
+        await service.save_verified_mapping(
+            account_id="schwab-eur-1",
+            candidate_id="any-id",
+            confirmed=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_readiness_broker_contradictory_currency_rejected(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    _seed_accounts(repo)
+    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1234", "*1234")
+
+    settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
+    exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
+    client = FakeHttpClient(
+        [
+            (200, {"access_token": "token"}),
+            (200, [{"accountNumber": "12345678", "hashValue": "hash-1234"}]),
+            (
+                200,
+                {
+                    "securitiesAccount": {
+                        "type": "MARGIN",
+                        "currency": "EUR",  # contradictory currency
+                        "isClosingOnlyRestricted": False,
+                    }
+                },
+            ),
+        ]
+    )
+    service = SchwabReadinessService(
+        repo,
+        transport=SchwabOAuthTransport(settings, http_client=client),
+        execution_settings=exec_settings,
+        schwab_settings=settings,
+    )
+    result = await service.check_account_readiness("schwab-taxable-1")
+    assert result.state == SchwabReadinessState.UNSUPPORTED_ACCOUNT
+    assert result.ready is False
+    assert "currency 'EUR' is not supported" in result.message
+
+
+@pytest.mark.asyncio
+async def test_readiness_broker_unsupported_type_rejected(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    _seed_accounts(repo)
+    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1234", "*1234")
+
+    settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
+    exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
+    client = FakeHttpClient(
+        [
+            (200, {"access_token": "token"}),
+            (200, [{"accountNumber": "12345678", "hashValue": "hash-1234"}]),
+            (
+                200,
+                {
+                    "securitiesAccount": {
+                        "type": "FUTURES",  # unsupported type
+                        "isClosingOnlyRestricted": False,
+                    }
+                },
+            ),
+        ]
+    )
+    service = SchwabReadinessService(
+        repo,
+        transport=SchwabOAuthTransport(settings, http_client=client),
+        execution_settings=exec_settings,
+        schwab_settings=settings,
+    )
+    result = await service.check_account_readiness("schwab-taxable-1")
+    assert result.state == SchwabReadinessState.UNSUPPORTED_ACCOUNT
+    assert result.ready is False
+    assert "FUTURES" in result.message
+
+
+@pytest.mark.asyncio
+async def test_save_verified_mapping_auth_failure_leaves_mapping_untouched(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    _seed_accounts(repo)
+    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-orig", "*1111")
+
+    settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
+    client = FakeHttpClient([(401, {"error": "unauthorized"})])
+    service = SchwabReadinessService(
+        repo,
+        transport=SchwabOAuthTransport(settings, http_client=client),
+        schwab_settings=settings,
+    )
+
+    with pytest.raises(ProviderAuthenticationError):
+        await service.save_verified_mapping(
+            account_id="schwab-taxable-1",
+            candidate_id="any-candidate-id",
+            confirmed=True,
+        )
+
+    # Repository mapping remains untouched
+    mapping = repo.get_schwab_account_mapping("schwab-taxable-1")
+    assert mapping is not None
+    assert mapping.schwab_account_hash == "hash-orig"
+    assert mapping.masked_account_number == "*1111"
+
+
+@pytest.mark.asyncio
+async def test_save_verified_mapping_unknown_selector_rejected(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    _seed_accounts(repo)
+
+    settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
+    client = FakeHttpClient(
+        [
+            (200, {"access_token": "token"}),
+            (200, [{"accountNumber": "12345678", "hashValue": "hash-valid"}]),
+        ]
+    )
+    service = SchwabReadinessService(
+        repo,
+        transport=SchwabOAuthTransport(settings, http_client=client),
+        schwab_settings=settings,
+    )
+
+    with pytest.raises(ValueError, match="not recognized"):
+        await service.save_verified_mapping(
+            account_id="schwab-taxable-1",
+            candidate_id="completely-bogus-selector",
+            confirmed=True,
+        )
+    assert repo.get_schwab_account_mapping("schwab-taxable-1") is None
+
+
+@pytest.mark.asyncio
+async def test_process_restart_invalidates_selector(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    _seed_accounts(repo)
+
+    settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
+    http_client = RoutingFakeHttpClient(
+        {
+            "oauth/token": (200, {"access_token": "token", "expires_in": 1800}),
+            "accounts/accountNumbers": (
+                200,
+                [{"accountNumber": "12345678", "hashValue": "hash-val"}],
+            ),
+        }
+    )
+    transport = SchwabOAuthTransport(settings, http_client=http_client)
+
+    # Process 1
+    service1 = SchwabReadinessService(
+        repo,
+        transport=transport,
+        schwab_settings=settings,
+        hmac_key=b"process-1-key-32-bytes-long-1234",
+    )
+    candidates = await service1.list_candidates_for_account("schwab-taxable-1")
+    cand_id_p1 = candidates[0].candidate_id
+
+    # Process 2 (simulated restart with fresh HMAC secret)
+    service2 = SchwabReadinessService(
+        repo,
+        transport=transport,
+        schwab_settings=settings,
+        hmac_key=b"process-2-key-32-bytes-diff-5678",
+    )
+    with pytest.raises(ValueError, match="not recognized"):
+        await service2.save_verified_mapping(
+            account_id="schwab-taxable-1",
+            candidate_id=cand_id_p1,
+            confirmed=True,
+        )

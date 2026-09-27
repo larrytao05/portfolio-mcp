@@ -50,10 +50,7 @@ from portfolio_mcp.provider import (
     ProviderUnavailableError,
 )
 from portfolio_mcp.refresh import PortfolioRefreshService
-from portfolio_mcp.schwab_readiness import (
-    SchwabReadinessService,
-    mask_account_number,
-)
+from portfolio_mcp.schwab_readiness import SchwabReadinessService
 from portfolio_mcp.schwab_transport import SchwabOAuthTransport
 from portfolio_mcp.trading_safety import (
     TradingGuard,
@@ -77,8 +74,7 @@ from portfolio_mcp.trading_service import (
 class SaveSchwabMappingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schwab_account_hash: str = Field(min_length=1, max_length=128)
-    masked_account_number: str = Field(min_length=1, max_length=32)
+    candidate_id: str = Field(min_length=1, max_length=128)
     confirmed: StrictBool
 
 
@@ -324,12 +320,16 @@ def create_app(
                 "account_id": account_id,
                 "candidates": [candidate.to_dict() for candidate in candidates],
             }
+        except AccountNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ProviderAuthenticationError, ProviderAuthorizationError) as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
         except ProviderUnavailableError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ProviderResponseError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/schwab/mapping/{account_id}")
     async def get_schwab_mapping(account_id: str) -> dict[str, object]:
@@ -345,54 +345,23 @@ def create_app(
     async def save_schwab_mapping(
         account_id: str, request: SaveSchwabMappingRequest
     ) -> dict[str, object]:
-        if not request.confirmed:
-            raise HTTPException(
-                status_code=400,
-                detail="Owner confirmation is required to save account mapping",
-            )
-        if not request.schwab_account_hash.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="schwab_account_hash cannot be empty",
-            )
-        if repository.stored_account(account_id) is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Account '{account_id}' does not exist",
-            )
-        if readiness_service.is_configured:
-            try:
-                candidates = await readiness_service.list_candidates_for_account(
-                    account_id
-                )
-                valid_hashes = {c.schwab_account_hash for c in candidates}
-                if request.schwab_account_hash not in valid_hashes:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            "Invalid candidate account hash; hash is not recognized "
-                            "among Schwab accounts for this owner"
-                        ),
-                    )
-            except (
-                ProviderUnavailableError,
-                ProviderResponseError,
-                ProviderAuthenticationError,
-                ProviderAuthorizationError,
-            ):
-                pass
-        masked = mask_account_number(request.masked_account_number)
         try:
-            mapping = repository.save_schwab_account_mapping(
+            mapping = await readiness_service.save_verified_mapping(
                 account_id=account_id,
-                schwab_account_hash=request.schwab_account_hash,
-                masked_account_number=masked,
+                candidate_id=request.candidate_id,
+                confirmed=request.confirmed,
             )
             return {"mapping": mapping.to_dict()}
         except AccountNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except SchwabAccountMappingConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ProviderUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ProviderResponseError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except (ProviderAuthenticationError, ProviderAuthorizationError) as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

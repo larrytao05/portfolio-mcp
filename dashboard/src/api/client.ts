@@ -138,6 +138,7 @@ export type AccountCapability = {
   blocks: CapabilityBlock[];
   is_stale: boolean;
   is_trade_capable: boolean;
+  schwab_mapping_eligible?: boolean;
 };
 
 export type TradingSettings = {
@@ -687,14 +688,13 @@ export function createCancellationMcpAuthorization(
 export type StoredSchwabAccountMapping = {
   id: string;
   account_id: string;
-  schwab_account_hash: string;
   masked_account_number: string;
   created_at: string;
   updated_at: string;
 };
 
 export type SchwabAccountCandidate = {
-  schwab_account_hash: string;
+  candidate_id: string;
   masked_account_number: string;
   is_mapped: boolean;
   mapped_to_account_id: string | null;
@@ -713,7 +713,6 @@ export type SchwabAccountReadiness = {
     | "account_unavailable"
     | "unsupported_account";
   ready: boolean;
-  schwab_account_hash: string | null;
   masked_account_number: string | null;
   message: string;
   details: Record<string, unknown>;
@@ -738,8 +737,7 @@ export function getSchwabMappingCandidates(
 export function saveSchwabMapping(
   accountId: string,
   data: {
-    schwab_account_hash: string;
-    masked_account_number: string;
+    candidate_id: string;
     confirmed: boolean;
   },
 ): Promise<{ mapping: StoredSchwabAccountMapping }> {

@@ -42,6 +42,7 @@ from portfolio_mcp.models import (
     ProviderHealth,
     ProviderHealthState,
     Transaction,
+    is_schwab_account_eligible,
 )
 from portfolio_mcp.order_history import (
     OrderAuditFilters,
@@ -570,7 +571,6 @@ class StoredSchwabAccountMapping:
         return {
             "id": self.id,
             "account_id": self.account_id,
-            "schwab_account_hash": self.schwab_account_hash,
             "masked_account_number": self.masked_account_number,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
@@ -3155,6 +3155,9 @@ class PortfolioRepository:
                 or record.observed_at is None
                 or record.observed_at < self._now() - timedelta(days=1)
             ),
+            schwab_mapping_eligible=is_schwab_account_eligible(
+                account.provider, account.currency
+            ),
         )
 
     def _unknown_capability(self, account: AccountRecord) -> AccountCapabilities:
@@ -3175,6 +3178,9 @@ class PortfolioRepository:
                 CapabilityBlock("capability_unknown", "Trading capability is unknown."),
             ),
             is_stale=True,
+            schwab_mapping_eligible=is_schwab_account_eligible(
+                account.provider, account.currency
+            ),
         )
 
     def _save_capabilities(
@@ -3739,6 +3745,11 @@ class PortfolioRepository:
             if account is None:
                 raise AccountNotFoundError(
                     f"Account '{normalized_account_id}' does not exist"
+                )
+            if not is_schwab_account_eligible(account.provider, account.currency):
+                raise ValueError(
+                    f"Account '{normalized_account_id}' is not eligible "
+                    "for Schwab mapping"
                 )
 
             existing_with_hash = session.scalar(
