@@ -2336,6 +2336,7 @@ class PortfolioRepository:
                 order_type=draft.order_type,
                 quantity=draft.quantity,
                 limit_price=draft.limit_price,
+                warnings=tuple(json.loads(draft.warnings) if draft.warnings else ()),
             ),
             created_at=record.created_at,
             updated_at=record.updated_at,
@@ -2815,6 +2816,7 @@ class StoredDraftSummary:
     order_type: str
     quantity: Decimal
     limit_price: Decimal | None
+    warnings: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -2831,6 +2833,7 @@ class StoredDraftSummary:
                     str(self.limit_price) if self.limit_price is not None else None
                 ),
             },
+            "warnings": list(self.warnings),
         }
 
 
@@ -2925,6 +2928,7 @@ class StoredOrder:
             ),
             "provider_status_label": self.provider_status_label,
             "draft": self.draft.to_dict(),
+            "warnings": list(self.draft.warnings),
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "version": self.version,
