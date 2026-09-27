@@ -569,10 +569,14 @@ export type CreateMcpAuthorizationResult = {
   };
 };
 
+export function getOrderDraft(draftId: string): Promise<{ draft: OrderDraft }> {
+  return getJson(`/api/order-drafts/${encodeURIComponent(draftId)}`);
+}
+
 export function issueMcpAuthorization(
   draftId: string,
   expectedFingerprint: string,
-  confirmed: boolean = true,
+  confirmed: boolean,
 ): Promise<CreateMcpAuthorizationResult> {
   return getJson(
     `/api/order-drafts/${encodeURIComponent(draftId)}/mcp-authorization`,
