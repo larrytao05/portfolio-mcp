@@ -578,6 +578,51 @@ describe("OrdersSection", () => {
     });
   });
 
+  it("does not display was canceled when broker rejects cancellation, keeping rejection notice and warning", async () => {
+    const cancelableOrder: StoredOrder = {
+      ...sampleOrder,
+      id: "ord-cancelable-refused",
+      can_cancel: true,
+      blocking_reason: null,
+    };
+
+    const page: OrderListPage = {
+      orders: [cancelableOrder],
+      next_cursor: null,
+      refresh_groups: [],
+      server_time: "2026-09-12T20:00:00Z",
+    };
+    api.getOrders.mockResolvedValue(page);
+
+    renderOrdersSection();
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    api.confirmOrderCancellation.mockResolvedValueOnce({
+      order: { ...cancelableOrder, state: "ACCEPTED", can_cancel: true },
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Confirm cancellation/i }),
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(
+          /Cancellation was rejected by the broker\. The order remains open and may still fill\./i,
+        ),
+      ).toBeTruthy();
+      expect(screen.queryByText(/was canceled/i)).toBeNull();
+      expect(
+        screen.getByText(/Filled shares cannot be undone/i),
+      ).toBeTruthy();
+    });
+  });
+
   it("does not render Cancel button for terminal or unknown orders", async () => {
     const terminalOrder: StoredOrder = {
       ...sampleOrder,
@@ -869,6 +914,5 @@ describe("OrdersSection", () => {
     // Check sparse order has explicit unavailable placeholders
     expect(screen.getAllByText("—").length).toBeGreaterThanOrEqual(1);
   });
->>>>>>> codex/issue-44-order-cancellation
 });
 

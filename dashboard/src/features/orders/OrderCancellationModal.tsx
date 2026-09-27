@@ -17,6 +17,17 @@ export type OrderCancellationModalProps = {
   onReconcileRequested?: (orderId: string) => void;
 };
 
+const CANCELLATION_DISPOSITION_MESSAGES: Partial<Record<string, string>> = {
+  ACCEPTED:
+    "Cancellation was rejected by the broker. The order remains open and may still fill.",
+  PARTIALLY_FILLED:
+    "Cancellation was rejected by the broker. The order remains open and may still fill.",
+  FILLED: "Order was filled and could not be canceled.",
+  EXPIRED: "Order expired and could not be canceled.",
+  CANCEL_PENDING: "Cancellation is in progress.",
+  UNKNOWN: "Cancellation outcome is unknown. Reconciliation is required.",
+};
+
 export function OrderCancellationModal({
   order,
   isOpen,
@@ -26,10 +37,7 @@ export function OrderCancellationModal({
   onReconcileRequested,
 }: OrderCancellationModalProps) {
   const [currentOrder, setCurrentOrder] = useState<StoredOrder>(order);
-  const [notice, setNotice] = useState<{
-    kind: "conflict" | "error";
-    message: string;
-  } | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const modalRef = useRef<HTMLDivElement>(null);
   const initialFocusRef = useRef<HTMLButtonElement>(null);
@@ -55,8 +63,13 @@ export function OrderCancellationModal({
     onSuccess: (data) => {
       setCurrentOrder(data.order);
       onOrderUpdated?.(data.order);
-      if (data.order.state !== "UNKNOWN") {
+      if (data.order.state === "CANCELED") {
         onSuccess(data.order);
+        return;
+      }
+      const message = CANCELLATION_DISPOSITION_MESSAGES[data.order.state];
+      if (message) {
+        setNotice(message);
       }
     },
     onError: async (error: unknown) => {
@@ -68,31 +81,27 @@ export function OrderCancellationModal({
           setCurrentOrder(fresh.order);
           onOrderUpdated?.(fresh.order);
           if (fresh.order.can_cancel) {
-            setNotice({
-              kind: "conflict",
-              message:
-                "Order state changed before cancellation could be confirmed. The details have been updated. Please review before confirming.",
-            });
+            setNotice(
+              "Order state changed before cancellation could be confirmed. The details have been updated. Please review before confirming.",
+            );
+          } else if (fresh.order.state === "UNKNOWN") {
+            setNotice(
+              "Cancellation outcome is unknown. Reconciliation is required.",
+            );
           } else {
-            setNotice({
-              kind: "conflict",
-              message: `Order can no longer be canceled (${
+            setNotice(
+              `Order can no longer be canceled (${
                 fresh.order.blocking_reason || fresh.order.state
               }).`,
-            });
+            );
           }
         } catch {
-          setNotice({
-            kind: "error",
-            message: "Order state changed, but unable to reload current state.",
-          });
+          setNotice("Order state changed, but unable to reload current state.");
         }
       } else {
-        setNotice({
-          kind: "error",
-          message:
-            error instanceof Error ? error.message : "Failed to cancel order.",
-        });
+        setNotice(
+          error instanceof Error ? error.message : "Failed to cancel order.",
+        );
       }
     },
   });
@@ -151,6 +160,12 @@ export function OrderCancellationModal({
   const remainingQty =
     currentOrder.remaining_quantity ??
     (filledQty === "0" ? totalQty : "—");
+
+  const displayNotice =
+    notice ??
+    (isUnknown
+      ? "Cancellation outcome is unknown. Reconciliation is required."
+      : null);
 
   return (
     <div
@@ -221,17 +236,14 @@ export function OrderCancellationModal({
           will only cancel the remaining unfilled shares.
         </div>
 
-        {notice && (
+        {displayNotice && (
           <p className="inline-alert" role="alert">
-            {notice.message}
+            {displayNotice}
           </p>
         )}
 
         {isUnknown ? (
           <div className="unknown-outcome-section">
-            <p className="inline-alert" role="alert">
-              Cancellation outcome is unknown. Reconciliation is required.
-            </p>
             <div className="modal-actions">
               <button
                 type="button"
