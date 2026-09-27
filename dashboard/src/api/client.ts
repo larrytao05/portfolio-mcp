@@ -273,7 +273,9 @@ async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.ok) {
     const body = await response.json().catch(() => null);
-    const message = body?.error?.message;
+    const message =
+      body?.error?.message ??
+      (typeof body?.detail === "string" ? body.detail : undefined);
     throw new Error(
       typeof message === "string"
         ? message
