@@ -10,6 +10,7 @@ from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 
 from portfolio_mcp.database import (
+    CancellationObservation,
     ConcurrentOrderUpdate,
     OrderDraft,
     PortfolioRepository,
@@ -576,6 +577,37 @@ def _draft_warnings(
     return tuple(warnings)
 
 
+def _classify_cancel_result(
+    raw: object, pending: StoredOrder
+) -> CancellationObservation:
+    if not isinstance(raw, ExecutionResult):
+        return CancellationObservation(kind="unknown")
+    if (
+        raw.broker_order_id is not None
+        and pending.broker_order_id is not None
+        and raw.broker_order_id != pending.broker_order_id
+    ):
+        return CancellationObservation(kind="unknown")
+    if raw.state == OrderState.CANCELED:
+        return CancellationObservation(
+            kind="canceled",
+            observed_order_state=OrderState.CANCELED,
+            fill=raw.fill,
+        )
+    if raw.state in {
+        OrderState.ACCEPTED,
+        OrderState.PARTIALLY_FILLED,
+        OrderState.FILLED,
+        OrderState.EXPIRED,
+    }:
+        return CancellationObservation(
+            kind="refused",
+            observed_order_state=raw.state,
+            fill=raw.fill,
+        )
+    return CancellationObservation(kind="unknown")
+
+
 class OrderCancellationService:
     def __init__(
         self,
@@ -660,98 +692,23 @@ class OrderCancellationService:
                     ),
                     timeout=10.0,
                 )
+                observation = _classify_cancel_result(result, order_pending)
             except asyncio.CancelledError:
                 self._repository.finish_order_cancellation(
                     order_id,
                     attempt_id=attempt_id,
-                    state=OrderState.UNKNOWN,
+                    observation=CancellationObservation(kind="unknown"),
                     now=_utc_now(self._clock()),
-                    outcome="unknown",
-                    result_code="unknown",
-                    result_message=(
-                        "Cancellation interrupted; outcome is unknown. "
-                        "Reconciliation required."
-                    ),
-                    result_source=OrderStatusSource.SYSTEM,
                     actor=actor,
                 )
                 raise
-            except (ExecutionIndeterminateError, asyncio.TimeoutError):
-                return self._repository.finish_order_cancellation(
-                    order_id,
-                    attempt_id=attempt_id,
-                    state=OrderState.UNKNOWN,
-                    now=_utc_now(self._clock()),
-                    outcome="unknown",
-                    result_code="unknown",
-                    result_message=(
-                        "Cancellation outcome is unknown. Reconciliation is required."
-                    ),
-                    result_source=OrderStatusSource.SYSTEM,
-                    actor=actor,
-                )
-            except Exception as error:
-                return self._repository.finish_order_cancellation(
-                    order_id,
-                    attempt_id=attempt_id,
-                    state=OrderState.UNKNOWN,
-                    now=_utc_now(self._clock()),
-                    outcome="unknown",
-                    result_code="unknown",
-                    result_message=f"Cancellation failed: {error}",
-                    result_source=OrderStatusSource.SYSTEM,
-                    actor=actor,
-                )
+            except Exception:
+                observation = CancellationObservation(kind="unknown")
 
-            observed_at = _utc_now(self._clock())
-            if not isinstance(result, ExecutionResult):
-                return self._repository.finish_order_cancellation(
-                    order_id,
-                    attempt_id=attempt_id,
-                    state=OrderState.UNKNOWN,
-                    now=observed_at,
-                    outcome="unknown",
-                    result_code="unknown",
-                    result_message="Cancellation result was malformed.",
-                    result_source=OrderStatusSource.SYSTEM,
-                    actor=actor,
-                )
-
-            if result.state == OrderState.CANCELED:
-                return self._repository.finish_order_cancellation(
-                    order_id,
-                    attempt_id=attempt_id,
-                    state=OrderState.CANCELED,
-                    now=observed_at,
-                    outcome="canceled",
-                    result_code="canceled",
-                    result_message="Order canceled successfully",
-                    result_source=OrderStatusSource.PROVIDER,
-                    fill=result.fill,
-                    actor=actor,
-                )
-            else:
-                target_state = (
-                    result.state
-                    if result.state
-                    in {
-                        OrderState.FILLED,
-                        OrderState.EXPIRED,
-                        OrderState.PARTIALLY_FILLED,
-                        OrderState.ACCEPTED,
-                    }
-                    else expected_state
-                )
-                return self._repository.finish_order_cancellation(
-                    order_id,
-                    attempt_id=attempt_id,
-                    state=target_state,
-                    now=observed_at,
-                    outcome="refused",
-                    result_code="cancel_rejected",
-                    result_message=result.message
-                    or "Cancellation was rejected by the broker.",
-                    result_source=OrderStatusSource.PROVIDER,
-                    fill=result.fill,
-                    actor=actor,
-                )
+            return self._repository.finish_order_cancellation(
+                order_id,
+                attempt_id=attempt_id,
+                observation=observation,
+                now=_utc_now(self._clock()),
+                actor=actor,
+            )
