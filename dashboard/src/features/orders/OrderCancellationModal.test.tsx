@@ -120,6 +120,152 @@ describe("OrderCancellationModal", () => {
     });
   });
 
+  it("handles refused cancellation by displaying rejection message without reporting success, preserving open-order warning", async () => {
+    vi.mocked(client.confirmOrderCancellation).mockResolvedValueOnce({
+      order: {
+        ...sampleCancelableOrder,
+        state: "ACCEPTED",
+        version: 3,
+        can_cancel: true,
+      },
+    });
+
+    const { props } = renderModal();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Confirm cancellation/i }),
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(
+          /Cancellation was rejected by the broker\. The order remains open and may still fill\./i,
+        ),
+      ).toBeTruthy();
+      expect(props.onSuccess).not.toHaveBeenCalled();
+      expect(
+        screen.getByText(/Filled shares cannot be undone/i),
+      ).toBeTruthy();
+      expect(
+        screen.getByRole("button", { name: /Confirm cancellation/i }),
+      ).toBeTruthy();
+    });
+  });
+
+  it("handles refused cancellation on PARTIALLY_FILLED order displaying rejection message without reporting success", async () => {
+    vi.mocked(client.confirmOrderCancellation).mockResolvedValueOnce({
+      order: {
+        ...sampleCancelableOrder,
+        state: "PARTIALLY_FILLED",
+        version: 3,
+        can_cancel: true,
+        fill: { quantity: "5", average_price: "220.50" },
+        remaining_quantity: "5",
+      },
+    });
+
+    const { props } = renderModal();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Confirm cancellation/i }),
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(
+          /Cancellation was rejected by the broker\. The order remains open and may still fill\./i,
+        ),
+      ).toBeTruthy();
+      expect(props.onSuccess).not.toHaveBeenCalled();
+      expect(
+        screen.getByText(/Filled shares cannot be undone/i),
+      ).toBeTruthy();
+      expect(
+        screen.getByRole("button", { name: /Confirm cancellation/i }),
+      ).toBeTruthy();
+    });
+  });
+
+  it("handles cancellation returning final observed FILLED state without reporting success", async () => {
+    vi.mocked(client.confirmOrderCancellation).mockResolvedValueOnce({
+      order: {
+        ...sampleCancelableOrder,
+        state: "FILLED",
+        version: 3,
+        can_cancel: false,
+      },
+    });
+
+    const { props } = renderModal();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Confirm cancellation/i }),
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/Order was filled and could not be canceled\./i),
+      ).toBeTruthy();
+      expect(props.onSuccess).not.toHaveBeenCalled();
+      expect(
+        screen.queryByRole("button", { name: /Confirm cancellation/i }),
+      ).toBeNull();
+      expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
+    });
+  });
+
+  it("handles cancellation returning final observed EXPIRED state without reporting success", async () => {
+    vi.mocked(client.confirmOrderCancellation).mockResolvedValueOnce({
+      order: {
+        ...sampleCancelableOrder,
+        state: "EXPIRED",
+        version: 3,
+        can_cancel: false,
+      },
+    });
+
+    const { props } = renderModal();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Confirm cancellation/i }),
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/Order expired and could not be canceled\./i),
+      ).toBeTruthy();
+      expect(props.onSuccess).not.toHaveBeenCalled();
+      expect(
+        screen.queryByRole("button", { name: /Confirm cancellation/i }),
+      ).toBeNull();
+      expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
+    });
+  });
+
+  it("handles cancellation returning CANCEL_PENDING without reporting success", async () => {
+    vi.mocked(client.confirmOrderCancellation).mockResolvedValueOnce({
+      order: {
+        ...sampleCancelableOrder,
+        state: "CANCEL_PENDING",
+        version: 3,
+        can_cancel: false,
+      },
+    });
+
+    const { props } = renderModal();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Confirm cancellation/i }),
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/Cancellation is in progress\./i),
+      ).toBeTruthy();
+      expect(props.onSuccess).not.toHaveBeenCalled();
+    });
+  });
+
   it("disables buttons while cancellation mutation is pending to prevent double-click", async () => {
     let resolvePromise: (value: client.ConfirmOrderCancellationResponse) => void;
     const pendingPromise = new Promise<client.ConfirmOrderCancellationResponse>((resolve) => {
@@ -245,6 +391,7 @@ describe("OrderCancellationModal", () => {
       expect(
         screen.getByText(/Cancellation outcome is unknown/i),
       ).toBeTruthy();
+      expect(screen.getAllByRole("alert")).toHaveLength(1);
       expect(
         screen.queryByRole("button", { name: /Confirm cancellation/i }),
       ).toBeNull();
@@ -279,6 +426,7 @@ describe("OrderCancellationModal", () => {
       expect(
         screen.getByText(/Cancellation outcome is unknown/i),
       ).toBeTruthy();
+      expect(screen.getAllByRole("alert")).toHaveLength(1);
       expect(
         screen.getByRole("button", { name: /Reconcile order/i }),
       ).toBeTruthy();

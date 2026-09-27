@@ -285,7 +285,9 @@ async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.ok) {
     const body = await response.json().catch(() => null);
-    const message = body?.error?.message;
+    const message =
+      body?.error?.message ??
+      (typeof body?.detail === "string" ? body.detail : undefined);
     const code = body?.error?.code;
     throw new ApiError(
       response.status,
@@ -434,6 +436,22 @@ export type StoredOrder = {
   version: number;
   can_cancel?: boolean;
   blocking_reason?: string | null;
+  warnings?: string[];
+  draft?: {
+    id: string;
+    created_at: string;
+    expires_at: string;
+    instruction: {
+      instrument_id: string;
+      symbol: string;
+      side: string;
+      type: string;
+      quantity: string;
+      limit_price: string | null;
+    };
+    warnings?: string[];
+  };
+
   reconciliation?: {
     status: string;
     source: string | null;
@@ -462,7 +480,7 @@ export type OrderAuditEvent = {
   draft_id: string | null;
   order_id: string | null;
   account_id: string | null;
-  event_type: string;
+  type: string;
   actor: string;
   previous_state: string | null;
   next_state: string | null;
@@ -596,10 +614,14 @@ export type CreateMcpAuthorizationResult = {
   };
 };
 
+export function getOrderDraft(draftId: string): Promise<{ draft: OrderDraft }> {
+  return getJson(`/api/order-drafts/${encodeURIComponent(draftId)}`);
+}
+
 export function issueMcpAuthorization(
   draftId: string,
   expectedFingerprint: string,
-  confirmed: boolean = true,
+  confirmed: boolean,
 ): Promise<CreateMcpAuthorizationResult> {
   return getJson(
     `/api/order-drafts/${encodeURIComponent(draftId)}/mcp-authorization`,
@@ -647,7 +669,7 @@ export function getCancellationRequest(
 export function createCancellationMcpAuthorization(
   requestId: string,
   expectedFingerprint: string,
-  confirmed: boolean = true,
+  confirmed: boolean,
 ): Promise<CreateCancellationMcpAuthorizationResult> {
   return getJson(
     `/api/cancellation-requests/${encodeURIComponent(requestId)}/mcp-authorization`,

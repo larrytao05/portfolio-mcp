@@ -12,6 +12,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from portfolio_mcp.api.app import create_app
 from portfolio_mcp.database import (
+    CancellationObservation,
+    CancellationRequestRecord,
     PortfolioRepository,
 )
 from portfolio_mcp.execution import (
@@ -642,3 +644,84 @@ async def test_new_cancellation_request_supersedes_previously_authorized_request
             account_id=req1.account_id,
             candidate_code=auth1.plaintext_code,
         )
+
+
+@pytest.mark.asyncio
+async def test_finish_order_cancellation_invalidates_active_cancellation_requests(
+    tmp_path,
+) -> None:
+    now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+    (
+        repo,
+        provider,
+        market_data,
+        draft_service,
+        mcp_auth_service,
+        execution_provider,
+        submission_service,
+        cancellation_service,
+        cancellation_request_service,
+        db_url,
+    ) = await _setup_services(tmp_path, now)
+
+    order_id = await _create_active_order(draft_service, submission_service)
+    order = repo.order(order_id)
+    assert order is not None
+
+    req = cancellation_request_service.create_request(order_id)
+    assert req.status == "pending"
+
+    # Begin cancellation claiming version and state
+    stored_order, attempt_id, started = repo.begin_order_cancellation(
+        order_id,
+        expected_version=order.version,
+        expected_state=order.state,
+        now=now,
+    )
+    assert started is True
+    assert attempt_id is not None
+
+    # First request was invalidated on begin with cancellation_started
+    reloaded_req1 = repo.get_cancellation_request(req.id)
+    assert reloaded_req1 is not None
+    assert reloaded_req1.status == "invalidated"
+    assert reloaded_req1.invalidation_reason == "cancellation_started"
+
+    # Insert a concurrent pending cancellation request to verify
+    # finish_order_cancellation
+    req2_id = "test-req-finish-cancel"
+    with repo._sessions.begin() as session:
+        session.add(
+            CancellationRequestRecord(
+                id=req2_id,
+                order_id=order_id,
+                expected_order_version=order.version,
+                expected_order_state=order.state.value,
+                account_id=order.account_id,
+                provider=order.provider,
+                symbol=order.symbol,
+                broker_order_id=order.broker_order_id,
+                remaining_quantity=order.remaining_quantity or "5",
+                action_fingerprint="fp-test",
+                created_at=now,
+                expires_at=now + timedelta(minutes=5),
+                status="pending",
+                invalidation_reason=None,
+            )
+        )
+
+    # Completing order cancellation via finish_order_cancellation
+    canceled_order = repo.finish_order_cancellation(
+        order_id,
+        attempt_id=attempt_id,
+        observation=CancellationObservation(kind="canceled"),
+        now=now,
+    )
+    assert canceled_order.state == OrderState.CANCELED
+
+    # Active request must be invalidated by finish_order_cancellation
+    # with invalidation_reason="order_canceled"
+    reloaded_req2 = repo.get_cancellation_request(req2_id)
+    assert reloaded_req2 is not None
+    assert reloaded_req2.status == "invalidated"
+    assert reloaded_req2.invalidation_reason == "order_canceled"
