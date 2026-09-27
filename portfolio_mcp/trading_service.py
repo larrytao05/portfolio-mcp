@@ -838,10 +838,10 @@ class OrderCancellationService:
                     f"cancellation_request_{req.status}",
                     f"Cancellation request is {req.status}",
                 )
-            if req.status == "executed":
+            if req.status in ("attempted", "executed"):
                 raise TradingValidationError(
                     "cancellation_request_already_consumed",
-                    "Cancellation request has already been executed",
+                    "Cancellation request has already been attempted",
                 )
             raise TradingValidationError(
                 "cancellation_request_not_authorized",
@@ -893,15 +893,15 @@ class OrderCancellationService:
                 error.code, "Authorization code is invalid or expired"
             ) from error
 
-        cancelled_order = await self.cancel(
+        self._repository.update_cancellation_request_status(req.id, status="attempted")
+
+        return await self.cancel(
             order_id=req.order_id,
             expected_version=req.expected_order_version,
             expected_state=OrderState(req.expected_order_state),
             confirmed=True,
             actor=OrderEventActor.MCP,
         )
-        self._repository.update_cancellation_request_status(req.id, status="executed")
-        return cancelled_order
 
 
 OrderCancellationRequestService = OrderCancellationService
