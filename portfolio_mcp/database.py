@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from uuid import UUID, uuid4
 
 from alembic.config import Config
@@ -563,6 +563,16 @@ class OrderReconciliationDecision:
     target_order_id: str | None
 
 
+CancellationKind = Literal["canceled", "refused", "unknown"]
+
+
+@dataclass(frozen=True)
+class CancellationObservation:
+    kind: Literal["canceled", "refused", "unknown"]
+    observed_order_state: OrderState | None = None
+    fill: FillSummary | None = None
+
+
 def _validate_fill(
     fill: FillSummary, order_quantity: Decimal, previous_quantity: Decimal | None
 ) -> None:
@@ -581,6 +591,66 @@ def _validate_fill(
         fill.average_price is not None and len(str(fill.average_price)) > 128
     ):
         raise ValueError("Order fill exceeds the supported precision")
+
+
+_CANCELLATION_METADATA: dict[
+    CancellationKind, tuple[str, str, str, OrderStatusSource]
+] = {
+    "canceled": (
+        "canceled",
+        "canceled",
+        "Order canceled successfully.",
+        OrderStatusSource.PROVIDER,
+    ),
+    "refused": (
+        "refused",
+        "cancel_rejected",
+        "Cancellation was rejected by the broker.",
+        OrderStatusSource.PROVIDER,
+    ),
+    "unknown": (
+        "unknown",
+        "unknown",
+        "Cancellation outcome is unknown. Reconciliation is required.",
+        OrderStatusSource.SYSTEM,
+    ),
+}
+
+
+def _resolve_cancellation_state(
+    record_quantity: Decimal,
+    record_filled_quantity: Decimal | None,
+    observation: CancellationObservation,
+) -> tuple[OrderState, FillSummary | None, CancellationKind]:
+    if observation.kind not in ("canceled", "refused"):
+        return OrderState.UNKNOWN, None, "unknown"
+
+    fill = observation.fill
+    if fill is not None:
+        try:
+            _validate_fill(fill, record_quantity, record_filled_quantity)
+        except ValueError:
+            return OrderState.UNKNOWN, None, "unknown"
+
+    cumulative_fill = fill.quantity if fill is not None else record_filled_quantity
+
+    if observation.kind == "canceled":
+        if cumulative_fill is not None and cumulative_fill >= record_quantity:
+            return OrderState.UNKNOWN, None, "unknown"
+        return OrderState.CANCELED, fill, "canceled"
+
+    obs_state = observation.observed_order_state
+    if obs_state == OrderState.FILLED:
+        if fill is not None and fill.quantity == record_quantity:
+            return OrderState.FILLED, fill, "refused"
+    elif obs_state == OrderState.PARTIALLY_FILLED:
+        if cumulative_fill is not None and 0 < cumulative_fill < record_quantity:
+            return OrderState.PARTIALLY_FILLED, fill, "refused"
+    elif obs_state == OrderState.ACCEPTED or obs_state == OrderState.EXPIRED:
+        if fill is None or fill.quantity < record_quantity:
+            return obs_state, fill, "refused"
+
+    return OrderState.UNKNOWN, None, "unknown"
 
 
 def _order_event_code(result_code: str | None, state: OrderState) -> OrderEventCode:
@@ -2496,6 +2566,57 @@ class PortfolioRepository:
                 ).encode("utf-8")
             ).hexdigest()
 
+            event_occurred_at = max(now, record.updated_at)
+            claim_stmt = (
+                update(OrderRecord)
+                .where(
+                    OrderRecord.id == order_id,
+                    OrderRecord.version == expected_version,
+                    OrderRecord.state == expected_state.value,
+                )
+                .values(
+                    state=OrderState.CANCEL_PENDING.value,
+                    version=OrderRecord.version + 1,
+                    updated_at=event_occurred_at,
+                )
+            )
+            claim_res = cast(CursorResult[object], session.execute(claim_stmt))
+            if claim_res.rowcount != 1:
+                session.expire_all()
+                current = session.get(OrderRecord, order_id)
+                if (
+                    current is not None
+                    and current.state == OrderState.CANCEL_PENDING.value
+                ):
+                    attempt_event = session.scalars(
+                        select(OrderEventRecord)
+                        .where(
+                            OrderEventRecord.order_id == order_id,
+                            OrderEventRecord.event_type
+                            == OrderEventType.CANCELLATION_REQUESTED.value,
+                        )
+                        .order_by(OrderEventRecord.occurred_at.desc())
+                    ).first()
+                    attempt_id = (
+                        UUID(
+                            decode_event_details(attempt_event.details_json)[
+                                "attempt_id"
+                            ]
+                        )
+                        if attempt_event is not None
+                        else uuid4()
+                    )
+                    return (
+                        self._stored_order(
+                            current, session.get(OrderDraftRecord, current.draft_id)
+                        ),
+                        attempt_id,
+                        False,
+                    )
+                raise ConcurrentOrderUpdate("Order changed before cancellation")
+
+            session.refresh(record)
+
             session.add(
                 OrderAuthorizationRecord(
                     id=str(attempt_id),
@@ -2545,11 +2666,6 @@ class PortfolioRepository:
                 deduplication_key=f"order:{record.id}:cancel:{attempt_id}:requested",
             )
 
-            previous_state = OrderState(record.state)
-            record.state = OrderState.CANCEL_PENDING.value
-            event_occurred_at = max(now, record.updated_at)
-            record.updated_at = event_occurred_at
-            record.version += 1
             self._invalidate_cancellation_requests_for_order_in_session(
                 session, record.id, "cancellation_started", event_occurred_at
             )
@@ -2558,7 +2674,7 @@ class PortfolioRepository:
             _append_status_transition_event(
                 session,
                 record=record,
-                previous_state=previous_state,
+                previous_state=expected_state,
                 next_state=OrderState.CANCEL_PENDING,
                 actor=actor,
                 occurred_at=event_occurred_at,
@@ -2572,13 +2688,8 @@ class PortfolioRepository:
         order_id: str,
         *,
         attempt_id: UUID,
-        state: OrderState,
+        observation: CancellationObservation,
         now: datetime,
-        outcome: str,
-        result_code: str,
-        result_message: str,
-        result_source: OrderStatusSource,
-        fill: FillSummary | None = None,
         actor: OrderEventActor = OrderEventActor.SYSTEM,
     ) -> "StoredOrder":
         now = require_aware_utc(now)
@@ -2591,14 +2702,36 @@ class PortfolioRepository:
             if record.state != OrderState.CANCEL_PENDING.value:
                 return self._stored_order(record, draft_record)
 
+            attempt_event = session.scalars(
+                select(OrderEventRecord)
+                .where(
+                    OrderEventRecord.order_id == order_id,
+                    OrderEventRecord.event_type
+                    == OrderEventType.CANCELLATION_REQUESTED.value,
+                )
+                .order_by(OrderEventRecord.occurred_at.desc())
+            ).first()
+            if attempt_event is not None:
+                details = decode_event_details(attempt_event.details_json)
+                active_attempt_str = details.get("attempt_id")
+                if active_attempt_str and str(attempt_id) != active_attempt_str:
+                    return self._stored_order(record, draft_record)
+
+            target_state, applied_fill, effective_kind = _resolve_cancellation_state(
+                record.quantity, record.filled_quantity, observation
+            )
+            outcome, result_code, result_message, result_source = (
+                _CANCELLATION_METADATA[effective_kind]
+            )
+
             previous_state = OrderState(record.state)
-            require_transition(previous_state, state)
+            require_transition(previous_state, target_state)
 
-            if fill is not None:
-                record.filled_quantity = fill.quantity
-                record.average_fill_price = fill.average_price
+            if applied_fill is not None:
+                record.filled_quantity = applied_fill.quantity
+                record.average_fill_price = applied_fill.average_price
 
-            record.state = state.value
+            record.state = target_state.value
             record.result_code = result_code
             record.result_message = result_message[:256]
             record.result_source = result_source.value
@@ -2619,8 +2752,8 @@ class PortfolioRepository:
                 actor=actor,
                 occurred_at=event_occurred_at,
                 previous_state=previous_state,
-                next_state=state,
-                code=_order_event_code(result_code, state),
+                next_state=target_state,
+                code=_order_event_code(result_code, target_state),
                 details={"attempt_id": str(attempt_id), "outcome": outcome},
                 deduplication_key=f"order:{record.id}:cancel:{attempt_id}:result",
             )
@@ -2629,11 +2762,11 @@ class PortfolioRepository:
                 session,
                 record=record,
                 previous_state=previous_state,
-                next_state=state,
+                next_state=target_state,
                 actor=actor,
                 occurred_at=event_occurred_at,
                 status_source=result_source,
-                fill=fill,
+                fill=applied_fill,
             )
 
             return self._stored_order(record, draft_record)
@@ -3204,6 +3337,7 @@ class PortfolioRepository:
                 order_type=draft.order_type,
                 quantity=draft.quantity,
                 limit_price=draft.limit_price,
+                warnings=tuple(json.loads(draft.warnings) if draft.warnings else ()),
             ),
             created_at=record.created_at,
             updated_at=record.updated_at,
@@ -3683,6 +3817,7 @@ class StoredDraftSummary:
     order_type: str
     quantity: Decimal
     limit_price: Decimal | None
+    warnings: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -3699,6 +3834,7 @@ class StoredDraftSummary:
                     str(self.limit_price) if self.limit_price is not None else None
                 ),
             },
+            "warnings": list(self.warnings),
         }
 
 
@@ -3825,6 +3961,7 @@ class StoredOrder:
             ),
             "provider_status_label": self.provider_status_label,
             "draft": self.draft.to_dict(),
+            "warnings": list(self.draft.warnings),
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "version": self.version,

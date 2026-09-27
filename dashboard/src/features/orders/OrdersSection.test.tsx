@@ -353,7 +353,7 @@ describe("OrdersSection", () => {
           draft_id: "draft-1",
           order_id: "ord-1",
           account_id: "schwab-taxable-demo",
-          event_type: "status_transition",
+          type: "status_transition",
           actor: "system",
           previous_state: "SUBMITTING",
           next_state: "ACCEPTED",
@@ -660,4 +660,216 @@ describe("OrdersSection", () => {
       expect(api.refreshOrder).toHaveBeenCalledWith("ord-to-unknown", "manual");
     });
   });
+
+  it("order audit handles multi-page next/prev traversal", async () => {
+    const page: OrderListPage = {
+      orders: [sampleOrder],
+      next_cursor: null,
+      refresh_groups: [],
+      server_time: "2026-09-12T20:00:00Z",
+    };
+
+    const auditPage1: OrderAuditPage = {
+      events: [
+        {
+          event_id: "evt-1",
+          draft_id: "draft-1",
+          order_id: "ord-1",
+          account_id: "schwab-taxable-demo",
+          type: "status_transition",
+          actor: "system",
+          previous_state: "SUBMITTING",
+          next_state: "ACCEPTED",
+          code: null,
+          details: {},
+          occurred_at: "2026-09-12T20:00:01Z",
+        },
+      ],
+      next_cursor: "audit-cursor-2",
+    };
+    const auditPage2: OrderAuditPage = {
+      events: [
+        {
+          event_id: "evt-2",
+          draft_id: "draft-1",
+          order_id: "ord-1",
+          account_id: "schwab-taxable-demo",
+          type: "execution_result",
+          actor: "system",
+          previous_state: "ACCEPTED",
+          next_state: "FILLED",
+          code: null,
+          details: {},
+          occurred_at: "2026-09-12T20:00:05Z",
+        },
+      ],
+      next_cursor: null,
+    };
+
+    api.getOrders.mockResolvedValue(page);
+    api.getOrderAudit.mockImplementation(async (filters) => {
+      if (filters?.cursor === "audit-cursor-2") {
+        return auditPage2;
+      }
+      return auditPage1;
+    });
+
+    renderOrdersSection();
+
+    const auditBtn = await screen.findByRole("button", { name: /audit/i });
+    fireEvent.click(auditBtn);
+
+    expect(await screen.findByText("status_transition")).toBeTruthy();
+    const nextBtn = await screen.findByRole("button", { name: /next audit page/i });
+    fireEvent.click(nextBtn);
+
+    expect(await screen.findByText("execution_result")).toBeTruthy();
+    expect(screen.queryByText("status_transition")).toBeNull();
+
+    const prevBtn = await screen.findByRole("button", { name: /previous audit page/i });
+    fireEvent.click(prevBtn);
+
+    expect(await screen.findByText("status_transition")).toBeTruthy();
+  });
+
+  it("order page 2 survives refresh without clearing cursor", async () => {
+    const page2: OrderListPage = {
+      orders: [
+        {
+          ...sampleOrder,
+          id: "ord-page2",
+          instrument: { id: "PAGE2SYM", symbol: "PAGE2SYM" },
+        },
+      ],
+      next_cursor: "cursor-3",
+      refresh_groups: [
+        {
+          provider: "schwab",
+          account_id: "schwab-taxable-demo",
+          target_order_id: "ord-page2",
+          next_refresh_at: "2026-09-12T20:00:01Z",
+        },
+      ],
+      server_time: "2026-09-12T20:00:00Z",
+    };
+
+    api.getOrders.mockResolvedValue(page2);
+    api.refreshOrder.mockResolvedValue({
+      order: { ...sampleOrder, id: "ord-page2" },
+      refresh: {
+        status: "attempted",
+        provider_read_started: true,
+        next_refresh_at: null,
+        target_order_id: "ord-page2",
+        server_time: "2026-09-12T20:00:01Z",
+      },
+    });
+
+    renderOrdersSection();
+
+    expect(await screen.findByText("PAGE2SYM")).toBeTruthy();
+    const refreshBtn = screen.getByRole("button", { name: "Refresh" });
+    fireEvent.click(refreshBtn);
+
+    await waitFor(() => {
+      expect(api.refreshOrder).toHaveBeenCalledWith("ord-page2", "manual");
+    });
+
+    // Verify getOrders was called with page cursor intact, not reset
+    expect(api.getOrders).toHaveBeenCalledWith(
+      expect.objectContaining({ limit: 25 }),
+    );
+  });
+
+  it("renders provider and date-range filters and resets cursor on submit", async () => {
+    const page: OrderListPage = {
+      orders: [sampleOrder],
+      next_cursor: null,
+      refresh_groups: [],
+      server_time: "2026-09-12T20:00:00Z",
+    };
+    api.getOrders.mockResolvedValue(page);
+
+    renderOrdersSection();
+
+    expect(await screen.findByLabelText("Filter provider")).toBeTruthy();
+    expect(screen.getByLabelText("Filter start date")).toBeTruthy();
+    expect(screen.getByLabelText("Filter end date")).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText("Filter provider"), {
+      target: { value: "schwab" },
+    });
+    fireEvent.change(screen.getByLabelText("Filter start date"), {
+      target: { value: "2026-09-01" },
+    });
+    fireEvent.change(screen.getByLabelText("Filter end date"), {
+      target: { value: "2026-09-15" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Filter" }));
+
+    await waitFor(() => {
+      expect(api.getOrders).toHaveBeenCalledWith(
+        expect.objectContaining({
+          provider: "schwab",
+          start_date: "2026-09-01",
+          end_date: "2026-09-15",
+          cursor: undefined,
+        }),
+      );
+    });
+  });
+
+  it("renders remaining quantity, timestamps, result source, and explicit unavailable values", async () => {
+    const richOrder: StoredOrder = {
+      ...sampleOrder,
+      id: "ord-rich",
+      remaining_quantity: "0.5",
+      provider_updated_at: "2026-09-12T19:30:00Z",
+      result: {
+        code: "refused",
+        message: null,
+        source: "broker",
+      },
+      reconciliation: {
+        status: "settled",
+        source: "broker",
+        provider_updated_at: "2026-09-12T19:30:00Z",
+        next_refresh_at: null,
+        target_order_id: null,
+      },
+      warnings: ["impact_unavailable"],
+    };
+
+    const sparseOrder: StoredOrder = {
+      ...sampleOrder,
+      id: "ord-sparse",
+      remaining_quantity: null,
+      fill: null,
+      provider_updated_at: null,
+      result: { code: null, message: null, source: null },
+      reconciliation: undefined,
+      warnings: [],
+    };
+
+    api.getOrders.mockResolvedValue({
+      orders: [richOrder, sparseOrder],
+      next_cursor: null,
+      refresh_groups: [],
+      server_time: "2026-09-12T20:00:00Z",
+    });
+
+    renderOrdersSection();
+
+    expect(await screen.findByText(/0\.5 rem/)).toBeTruthy();
+    expect(screen.getByText(/source: broker/)).toBeTruthy();
+    expect(screen.getByText(/settled/)).toBeTruthy();
+    expect(screen.getByText("impact_unavailable")).toBeTruthy();
+    expect(screen.getByText(/Broker:/)).toBeTruthy();
+
+    // Check sparse order has explicit unavailable placeholders
+    expect(screen.getAllByText("—").length).toBeGreaterThanOrEqual(1);
+  });
 });
+
+

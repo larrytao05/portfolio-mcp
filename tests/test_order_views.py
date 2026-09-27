@@ -76,6 +76,10 @@ def test_orders_endpoint_returns_saved_page_and_bound_cursor(tmp_path) -> None:
     assert body["next_cursor"]
     assert body["server_time"] == "2026-09-12T20:00:00+00:00"
 
+    assert "warnings" in body["orders"][0]
+    assert "warnings" in body["orders"][0]["draft"]
+    assert isinstance(body["orders"][0]["warnings"], list)
+
     next_page = client.get(
         "/api/orders",
         params={"limit": 1, "state": "ACCEPTED", "cursor": body["next_cursor"]},
