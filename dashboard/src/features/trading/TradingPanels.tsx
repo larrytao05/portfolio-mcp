@@ -224,7 +224,15 @@ export function TradeSection({ accounts }: { accounts: Account[] }) {
         </div>
       </div>
 
-      <div className="filter-bar">
+      <form
+        className="filter-bar"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (mcpDraftInput.trim()) {
+            setActiveMcpDraftId(mcpDraftInput.trim());
+          }
+        }}
+      >
         <label>
           MCP Draft ID
           <input
@@ -235,13 +243,12 @@ export function TradeSection({ accounts }: { accounts: Account[] }) {
           />
         </label>
         <button
-          type="button"
+          type="submit"
           disabled={!mcpDraftInput.trim()}
-          onClick={() => setActiveMcpDraftId(mcpDraftInput.trim())}
         >
           Review MCP draft
         </button>
-      </div>
+      </form>
 
       {activeMcpDraftId && (
         <OwnerReview
