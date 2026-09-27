@@ -13,6 +13,7 @@ import {
   type OrderDraft,
   type TradingSettings,
 } from "../../api/client";
+import { OwnerReview } from "../../components/OwnerReview";
 import { capabilityLabel } from "../../lib/capabilityLabel";
 
 export function ExecutionStatus({
@@ -163,6 +164,8 @@ export function TradeSection({ accounts }: { accounts: Account[] }) {
   const queryClient = useQueryClient();
   const [draft, setDraft] = useState<OrderDraft | null>(null);
   const [order, setOrder] = useState<Order | null>(null);
+  const [mcpDraftInput, setMcpDraftInput] = useState("");
+  const [activeMcpDraftId, setActiveMcpDraftId] = useState<string | null>(null);
   const [instrumentQuery, setInstrumentQuery] = useState("");
   const [submittedInstrumentQuery, setSubmittedInstrumentQuery] = useState<
     string | null
@@ -220,6 +223,34 @@ export function TradeSection({ accounts }: { accounts: Account[] }) {
           <p className="muted">Orders use the offline fake execution provider.</p>
         </div>
       </div>
+
+      <div className="filter-bar">
+        <label>
+          MCP Draft ID
+          <input
+            aria-label="MCP Draft ID"
+            placeholder="e.g. draft-123"
+            value={mcpDraftInput}
+            onChange={(event) => setMcpDraftInput(event.target.value)}
+          />
+        </label>
+        <button
+          type="button"
+          disabled={!mcpDraftInput.trim()}
+          onClick={() => setActiveMcpDraftId(mcpDraftInput.trim())}
+        >
+          Review MCP draft
+        </button>
+      </div>
+
+      {activeMcpDraftId && (
+        <OwnerReview
+          action="submit"
+          draftId={activeMcpDraftId}
+          onClose={() => setActiveMcpDraftId(null)}
+        />
+      )}
+
       <form className="filter-bar" onSubmit={submit}>
         <label>
           Account
