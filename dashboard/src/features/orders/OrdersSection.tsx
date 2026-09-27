@@ -3,6 +3,7 @@ import { useEffect, useState, type FormEvent } from "react";
 
 import {
   type Account,
+  type OrderListFilters,
   type StoredOrder,
   getOrderAudit,
   getOrders,
@@ -16,15 +17,15 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
   const [visibility, setVisibility] = useState(
     typeof document !== "undefined" ? document.visibilityState : "visible",
   );
-  const [accountId, setAccountId] = useState("");
-  const [stateFilter, setStateFilter] = useState("");
-  const [symbolFilter, setSymbolFilter] = useState("");
+  const [filters, setFilters] = useState<OrderListFilters>({});
   const [cursor, setCursor] = useState<string | undefined>(undefined);
   const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
   const [orderToCancel, setOrderToCancel] = useState<StoredOrder | null>(null);
   const [cancellationMessage, setCancellationMessage] = useState<string | null>(
     null,
   );
+  const [auditCursor, setAuditCursor] = useState<string | undefined>(undefined);
+  const [auditCursorHistory, setAuditCursorHistory] = useState<string[]>([]);
   const [lastRefreshMessage, setLastRefreshMessage] = useState<string | null>(
     null,
   );
@@ -44,20 +45,22 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
   const isViewActive = hash === "#orders" && visibility === "visible";
 
   const ordersQuery = useQuery({
-    queryKey: ["orders", accountId, stateFilter, symbolFilter, cursor],
+    queryKey: ["orders", filters, cursor],
     queryFn: () =>
       getOrders({
-        account_id: accountId || undefined,
-        state: stateFilter ? [stateFilter] : undefined,
-        symbol: symbolFilter || undefined,
+        ...filters,
         cursor: cursor || undefined,
         limit: 25,
       }),
   });
 
   const auditQuery = useQuery({
-    queryKey: ["order-audit", selectedOrderId],
-    queryFn: () => getOrderAudit({ order_id: selectedOrderId! }),
+    queryKey: ["order-audit", selectedOrderId, auditCursor],
+    queryFn: () =>
+      getOrderAudit({
+        order_id: selectedOrderId!,
+        cursor: auditCursor,
+      }),
     enabled: selectedOrderId !== null,
   });
 
@@ -82,7 +85,6 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
       } else {
         setLastRefreshMessage(null);
       }
-      setCursor(undefined);
       void queryClient.invalidateQueries({ queryKey: ["orders"] });
       void queryClient.invalidateQueries({ queryKey: ["order-audit"] });
     },
@@ -164,9 +166,21 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
   function submitFilters(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
-    setAccountId((data.get("account_id") as string) || "");
-    setStateFilter((data.get("state") as string) || "");
-    setSymbolFilter((data.get("symbol") as string) || "");
+    const account_id = (data.get("account_id") as string) || undefined;
+    const provider = (data.get("provider") as string) || undefined;
+    const stateVal = (data.get("state") as string) || undefined;
+    const symbol = (data.get("symbol") as string) || undefined;
+    const start_date = (data.get("start_date") as string) || undefined;
+    const end_date = (data.get("end_date") as string) || undefined;
+
+    setFilters({
+      account_id,
+      provider,
+      state: stateVal ? [stateVal] : undefined,
+      symbol,
+      start_date,
+      end_date,
+    });
     setCursor(undefined);
     setCancellationMessage(null);
   }
@@ -195,7 +209,7 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
           Account
           <select
             aria-label="Filter account"
-            defaultValue={accountId}
+            defaultValue={filters.account_id ?? ""}
             name="account_id"
           >
             <option value="">All accounts</option>
@@ -207,10 +221,20 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
           </select>
         </label>
         <label>
+          Provider
+          <input
+            aria-label="Filter provider"
+            defaultValue={filters.provider ?? ""}
+            name="provider"
+            placeholder="e.g. schwab"
+            type="text"
+          />
+        </label>
+        <label>
           State
           <select
             aria-label="Filter state"
-            defaultValue={stateFilter}
+            defaultValue={filters.state?.[0] ?? ""}
             name="state"
           >
             <option value="">All states</option>
@@ -229,10 +253,28 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
           Symbol
           <input
             aria-label="Filter symbol"
-            defaultValue={symbolFilter}
+            defaultValue={filters.symbol ?? ""}
             name="symbol"
             placeholder="e.g. VTI"
             type="text"
+          />
+        </label>
+        <label>
+          Start date
+          <input
+            aria-label="Filter start date"
+            defaultValue={filters.start_date ?? ""}
+            name="start_date"
+            type="date"
+          />
+        </label>
+        <label>
+          End date
+          <input
+            aria-label="Filter end date"
+            defaultValue={filters.end_date ?? ""}
+            name="end_date"
+            type="date"
           />
         </label>
         <button type="submit">Filter</button>
@@ -297,34 +339,82 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
                 ].includes(order.state);
                 return (
                   <tr key={order.id}>
-                    <td>{new Date(order.created_at).toLocaleString()}</td>
-                    <td>{order.account.label || order.account.id}</td>
                     <td>
-                      <strong>{order.instrument.symbol}</strong>
+                      <div>
+                        {order.created_at
+                          ? new Date(order.created_at).toLocaleString()
+                          : "—"}
+                      </div>
+                      {order.provider_updated_at && (
+                        <small className="muted">
+                          Broker:{" "}
+                          {new Date(
+                            order.provider_updated_at,
+                          ).toLocaleTimeString()}
+                        </small>
+                      )}
+                    </td>
+                    <td>{order.account?.label || order.account?.id || "—"}</td>
+                    <td>
+                      <strong>{order.instrument?.symbol || "—"}</strong>
                     </td>
                     <td>
                       <span className="badge">
-                        {order.instruction.side.toUpperCase()} {order.instruction.type.toUpperCase()}
+                        {order.instruction.side
+                          ? order.instruction.side.toUpperCase()
+                          : "—"}{" "}
+                        {order.instruction.type
+                          ? order.instruction.type.toUpperCase()
+                          : "—"}
                       </span>
                     </td>
                     <td className="numeric">
-                      {order.instruction.quantity} @{" "}
-                      {order.instruction.limit_price ? `$${order.instruction.limit_price}` : "MKT"}
+                      {order.instruction.quantity ?? "—"}
+                      {order.remaining_quantity
+                        ? ` (${order.remaining_quantity} rem)`
+                        : ""}
+                      {" @ "}
+                      {order.instruction.limit_price
+                        ? `$${order.instruction.limit_price}`
+                        : "MKT"}
                     </td>
                     <td className="numeric">
-                      {order.fill?.quantity ?? "—"}
-                      {order.fill?.average_price
-                        ? ` @ $${order.fill.average_price}`
-                        : ""}
+                      {order.fill ? (
+                        <>
+                          {order.fill.quantity ?? "—"}
+                          {order.fill.average_price
+                            ? ` @ $${order.fill.average_price}`
+                            : ""}
+                        </>
+                      ) : (
+                        "—"
+                      )}
                     </td>
                     <td>
-                      <span className={`badge state-${order.state.toLowerCase()}`}>
+                      <span
+                        className={`badge state-${order.state.toLowerCase()}`}
+                      >
                         {order.state}
                       </span>
+                      {order.warnings && order.warnings.length > 0 && (
+                        <div>
+                          {order.warnings.map((w) => (
+                            <span key={w} className="badge">
+                              {w}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </td>
                     <td>
                       <small>
-                        {order.reconciliation?.status ?? "pending"}
+                        {order.reconciliation?.status ??
+                          (order.result?.code || "—")}
+                        {order.reconciliation?.source
+                          ? ` (source: ${order.reconciliation.source})`
+                          : order.result?.source
+                            ? ` (source: ${order.result.source})`
+                            : ""}
                         {order.reconciliation?.target_order_id === order.id &&
                         order.reconciliation?.next_refresh_at
                           ? ` (Next: ${new Date(order.reconciliation.next_refresh_at).toLocaleTimeString()})`
@@ -374,7 +464,11 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
                         )}
                         <button
                           type="button"
-                          onClick={() => setSelectedOrderId(order.id)}
+                          onClick={() => {
+                            setSelectedOrderId(order.id);
+                            setAuditCursor(undefined);
+                            setAuditCursorHistory([]);
+                          }}
                         >
                           Audit
                         </button>
@@ -410,7 +504,11 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
               <h3 id="audit-heading">Order Audit: {selectedOrderId}</h3>
               <button
                 type="button"
-                onClick={() => setSelectedOrderId(null)}
+                onClick={() => {
+                  setSelectedOrderId(null);
+                  setAuditCursor(undefined);
+                  setAuditCursorHistory([]);
+                }}
                 aria-label="Close audit"
               >
                 ✕ Close audit
@@ -428,31 +526,66 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
               <p className="empty-state">No audit events found.</p>
             )}
             {auditQuery.data?.events && auditQuery.data.events.length > 0 && (
-              <ul className="audit-event-list">
-                {auditQuery.data.events.map((evt) => (
-                  <li key={evt.event_id} className="audit-event-item">
-                    <div className="audit-event-meta">
-                      <strong>{evt.event_type}</strong>
-                      <span className="muted">
-                        by {evt.actor} •{" "}
-                        {new Date(evt.occurred_at).toLocaleString()}
-                      </span>
-                    </div>
-                    {(evt.previous_state || evt.next_state) && (
-                      <p>
-                        Transition: {evt.previous_state ?? "none"} →{" "}
-                        {evt.next_state ?? "none"}
-                      </p>
-                    )}
-                    {evt.code && <p>Code: {evt.code}</p>}
-                    {Object.keys(evt.details).length > 0 && (
-                      <pre className="audit-details">
-                        {JSON.stringify(evt.details, null, 2)}
-                      </pre>
-                    )}
-                  </li>
-                ))}
-              </ul>
+              <>
+                <ul className="audit-event-list">
+                  {auditQuery.data.events.map((evt) => (
+                    <li key={evt.event_id} className="audit-event-item">
+                      <div className="audit-event-meta">
+                        <strong>{evt.type}</strong>
+                        <span className="muted">
+                          by {evt.actor} •{" "}
+                          {new Date(evt.occurred_at).toLocaleString()}
+                        </span>
+                      </div>
+                      {(evt.previous_state || evt.next_state) && (
+                        <p>
+                          Transition: {evt.previous_state ?? "none"} →{" "}
+                          {evt.next_state ?? "none"}
+                        </p>
+                      )}
+                      {evt.code && <p>Code: {evt.code}</p>}
+                      {Object.keys(evt.details).length > 0 && (
+                        <pre className="audit-details">
+                          {JSON.stringify(evt.details, null, 2)}
+                        </pre>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+                <div className="pagination">
+                  {auditCursorHistory.length > 0 && (
+                    <button
+                      type="button"
+                      aria-label="Previous audit page"
+                      onClick={() => {
+                        const historyCopy = [...auditCursorHistory];
+                        const prev = historyCopy.pop();
+                        setAuditCursorHistory(historyCopy);
+                        setAuditCursor(prev || undefined);
+                      }}
+                    >
+                      ← Previous page
+                    </button>
+                  )}
+                  {auditQuery.data?.next_cursor && (
+                    <button
+                      type="button"
+                      aria-label="Next audit page"
+                      onClick={() => {
+                        setAuditCursorHistory((prev) => [
+                          ...prev,
+                          auditCursor || "",
+                        ]);
+                        setAuditCursor(
+                          auditQuery.data?.next_cursor ?? undefined,
+                        );
+                      }}
+                    >
+                      Next page →
+                    </button>
+                  )}
+                </div>
+              </>
             )}
           </div>
         </div>

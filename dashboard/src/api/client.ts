@@ -434,6 +434,21 @@ export type StoredOrder = {
   version: number;
   can_cancel?: boolean;
   blocking_reason?: string | null;
+  warnings?: string[];
+  draft?: {
+    id: string;
+    created_at: string;
+    expires_at: string;
+    instruction: {
+      instrument_id: string;
+      symbol: string;
+      side: string;
+      type: string;
+      quantity: string;
+      limit_price: string | null;
+    };
+    warnings?: string[];
+  };
   reconciliation?: {
     status: string;
     source: string | null;
@@ -462,7 +477,7 @@ export type OrderAuditEvent = {
   draft_id: string | null;
   order_id: string | null;
   account_id: string | null;
-  event_type: string;
+  type: string;
   actor: string;
   previous_state: string | null;
   next_state: string | null;

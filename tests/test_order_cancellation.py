@@ -1,15 +1,21 @@
 import asyncio
+import json
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import cast
+from uuid import uuid4
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from portfolio_mcp.api import create_app
+from portfolio_mcp.database import CancellationObservation, PortfolioRepository
 from portfolio_mcp.execution import (
     ExecutionResult,
+    FillSummary,
     FixtureExecutionProvider,
+    OrderState,
 )
 from portfolio_mcp.fixtures import FixturePortfolioProvider
 from portfolio_mcp.trading_service import allow_fixture_submission
@@ -388,3 +394,169 @@ async def test_concurrent_cancellations_call_provider_at_most_once(tmp_path) -> 
 
     cancel_calls = [inv for inv in execution.invocations if inv[0] == "cancel"]
     assert len(cancel_calls) == 1
+
+
+def test_cancellation_returned_unknown_result_stays_unknown_and_noncancelable(
+    tmp_path,
+) -> None:
+    class UnknownReturningExecutionProvider(FixtureExecutionProvider):
+        async def cancel_order(self, broker_order_id: str) -> ExecutionResult:
+            return ExecutionResult(
+                OrderState.UNKNOWN, broker_order_id, "INTERNAL_BROKER_TEXT"
+            )
+
+    execution = UnknownReturningExecutionProvider()
+    client = _client(tmp_path, execution)
+    order = _submit_order(client)
+
+    response = client.post(
+        f"/api/orders/{order['id']}/cancel/confirm",
+        json={
+            "expected_version": order["version"],
+            "expected_state": order["state"],
+            "confirmed": True,
+        },
+    )
+    assert response.status_code == 200
+    unknown_order = response.json()["order"]
+    assert unknown_order["state"] == "UNKNOWN"
+    assert unknown_order["can_cancel"] is False
+    assert "INTERNAL_BROKER_TEXT" not in (unknown_order["result"]["message"] or "")
+
+    audit_response = client.get(f"/api/order-audit?order_id={order['id']}")
+    audit_text = json.dumps(audit_response.json())
+    assert "INTERNAL_BROKER_TEXT" not in audit_text
+
+
+def test_cancellation_bad_or_regressing_fill_commits_unknown_and_preserves_prior_fill(
+    tmp_path,
+) -> None:
+    class RegressingFillExecutionProvider(FixtureExecutionProvider):
+        def __init__(self) -> None:
+            super().__init__(scenario="partial_fill")
+
+        async def cancel_order(self, broker_order_id: str) -> ExecutionResult:
+            return ExecutionResult(
+                OrderState.CANCELED,
+                broker_order_id,
+                fill=FillSummary(Decimal("0.2"), Decimal("100")),
+            )
+
+    execution = RegressingFillExecutionProvider()
+    client = _client(tmp_path, execution)
+    order = _submit_order(client)
+    assert order["state"] == "PARTIALLY_FILLED"
+    assert cast(dict[str, object], order["fill"])["quantity"] == "0.5"
+
+    response = client.post(
+        f"/api/orders/{order['id']}/cancel/confirm",
+        json={
+            "expected_version": order["version"],
+            "expected_state": order["state"],
+            "confirmed": True,
+        },
+    )
+    assert response.status_code == 200
+    res_order = response.json()["order"]
+    assert res_order["state"] == "UNKNOWN"
+    assert res_order["can_cancel"] is False
+    # Preserves prior valid fill
+    assert res_order["fill"]["quantity"] == "0.5"
+
+
+def test_cancellation_provider_exception_text_never_leaks_to_db_or_audit(
+    tmp_path,
+) -> None:
+    class LeakyExceptionExecutionProvider(FixtureExecutionProvider):
+        async def cancel_order(self, broker_order_id: str) -> ExecutionResult:
+            raise RuntimeError("CRITICAL_BROKER_LEAK_SECRET_KEY")
+
+    execution = LeakyExceptionExecutionProvider()
+    client = _client(tmp_path, execution)
+    order = _submit_order(client)
+
+    response = client.post(
+        f"/api/orders/{order['id']}/cancel/confirm",
+        json={
+            "expected_version": order["version"],
+            "expected_state": order["state"],
+            "confirmed": True,
+        },
+    )
+    assert response.status_code == 200
+    res_order = response.json()["order"]
+    assert res_order["state"] == "UNKNOWN"
+    assert "CRITICAL_BROKER_LEAK_SECRET_KEY" not in (
+        res_order["result"]["message"] or ""
+    )
+
+    audit_response = client.get(f"/api/order-audit?order_id={order['id']}")
+    audit_text = json.dumps(audit_response.json())
+    assert "CRITICAL_BROKER_LEAK_SECRET_KEY" not in audit_text
+
+
+def test_cancellation_late_obsolete_attempt_rejected(tmp_path) -> None:
+    execution = FixtureExecutionProvider()
+    client = _client(tmp_path, execution)
+    order = _submit_order(client)
+    order_id = cast(str, order["id"])
+    version = cast(int, order["version"])
+    state = OrderState(cast(str, order["state"]))
+    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'cancellation.db'}")
+    now = datetime.now(UTC)
+    stored, attempt_id, started = repository.begin_order_cancellation(
+        order_id,
+        expected_version=version,
+        expected_state=state,
+        now=now,
+    )
+    assert started is True
+    assert attempt_id is not None
+
+    fake_attempt = uuid4()
+    res_obsolete = repository.finish_order_cancellation(
+        order_id,
+        attempt_id=fake_attempt,
+        observation=CancellationObservation(kind="canceled"),
+        now=now,
+    )
+    assert res_obsolete.state == OrderState.CANCEL_PENDING
+
+    res_legit = repository.finish_order_cancellation(
+        order_id,
+        attempt_id=attempt_id,
+        observation=CancellationObservation(kind="canceled"),
+        now=now,
+    )
+    assert res_legit.state == OrderState.CANCELED
+
+
+def test_repository_begin_order_cancellation_claim_race_safety(tmp_path) -> None:
+    execution = FixtureExecutionProvider()
+    client = _client(tmp_path, execution)
+    order = _submit_order(client)
+    order_id = cast(str, order["id"])
+    version = cast(int, order["version"])
+    state = OrderState(cast(str, order["state"]))
+    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'cancellation.db'}")
+    now = datetime.now(UTC)
+
+    stored1, attempt1, started1 = repository.begin_order_cancellation(
+        order_id,
+        expected_version=version,
+        expected_state=state,
+        now=now,
+    )
+    assert started1 is True
+    assert stored1.state == OrderState.CANCEL_PENDING
+    assert attempt1 is not None
+
+    stored2, attempt2, started2 = repository.begin_order_cancellation(
+        order_id,
+        expected_version=stored1.version,
+        expected_state=OrderState.CANCEL_PENDING,
+        now=now,
+    )
+    assert started2 is False
+    assert attempt2 == attempt1
+    assert stored2.state == OrderState.CANCEL_PENDING
