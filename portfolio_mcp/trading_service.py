@@ -867,4 +867,3 @@ class McpAuthorizationService:
             expires_at=record.expires_at,
             consumed_at=now,
         )
-
