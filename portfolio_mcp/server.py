@@ -8,6 +8,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from portfolio_mcp.database import PortfolioRepository
 from portfolio_mcp.execution import (
+    ExecutionProvider,
     FixtureExecutionProvider,
     OrderReadProvider,
     OrderState,
@@ -32,8 +33,12 @@ from portfolio_mcp.trading_safety import (
     TradingSettingsService,
 )
 from portfolio_mcp.trading_service import (
+    McpAuthorizationError,
+    McpAuthorizationService,
     OrderDraftService,
+    OrderSubmissionService,
     TradingValidationError,
+    fixture_submission_validator,
 )
 
 
@@ -41,36 +46,60 @@ def create_server(
     provider: PortfolioProvider,
     *,
     market_data_provider: MarketDataProvider | None = None,
+    execution_provider: ExecutionProvider | None = None,
     order_read_provider: OrderReadProvider | None = None,
     database_url: str = "sqlite:///portfolio.db",
     clock: Callable[[], datetime] | None = None,
     repository: PortfolioRepository | None = None,
     draft_service: OrderDraftService | None = None,
     reconciliation_service: OrderReconciliationService | None = None,
+    submission_service: OrderSubmissionService | None = None,
+    mcp_auth_service: McpAuthorizationService | None = None,
 ) -> MCPServer:
     mcp = MCPServer("portfolio-mcp")
 
     service_clock = clock or (lambda: datetime.now(UTC))
     repo = repository or PortfolioRepository(database_url, service_clock)
     market_data = market_data_provider or FixtureMarketDataProvider()
+    settings_service = TradingSettingsService(repo, service_clock)
+    trading_guard = TradingGuard(repo, settings_service)
 
     active_draft_service = draft_service
     if active_draft_service is None:
-        settings_service = TradingSettingsService(repo, service_clock)
-        trading_guard = TradingGuard(repo, settings_service)
         active_draft_service = OrderDraftService(
             repo, market_data, service_clock, trading_guard
         )
 
-    order_reader = (
-        order_read_provider
-        if order_read_provider is not None
+    execution = (
+        execution_provider
+        if execution_provider is not None
         else FixtureExecutionProvider(clock=service_clock)
     )
+
+    order_reader = order_read_provider
+    if order_reader is None and isinstance(execution, FixtureExecutionProvider):
+        order_reader = execution
 
     reconciliation = reconciliation_service
     if reconciliation is None and order_reader is not None:
         reconciliation = OrderReconciliationService(repo, order_reader, service_clock)
+
+    active_mcp_auth = (
+        mcp_auth_service
+        if mcp_auth_service is not None
+        else McpAuthorizationService(repo, clock=service_clock)
+    )
+
+    active_submission_service = submission_service
+    if active_submission_service is None:
+        active_submission_service = OrderSubmissionService(
+            repository=repo,
+            execution_provider=execution,
+            clock=service_clock,
+            validator=fixture_submission_validator(provider),
+            trading_guard=trading_guard,
+            mcp_auth_service=active_mcp_auth,
+        )
 
     @mcp.tool()
     async def list_accounts() -> dict[str, list[dict[str, str]]]:
@@ -239,6 +268,28 @@ def create_server(
         if order is None:
             raise ToolError(f"order_not_found: Order '{order_id}' not found")
         return {"order": order.to_dict()}
+
+    @mcp.tool()
+    async def submit_authorized_order(draft_id: str, code: str) -> dict[str, object]:
+        """Submit an order draft using a one-time authorization code.
+
+        Consumes the one-time code and submits the exact reviewed draft to the broker
+        if all safety and risk checks pass. Re-evaluates capabilities, quotes, and
+        trading safeguards immediately before execution.
+        """
+        if not draft_id or not draft_id.strip():
+            raise ToolError("invalid_draft_id: Draft ID is required")
+        if not code or not code.strip():
+            raise ToolError("invalid_code: Authorization code is required")
+        try:
+            order = await active_submission_service.submit_authorized(
+                draft_id.strip(), code.strip()
+            )
+            return {"order": order.to_dict()}
+        except TradingValidationError as error:
+            raise ToolError(f"{error.code}: {error}") from error
+        except McpAuthorizationError as error:
+            raise ToolError(f"{error.code}: {error}") from error
 
     return mcp
 

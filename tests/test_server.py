@@ -30,6 +30,7 @@ EXPECTED_TOOLS = [
     "get_order_draft",
     "list_orders",
     "get_order",
+    "submit_authorized_order",
 ]
 
 
@@ -392,20 +393,23 @@ async def test_mcp_security_boundary_no_forbidden_tools() -> None:
         response = await session.list_tools()
 
     tool_names = [tool.name for tool in response.tools]
+    assert "submit_authorized_order" in tool_names
 
-    forbidden_keywords = [
+    forbidden_tool_patterns = [
         "settings",
         "limit",
         "kill_switch",
-        "code",
-        "auth",
-        "cancel",  # Cancellation via MCP is in #51 with one-time codes
-        "submit",  # Submission via MCP is in #55 with one-time codes
+        "create_code",
+        "issue_code",
+        "get_code",
+        "list_codes",
+        "create_auth",
+        "cancel",
     ]
     for name in tool_names:
-        for keyword in forbidden_keywords:
-            assert keyword not in name.lower(), (
-                f"Tool '{name}' violates security boundary by including '{keyword}'"
+        for pattern in forbidden_tool_patterns:
+            assert pattern not in name.lower(), (
+                f"Tool '{name}' violates security boundary by including '{pattern}'"
             )
 
 
