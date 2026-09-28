@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import weakref
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 
 from portfolio_mcp.database import (
+    CancellationObservation,
     ConcurrentOrderUpdate,
     OrderDraft,
     PortfolioRepository,
@@ -573,3 +575,140 @@ def _draft_warnings(
     if order_type == "market":
         return tuple(warning for warning in warnings if warning != "quote_unavailable")
     return tuple(warnings)
+
+
+def _classify_cancel_result(
+    raw: object, pending: StoredOrder
+) -> CancellationObservation:
+    if not isinstance(raw, ExecutionResult):
+        return CancellationObservation(kind="unknown")
+    if (
+        raw.broker_order_id is not None
+        and pending.broker_order_id is not None
+        and raw.broker_order_id != pending.broker_order_id
+    ):
+        return CancellationObservation(kind="unknown")
+    if raw.state == OrderState.CANCELED:
+        return CancellationObservation(
+            kind="canceled",
+            observed_order_state=OrderState.CANCELED,
+            fill=raw.fill,
+        )
+    if raw.state in {
+        OrderState.ACCEPTED,
+        OrderState.PARTIALLY_FILLED,
+        OrderState.FILLED,
+        OrderState.EXPIRED,
+    }:
+        return CancellationObservation(
+            kind="refused",
+            observed_order_state=raw.state,
+            fill=raw.fill,
+        )
+    return CancellationObservation(kind="unknown")
+
+
+class OrderCancellationService:
+    def __init__(
+        self,
+        repository: PortfolioRepository,
+        execution_provider: ExecutionProvider,
+        clock: Callable[[], datetime],
+    ) -> None:
+        self._repository = repository
+        self._execution_provider = execution_provider
+        self._clock = clock
+        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
+
+    def _lock_for(self, order_id: str) -> asyncio.Lock:
+        lock = self._locks.get(order_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[order_id] = lock
+        return lock
+
+    async def cancel(
+        self,
+        *,
+        order_id: str,
+        expected_version: int,
+        expected_state: OrderState,
+        confirmed: bool,
+        actor: OrderEventActor = OrderEventActor.DASHBOARD,
+    ) -> StoredOrder:
+        if not confirmed:
+            raise TradingValidationError(
+                "confirmation_required", "Order cancellation confirmation is required"
+            )
+        order = self._repository.order(order_id)
+        if order is None:
+            raise TradingValidationError("order_not_found", "Order not found")
+
+        try:
+            capability = await self._execution_provider.get_execution_capability(
+                order.account_id
+            )
+        except Exception as error:
+            raise TradingValidationError(
+                "capability_unavailable", "Trading capability is unavailable"
+            ) from error
+        if (
+            not _capability_is_well_formed(capability, order.account_id)
+            or not capability.permits_cancellation
+        ):
+            raise TradingValidationError(
+                "execution_unsupported", "This account cannot cancel orders"
+            )
+
+        async with self._lock_for(order_id):
+            now = _utc_now(self._clock())
+            try:
+                order_pending, attempt_id, started = (
+                    self._repository.begin_order_cancellation(
+                        order_id,
+                        expected_version=expected_version,
+                        expected_state=expected_state,
+                        now=now,
+                        actor=actor,
+                    )
+                )
+            except ConcurrentOrderUpdate:
+                raise TradingValidationError(
+                    "order_conflict", "Order changed before cancellation"
+                )
+            except ValueError as error:
+                raise TradingValidationError("order_not_cancelable", str(error))
+
+            if not started or attempt_id is None:
+                return order_pending
+
+            assert order_pending.broker_order_id is not None
+            try:
+                result = await asyncio.wait_for(
+                    self._execution_provider.cancel_order(
+                        order_pending.broker_order_id
+                    ),
+                    timeout=10.0,
+                )
+                observation = _classify_cancel_result(result, order_pending)
+            except asyncio.CancelledError:
+                self._repository.finish_order_cancellation(
+                    order_id,
+                    attempt_id=attempt_id,
+                    observation=CancellationObservation(kind="unknown"),
+                    now=_utc_now(self._clock()),
+                    actor=actor,
+                )
+                raise
+            except Exception:
+                observation = CancellationObservation(kind="unknown")
+
+            return self._repository.finish_order_cancellation(
+                order_id,
+                attempt_id=attempt_id,
+                observation=observation,
+                now=_utc_now(self._clock()),
+                actor=actor,
+            )

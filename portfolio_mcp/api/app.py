@@ -7,7 +7,7 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from portfolio_mcp.database import CorruptedAuditRecordError, PortfolioRepository
 from portfolio_mcp.execution import (
@@ -41,6 +41,7 @@ from portfolio_mcp.trading_safety import (
     settings_dict,
 )
 from portfolio_mcp.trading_service import (
+    OrderCancellationService,
     OrderDraftService,
     OrderSubmissionService,
     SubmissionValidator,
@@ -60,6 +61,14 @@ class CreateOrderDraftRequest(BaseModel):
 
 class ConfirmOrderDraftRequest(BaseModel):
     expected_fingerprint: str
+    confirmed: bool
+
+
+class ConfirmOrderCancellationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(ge=1)
+    expected_state: OrderState
     confirmed: bool
 
 
@@ -106,6 +115,9 @@ def create_app(
     )
     submission_service = OrderSubmissionService(
         repository, execution, service_clock, validator, trading_guard
+    )
+    cancellation_service = OrderCancellationService(
+        repository, execution, service_clock
     )
     order_reader = order_read_provider
     if order_reader is None and type(execution) is FixtureExecutionProvider:
@@ -443,6 +455,18 @@ def create_app(
             },
         }
 
+    @app.post("/api/orders/{order_id}/cancel/confirm")
+    async def confirm_order_cancellation(
+        order_id: str, request: ConfirmOrderCancellationRequest
+    ) -> dict[str, object]:
+        order = await cancellation_service.cancel(
+            order_id=order_id,
+            expected_version=request.expected_version,
+            expected_state=request.expected_state,
+            confirmed=request.confirmed,
+        )
+        return {"order": order.to_dict()}
+
     @app.get("/api/orders/{order_id}")
     async def get_order(order_id: str) -> dict[str, object]:
         order = repository.order(order_id)
@@ -475,8 +499,15 @@ def create_app(
     async def trading_validation_error(
         _: Request, error: TradingValidationError
     ) -> JSONResponse:
+        status_code = (
+            404
+            if error.code == "order_not_found"
+            else 409
+            if error.code in {"order_conflict", "stale_version"}
+            else 422
+        )
         return JSONResponse(
-            status_code=422,
+            status_code=status_code,
             content={"error": {"code": error.code, "message": str(error)}},
         )
 
