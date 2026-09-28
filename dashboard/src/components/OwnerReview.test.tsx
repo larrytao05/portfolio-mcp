@@ -1,4 +1,5 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { OwnerReview } from "./OwnerReview";
@@ -84,7 +85,7 @@ describe("OwnerReview", () => {
   it("loads saved draft with GET and does not issue a code on load", async () => {
     vi.mocked(client.getOrderDraft).mockResolvedValueOnce({ draft: sampleDraft });
 
-    render(<OwnerReview action="submit" draftId="draft-mcp-1" />);
+    render(<OwnerReview action="submit" draftId="draft-mcp-1" onClose={vi.fn()} />);
 
     expect(screen.getByText(/Loading review details…/i)).toBeTruthy();
 
@@ -102,7 +103,7 @@ describe("OwnerReview", () => {
   it("disables Issue code button until confirmation checkbox is checked", async () => {
     vi.mocked(client.getOrderDraft).mockResolvedValueOnce({ draft: sampleDraft });
 
-    render(<OwnerReview action="submit" draftId="draft-mcp-1" />);
+    render(<OwnerReview action="submit" draftId="draft-mcp-1" onClose={vi.fn()} />);
 
     await waitFor(() => {
       expect(screen.getByText("fp-sample-123")).toBeTruthy();
@@ -136,7 +137,7 @@ describe("OwnerReview", () => {
       },
     });
 
-    render(<OwnerReview action="submit" draftId="draft-mcp-1" />);
+    render(<OwnerReview action="submit" draftId="draft-mcp-1" onClose={vi.fn()} />);
 
     await waitFor(() => {
       expect(screen.getByText("fp-sample-123")).toBeTruthy();
@@ -167,7 +168,7 @@ describe("OwnerReview", () => {
       new Error("Order draft not found"),
     );
 
-    render(<OwnerReview action="submit" draftId="draft-missing" />);
+    render(<OwnerReview action="submit" draftId="draft-missing" onClose={vi.fn()} />);
 
     await waitFor(() => {
       expect(screen.getByRole("alert")).toBeTruthy();
@@ -181,7 +182,7 @@ describe("OwnerReview", () => {
       new Error("Order draft has expired"),
     );
 
-    render(<OwnerReview action="submit" draftId="draft-mcp-1" />);
+    render(<OwnerReview action="submit" draftId="draft-mcp-1" onClose={vi.fn()} />);
 
     await waitFor(() => {
       expect(screen.getByText("fp-sample-123")).toBeTruthy();
@@ -206,7 +207,7 @@ describe("OwnerReview", () => {
       cancellation_request: sampleCancellationRequest,
     });
 
-    render(<OwnerReview action="cancel" requestId="cancel-req-1" />);
+    render(<OwnerReview action="cancel" requestId="cancel-req-1" onClose={vi.fn()} />);
 
     expect(screen.getByText(/Loading review details…/i)).toBeTruthy();
 
@@ -228,7 +229,7 @@ describe("OwnerReview", () => {
       cancellation_request: sampleCancellationRequest,
     });
 
-    render(<OwnerReview action="cancel" requestId="cancel-req-1" />);
+    render(<OwnerReview action="cancel" requestId="cancel-req-1" onClose={vi.fn()} />);
 
     await waitFor(() => {
       expect(screen.getByText("fp-cancel-456")).toBeTruthy();
@@ -259,7 +260,7 @@ describe("OwnerReview", () => {
       },
     });
 
-    render(<OwnerReview action="cancel" requestId="cancel-req-1" />);
+    render(<OwnerReview action="cancel" requestId="cancel-req-1" onClose={vi.fn()} />);
 
     await waitFor(() => {
       expect(screen.getByText("fp-cancel-456")).toBeTruthy();
@@ -299,7 +300,7 @@ describe("OwnerReview", () => {
       },
     });
 
-    render(<OwnerReview action="cancel" requestId="cancel-req-1" />);
+    render(<OwnerReview action="cancel" requestId="cancel-req-1" onClose={vi.fn()} />);
 
     await waitFor(() => {
       expect(screen.getByRole("alert")).toBeTruthy();
@@ -310,5 +311,226 @@ describe("OwnerReview", () => {
 
     expect(screen.queryByRole("checkbox")).toBeNull();
     expect(screen.queryByRole("button", { name: "Issue code" })).toBeNull();
+  });
+
+  it("does not display an old cancellation code after the target changes", async () => {
+    let resolveIssue!: (
+      result: Awaited<
+        ReturnType<typeof client.createCancellationMcpAuthorization>
+      >,
+    ) => void;
+    vi.mocked(client.getCancellationRequest).mockImplementation(async (id) => ({
+      cancellation_request: {
+        ...sampleCancellationRequest,
+        id,
+        fingerprint: `${id}-fingerprint`,
+      },
+    }));
+    vi.mocked(client.createCancellationMcpAuthorization).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveIssue = resolve;
+        }),
+    );
+
+    const view = render(
+      <OwnerReview
+        action="cancel"
+        requestId="cancel-one"
+        onClose={vi.fn()}
+      />,
+    );
+    await screen.findByText("cancel-one-fingerprint");
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: /I confirm this cancellation request/i,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Issue code" }));
+    await waitFor(() => {
+      expect(client.createCancellationMcpAuthorization).toHaveBeenCalledWith(
+        "cancel-one",
+        "cancel-one-fingerprint",
+        true,
+      );
+    });
+
+    view.rerender(
+      <OwnerReview
+        action="cancel"
+        requestId="cancel-two"
+        onClose={vi.fn()}
+      />,
+    );
+    await screen.findByText("cancel-two-fingerprint");
+
+    await act(async () => {
+      resolveIssue({
+        authorization_id: "auth-one",
+        code: "87654321",
+        expires_at: "2026-09-25T20:05:00Z",
+        cancellation_request: {
+          ...sampleCancellationRequest,
+          id: "cancel-one",
+          status: "authorized",
+        },
+      });
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText("87654321")).toBeNull();
+    expect(screen.getByText("cancel-two-fingerprint")).toBeTruthy();
+  });
+
+  it("closes the cancellation review and clears its code on hash navigation", async () => {
+    vi.mocked(client.getCancellationRequest).mockResolvedValueOnce({
+      cancellation_request: sampleCancellationRequest,
+    });
+    vi.mocked(client.createCancellationMcpAuthorization).mockResolvedValueOnce({
+      authorization_id: "auth-nav",
+      code: "12345678",
+      expires_at: "2026-09-25T20:05:00Z",
+      cancellation_request: {
+        ...sampleCancellationRequest,
+        status: "authorized",
+      },
+    });
+
+    function ReviewHost() {
+      const [open, setOpen] = useState(true);
+      return open ? (
+        <OwnerReview
+          action="cancel"
+          requestId={sampleCancellationRequest.id}
+          onClose={() => setOpen(false)}
+        />
+      ) : (
+        <p>Review closed</p>
+      );
+    }
+
+    render(<ReviewHost />);
+    await screen.findByText(sampleCancellationRequest.fingerprint);
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: /I confirm this cancellation request/i,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Issue code" }));
+    await screen.findByText("12345678");
+
+    act(() => window.dispatchEvent(new Event("hashchange")));
+
+    expect(await screen.findByText("Review closed")).toBeTruthy();
+    expect(screen.queryByText("12345678")).toBeNull();
+  });
+
+  it("does not show an issued code after the reviewed target changes", async () => {
+    let resolveIssue!: (
+      result: Awaited<ReturnType<typeof client.issueMcpAuthorization>>,
+    ) => void;
+    vi.mocked(client.getOrderDraft).mockImplementation(async (draftId) => ({
+      draft: {
+        ...sampleDraft,
+        id: draftId,
+        fingerprint: `${draftId}-fingerprint`,
+      },
+    }));
+    vi.mocked(client.issueMcpAuthorization).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveIssue = resolve;
+        }),
+    );
+
+    const view = render(
+      <OwnerReview action="submit" draftId="draft-one" onClose={vi.fn()} />,
+    );
+    await screen.findByText("draft-one-fingerprint");
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: /I confirm this order instruction/i,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Issue code" }));
+    await waitFor(() => {
+      expect(client.issueMcpAuthorization).toHaveBeenCalledWith(
+        "draft-one",
+        "draft-one-fingerprint",
+        true,
+      );
+    });
+
+    view.rerender(
+      <OwnerReview action="submit" draftId="draft-two" onClose={vi.fn()} />,
+    );
+    await screen.findByText("draft-two-fingerprint");
+
+    await act(async () => {
+      resolveIssue({
+        authorization_id: "auth-one",
+        code: "87654321",
+        expires_at: "2026-09-25T20:05:00Z",
+        draft: {
+          id: "draft-one",
+          symbol: "VTI",
+          side: "buy",
+          quantity: "5",
+          order_type: "limit",
+          limit_price: "220.00",
+          fingerprint: "draft-one-fingerprint",
+        },
+      });
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText("87654321")).toBeNull();
+    expect(screen.getByText("draft-two-fingerprint")).toBeTruthy();
+  });
+
+  it("closes and clears a displayed code after hash navigation", async () => {
+    vi.mocked(client.getOrderDraft).mockResolvedValueOnce({ draft: sampleDraft });
+    vi.mocked(client.issueMcpAuthorization).mockResolvedValueOnce({
+      authorization_id: "auth-nav",
+      code: "12345678",
+      expires_at: "2026-09-25T20:05:00Z",
+      draft: {
+        id: sampleDraft.id,
+        symbol: "VTI",
+        side: "buy",
+        quantity: "5",
+        order_type: "limit",
+        limit_price: "220.00",
+        fingerprint: sampleDraft.fingerprint,
+      },
+    });
+
+    function ReviewHost() {
+      const [open, setOpen] = useState(true);
+      return open ? (
+        <OwnerReview
+          action="submit"
+          draftId={sampleDraft.id}
+          onClose={() => setOpen(false)}
+        />
+      ) : (
+        <p>Review closed</p>
+      );
+    }
+
+    render(<ReviewHost />);
+    await screen.findByText(sampleDraft.fingerprint);
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: /I confirm this order instruction/i,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Issue code" }));
+    await screen.findByText("12345678");
+
+    act(() => window.dispatchEvent(new Event("hashchange")));
+
+    expect(await screen.findByText("Review closed")).toBeTruthy();
+    expect(screen.queryByText("12345678")).toBeNull();
   });
 });

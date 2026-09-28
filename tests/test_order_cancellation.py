@@ -347,6 +347,100 @@ def test_cancellation_partially_filled_order_preserves_fills(tmp_path) -> None:
     assert canceled_fill["average_price"] == "100"
 
 
+def test_accepted_cancellation_refusal_with_known_fill_becomes_unknown(
+    tmp_path,
+) -> None:
+    class AcceptedWithoutFillExecutionProvider(FixtureExecutionProvider):
+        def __init__(self) -> None:
+            super().__init__(scenario="partial_fill")
+
+        async def cancel_order(self, broker_order_id: str) -> ExecutionResult:
+            return ExecutionResult(OrderState.ACCEPTED, broker_order_id)
+
+    client = _client(tmp_path, AcceptedWithoutFillExecutionProvider())
+    order = _submit_order(client)
+    assert order["state"] == "PARTIALLY_FILLED"
+    assert cast(dict[str, object], order["fill"])["quantity"] == "0.5"
+
+    response = client.post(
+        f"/api/orders/{order['id']}/cancel/confirm",
+        json={
+            "expected_version": order["version"],
+            "expected_state": order["state"],
+            "confirmed": True,
+        },
+    )
+
+    assert response.status_code == 200
+    updated_order = response.json()["order"]
+    assert updated_order["state"] == "UNKNOWN"
+    assert updated_order["can_cancel"] is False
+    assert cast(dict[str, object], updated_order["fill"])["quantity"] == "0.5"
+
+
+def test_accepted_cancellation_refusal_preserves_new_valid_fill(tmp_path) -> None:
+    class AcceptedWithFillExecutionProvider(FixtureExecutionProvider):
+        async def cancel_order(self, broker_order_id: str) -> ExecutionResult:
+            return ExecutionResult(
+                OrderState.ACCEPTED,
+                broker_order_id,
+                fill=FillSummary(Decimal("0.5"), Decimal("100")),
+            )
+
+    client = _client(tmp_path, AcceptedWithFillExecutionProvider())
+    order = _submit_order(client)
+    assert order["state"] == "ACCEPTED"
+
+    response = client.post(
+        f"/api/orders/{order['id']}/cancel/confirm",
+        json={
+            "expected_version": order["version"],
+            "expected_state": order["state"],
+            "confirmed": True,
+        },
+    )
+
+    assert response.status_code == 200
+    updated_order = response.json()["order"]
+    assert updated_order["state"] == "UNKNOWN"
+    assert updated_order["can_cancel"] is False
+    fill = cast(dict[str, object], updated_order["fill"])
+    assert fill["quantity"] == "0.5"
+    assert fill["average_price"] == "100"
+
+
+def test_canceled_result_with_full_fill_becomes_unknown_and_keeps_fill(
+    tmp_path,
+) -> None:
+    class CanceledWithFullFillExecutionProvider(FixtureExecutionProvider):
+        async def cancel_order(self, broker_order_id: str) -> ExecutionResult:
+            return ExecutionResult(
+                OrderState.CANCELED,
+                broker_order_id,
+                fill=FillSummary(Decimal("1"), Decimal("100")),
+            )
+
+    client = _client(tmp_path, CanceledWithFullFillExecutionProvider())
+    order = _submit_order(client)
+
+    response = client.post(
+        f"/api/orders/{order['id']}/cancel/confirm",
+        json={
+            "expected_version": order["version"],
+            "expected_state": order["state"],
+            "confirmed": True,
+        },
+    )
+
+    assert response.status_code == 200
+    updated_order = response.json()["order"]
+    assert updated_order["state"] == "UNKNOWN"
+    assert updated_order["can_cancel"] is False
+    fill = cast(dict[str, object], updated_order["fill"])
+    assert fill["quantity"] == "1"
+    assert fill["average_price"] == "100"
+
+
 @pytest.mark.asyncio
 async def test_concurrent_cancellations_call_provider_at_most_once(tmp_path) -> None:
     class SlowExecutionProvider(FixtureExecutionProvider):
