@@ -424,4 +424,113 @@ describe("OwnerReview", () => {
     expect(await screen.findByText("Review closed")).toBeTruthy();
     expect(screen.queryByText("12345678")).toBeNull();
   });
+
+  it("does not show an issued code after the reviewed target changes", async () => {
+    let resolveIssue!: (
+      result: Awaited<ReturnType<typeof client.issueMcpAuthorization>>,
+    ) => void;
+    vi.mocked(client.getOrderDraft).mockImplementation(async (draftId) => ({
+      draft: {
+        ...sampleDraft,
+        id: draftId,
+        fingerprint: `${draftId}-fingerprint`,
+      },
+    }));
+    vi.mocked(client.issueMcpAuthorization).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveIssue = resolve;
+        }),
+    );
+
+    const view = render(
+      <OwnerReview action="submit" draftId="draft-one" onClose={vi.fn()} />,
+    );
+    await screen.findByText("draft-one-fingerprint");
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: /I confirm this order instruction/i,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Issue code" }));
+    await waitFor(() => {
+      expect(client.issueMcpAuthorization).toHaveBeenCalledWith(
+        "draft-one",
+        "draft-one-fingerprint",
+        true,
+      );
+    });
+
+    view.rerender(
+      <OwnerReview action="submit" draftId="draft-two" onClose={vi.fn()} />,
+    );
+    await screen.findByText("draft-two-fingerprint");
+
+    await act(async () => {
+      resolveIssue({
+        authorization_id: "auth-one",
+        code: "87654321",
+        expires_at: "2026-09-25T20:05:00Z",
+        draft: {
+          id: "draft-one",
+          symbol: "VTI",
+          side: "buy",
+          quantity: "5",
+          order_type: "limit",
+          limit_price: "220.00",
+          fingerprint: "draft-one-fingerprint",
+        },
+      });
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText("87654321")).toBeNull();
+    expect(screen.getByText("draft-two-fingerprint")).toBeTruthy();
+  });
+
+  it("closes and clears a displayed code after hash navigation", async () => {
+    vi.mocked(client.getOrderDraft).mockResolvedValueOnce({ draft: sampleDraft });
+    vi.mocked(client.issueMcpAuthorization).mockResolvedValueOnce({
+      authorization_id: "auth-nav",
+      code: "12345678",
+      expires_at: "2026-09-25T20:05:00Z",
+      draft: {
+        id: sampleDraft.id,
+        symbol: "VTI",
+        side: "buy",
+        quantity: "5",
+        order_type: "limit",
+        limit_price: "220.00",
+        fingerprint: sampleDraft.fingerprint,
+      },
+    });
+
+    function ReviewHost() {
+      const [open, setOpen] = useState(true);
+      return open ? (
+        <OwnerReview
+          action="submit"
+          draftId={sampleDraft.id}
+          onClose={() => setOpen(false)}
+        />
+      ) : (
+        <p>Review closed</p>
+      );
+    }
+
+    render(<ReviewHost />);
+    await screen.findByText(sampleDraft.fingerprint);
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: /I confirm this order instruction/i,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Issue code" }));
+    await screen.findByText("12345678");
+
+    act(() => window.dispatchEvent(new Event("hashchange")));
+
+    expect(await screen.findByText("Review closed")).toBeTruthy();
+    expect(screen.queryByText("12345678")).toBeNull();
+  });
 });
