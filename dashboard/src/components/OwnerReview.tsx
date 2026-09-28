@@ -121,12 +121,6 @@ function OwnerReviewSession(props: OwnerReviewProps) {
   }, [onClose]);
 
   useEffect(() => {
-    const closeOnNavigation = () => onClose();
-    window.addEventListener("hashchange", closeOnNavigation);
-    return () => window.removeEventListener("hashchange", closeOnNavigation);
-  }, [onClose]);
-
-  useEffect(() => {
     let active = true;
     setLoading(true);
     setError(null);

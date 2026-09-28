@@ -489,6 +489,7 @@ describe("OwnerReview", () => {
   });
 
   it("closes and clears a displayed code after hash navigation", async () => {
+    const onClose = vi.fn();
     vi.mocked(client.getOrderDraft).mockResolvedValueOnce({ draft: sampleDraft });
     vi.mocked(client.issueMcpAuthorization).mockResolvedValueOnce({
       authorization_id: "auth-nav",
@@ -511,7 +512,10 @@ describe("OwnerReview", () => {
         <OwnerReview
           action="submit"
           draftId={sampleDraft.id}
-          onClose={() => setOpen(false)}
+          onClose={() => {
+            onClose();
+            setOpen(false);
+          }}
         />
       ) : (
         <p>Review closed</p>
@@ -532,5 +536,6 @@ describe("OwnerReview", () => {
 
     expect(await screen.findByText("Review closed")).toBeTruthy();
     expect(screen.queryByText("12345678")).toBeNull();
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });
