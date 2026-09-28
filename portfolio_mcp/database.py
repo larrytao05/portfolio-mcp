@@ -509,7 +509,7 @@ def _resolve_cancellation_state(
 
     if observation.kind == "canceled":
         if cumulative_fill is not None and cumulative_fill >= record_quantity:
-            return OrderState.UNKNOWN, None, "unknown"
+            return OrderState.UNKNOWN, fill, "unknown"
         return OrderState.CANCELED, fill, "canceled"
 
     obs_state = observation.observed_order_state
@@ -519,11 +519,14 @@ def _resolve_cancellation_state(
     elif obs_state == OrderState.PARTIALLY_FILLED:
         if cumulative_fill is not None and 0 < cumulative_fill < record_quantity:
             return OrderState.PARTIALLY_FILLED, fill, "refused"
-    elif obs_state == OrderState.ACCEPTED or obs_state == OrderState.EXPIRED:
+    elif obs_state == OrderState.ACCEPTED:
+        if cumulative_fill in (None, 0):
+            return OrderState.ACCEPTED, fill, "refused"
+    elif obs_state == OrderState.EXPIRED:
         if fill is None or fill.quantity < record_quantity:
-            return obs_state, fill, "refused"
+            return OrderState.EXPIRED, fill, "refused"
 
-    return OrderState.UNKNOWN, None, "unknown"
+    return OrderState.UNKNOWN, fill, "unknown"
 
 
 def _order_event_code(result_code: str | None, state: OrderState) -> OrderEventCode:
