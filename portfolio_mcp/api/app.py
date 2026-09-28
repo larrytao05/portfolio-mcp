@@ -45,6 +45,7 @@ from portfolio_mcp.trading_safety import (
 from portfolio_mcp.trading_service import (
     McpAuthorizationError,
     McpAuthorizationService,
+    OrderCancellationRequestService,
     OrderCancellationService,
     OrderDraftService,
     OrderSubmissionService,
@@ -52,6 +53,11 @@ from portfolio_mcp.trading_service import (
     TradingValidationError,
     fixture_submission_validator,
 )
+
+
+class CreateCancellationMcpAuthorizationRequest(BaseModel):
+    expected_fingerprint: str
+    confirmed: StrictBool
 
 
 class CreateOrderDraftRequest(BaseModel):
@@ -106,6 +112,8 @@ def create_app(
     clock: Callable[[], datetime] | None = None,
     draft_service: OrderDraftService | None = None,
     submission_service: OrderSubmissionService | None = None,
+    cancellation_service: OrderCancellationService | None = None,
+    cancellation_request_service: OrderCancellationRequestService | None = None,
     mcp_auth_service: McpAuthorizationService | None = None,
 ) -> FastAPI:
     service_clock = clock or (lambda: datetime.now(UTC))
@@ -146,8 +154,15 @@ def create_app(
             mcp_auth_service=active_mcp_auth,
         )
     )
-    cancellation_service = OrderCancellationService(
-        repository, execution, service_clock
+    active_cancellation_service = (
+        cancellation_service
+        if cancellation_service is not None
+        else OrderCancellationService(repository, execution, service_clock)
+    )
+    active_cancellation_request_service = (
+        cancellation_request_service
+        if cancellation_request_service is not None
+        else OrderCancellationRequestService(repository, execution, service_clock)
     )
     order_reader = order_read_provider
     if order_reader is None and type(execution) is FixtureExecutionProvider:
@@ -351,6 +366,43 @@ def create_app(
             },
         }
 
+    @app.get("/api/cancellation-requests/{request_id}")
+    async def get_cancellation_request(request_id: str) -> dict[str, object]:
+        req = active_cancellation_request_service.get_request(request_id)
+        if req is None:
+            raise HTTPException(
+                status_code=404, detail="Cancellation request not found"
+            )
+        return {"cancellation_request": req.to_dict()}
+
+    @app.post("/api/cancellation-requests/{request_id}/mcp-authorization")
+    async def create_cancellation_mcp_authorization(
+        request_id: str, request: CreateCancellationMcpAuthorizationRequest
+    ) -> dict[str, object]:
+        if not request.confirmed:
+            raise HTTPException(
+                status_code=422,
+                detail="Explicit confirmation is required",
+            )
+        try:
+            stored_req, created = active_mcp_auth.authorize_cancellation_request(
+                request_id=request_id,
+                expected_fingerprint=request.expected_fingerprint,
+                now=service_clock(),
+            )
+            return {
+                "authorization_id": created.id,
+                "code": created.plaintext_code,
+                "expires_at": created.expires_at.isoformat(),
+                "cancellation_request": stored_req.to_dict(),
+            }
+        except McpAuthorizationError as error:
+            if error.code == "cancellation_request_not_found":
+                raise HTTPException(
+                    status_code=404, detail="Cancellation request not found"
+                )
+            raise HTTPException(status_code=409, detail=error.message)
+
     @app.get("/api/orders")
     async def list_orders(
         account_id: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
@@ -501,7 +553,7 @@ def create_app(
     async def confirm_order_cancellation(
         order_id: str, request: ConfirmOrderCancellationRequest
     ) -> dict[str, object]:
-        order = await cancellation_service.cancel(
+        order = await active_cancellation_service.cancel(
             order_id=order_id,
             expected_version=request.expected_version,
             expected_state=request.expected_state,

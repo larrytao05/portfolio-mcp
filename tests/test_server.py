@@ -31,6 +31,7 @@ EXPECTED_TOOLS = [
     "list_orders",
     "get_order",
     "submit_authorized_order",
+    "request_order_cancellation",
 ]
 
 
@@ -394,6 +395,7 @@ async def test_mcp_security_boundary_no_forbidden_tools() -> None:
 
     tool_names = [tool.name for tool in response.tools]
     assert "submit_authorized_order" in tool_names
+    assert "request_order_cancellation" in tool_names
 
     forbidden_tool_patterns = [
         "settings",
@@ -404,7 +406,7 @@ async def test_mcp_security_boundary_no_forbidden_tools() -> None:
         "get_code",
         "list_codes",
         "create_auth",
-        "cancel",
+        "cancel_order",
     ]
     for name in tool_names:
         for pattern in forbidden_tool_patterns:

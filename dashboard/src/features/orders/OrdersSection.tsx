@@ -9,6 +9,8 @@ import {
   getOrders,
   refreshOrder,
 } from "../../api/client";
+import { OrderCancellationModal } from "./OrderCancellationModal";
+import { OwnerReview } from "../../components/OwnerReview";
 
 export function OrdersSection({ accounts }: { accounts: Account[] }) {
   const queryClient = useQueryClient();
@@ -22,9 +24,17 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
   ]);
   const cursor = cursorHistory[cursorHistory.length - 1];
   const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
+  const [orderToCancel, setOrderToCancel] = useState<StoredOrder | null>(null);
+  const [cancellationMessage, setCancellationMessage] = useState<string | null>(
+    null,
+  );
   const [auditCursor, setAuditCursor] = useState<string | undefined>(undefined);
   const [auditCursorHistory, setAuditCursorHistory] = useState<string[]>([]);
   const [lastRefreshMessage, setLastRefreshMessage] = useState<string | null>(
+    null,
+  );
+  const [mcpCancelInput, setMcpCancelInput] = useState("");
+  const [activeMcpCancelId, setActiveMcpCancelId] = useState<string | null>(
     null,
   );
 
@@ -180,6 +190,7 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
       end_date,
     });
     setCursorHistory([undefined]);
+    setCancellationMessage(null);
   }
 
   const offPageGroup = ordersQuery.data?.refresh_groups.find(
@@ -200,6 +211,37 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
         </div>
         <span className="muted">Saved orders and lifecycle audit</span>
       </div>
+
+      <form
+        className="filter-bar"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (mcpCancelInput.trim()) {
+            setActiveMcpCancelId(mcpCancelInput.trim());
+          }
+        }}
+      >
+        <label>
+          MCP Cancellation Request ID
+          <input
+            aria-label="MCP Cancellation Request ID"
+            placeholder="e.g. cancel-req-123"
+            value={mcpCancelInput}
+            onChange={(e) => setMcpCancelInput(e.target.value)}
+          />
+        </label>
+        <button type="submit" disabled={!mcpCancelInput.trim()}>
+          Review MCP Cancellation
+        </button>
+      </form>
+
+      {activeMcpCancelId && (
+        <OwnerReview
+          action="cancel"
+          requestId={activeMcpCancelId}
+          onClose={() => setActiveMcpCancelId(null)}
+        />
+      )}
 
       <form className="filter-bar" onSubmit={submitFilters}>
         <label>
@@ -277,6 +319,11 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
         <button type="submit">Filter</button>
       </form>
 
+      {cancellationMessage && (
+        <p className="inline-alert" role="status">
+          {cancellationMessage}
+        </p>
+      )}
       {lastRefreshMessage && (
         <p className="inline-alert" role="status">
           {lastRefreshMessage}
@@ -415,6 +462,17 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
                     </td>
                     <td>
                       <div className="compact-controls">
+                        {order.can_cancel && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setCancellationMessage(null);
+                              setOrderToCancel(order);
+                            }}
+                          >
+                            Cancel
+                          </button>
+                        )}
                         {isUnknown && (
                           <button
                             type="button"
@@ -593,6 +651,29 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
             )}
           </div>
         </div>
+      )}
+
+      {orderToCancel && (
+        <OrderCancellationModal
+          order={orderToCancel}
+          isOpen={true}
+          onClose={() => setOrderToCancel(null)}
+          onOrderUpdated={() => {
+            void queryClient.invalidateQueries({ queryKey: ["orders"] });
+            void queryClient.invalidateQueries({ queryKey: ["order-audit"] });
+          }}
+          onSuccess={(canceledOrder) => {
+            setOrderToCancel(null);
+            setCancellationMessage(
+              `Order ${canceledOrder.id} (${canceledOrder.instrument.symbol}) was canceled.`,
+            );
+            void queryClient.invalidateQueries({ queryKey: ["orders"] });
+            void queryClient.invalidateQueries({ queryKey: ["order-audit"] });
+          }}
+          onReconcileRequested={(orderId) => {
+            mutateRefresh({ orderId, mode: "manual" });
+          }}
+        />
       )}
     </section>
   );
