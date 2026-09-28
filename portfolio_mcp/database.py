@@ -43,6 +43,7 @@ from portfolio_mcp.models import (
     ProviderHealthState,
     Transaction,
     is_schwab_account_eligible,
+    is_schwab_account_masked,
 )
 from portfolio_mcp.order_history import (
     OrderAuditFilters,
@@ -3739,6 +3740,10 @@ class PortfolioRepository:
                 "account_id, schwab_account_hash, and masked_account_number "
                 "must not be empty"
             )
+        if not is_schwab_account_masked(normalized_masked):
+            raise ValueError(
+                "masked account number must use the canonical *dddd format"
+            )
 
         with self._sessions() as session:
             account = session.get(AccountRecord, normalized_account_id)
@@ -3842,7 +3847,9 @@ class PortfolioRepository:
             id=record.id,
             account_id=record.account_id,
             schwab_account_hash=record.schwab_account_hash,
-            masked_account_number=record.masked_account_number,
+            masked_account_number=record.masked_account_number
+            if is_schwab_account_masked(record.masked_account_number)
+            else "Unavailable",
             created_at=record.created_at,
             updated_at=record.updated_at,
         )

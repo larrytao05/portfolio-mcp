@@ -46,6 +46,7 @@ from portfolio_mcp.provider import (
     ProviderAuthenticationError,
     ProviderAuthorizationError,
     ProviderError,
+    ProviderRateLimitError,
     ProviderResponseError,
     ProviderUnavailableError,
 )
@@ -76,6 +77,26 @@ class SaveSchwabMappingRequest(BaseModel):
 
     candidate_id: str = Field(min_length=1, max_length=128)
     confirmed: StrictBool
+
+
+def _schwab_mapping_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, AccountNotFoundError):
+        return HTTPException(status_code=404, detail="Portfolio account was not found")
+    if isinstance(exc, SchwabAccountMappingConflictError):
+        return HTTPException(status_code=409, detail="Schwab account is already mapped")
+    if isinstance(exc, (ProviderAuthenticationError, ProviderAuthorizationError)):
+        return HTTPException(status_code=403, detail="Schwab access is not authorized")
+    if isinstance(exc, ProviderRateLimitError):
+        return HTTPException(status_code=429, detail="Schwab rate limit reached")
+    if isinstance(exc, ProviderUnavailableError):
+        return HTTPException(status_code=503, detail="Schwab service is unavailable")
+    if isinstance(exc, ProviderResponseError):
+        return HTTPException(
+            status_code=502, detail="Schwab returned an invalid response"
+        )
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=400, detail="Invalid Schwab mapping request")
+    return HTTPException(status_code=500, detail="Unable to process Schwab mapping")
 
 
 class CreateCancellationMcpAuthorizationRequest(BaseModel):
@@ -320,16 +341,8 @@ def create_app(
                 "account_id": account_id,
                 "candidates": [candidate.to_dict() for candidate in candidates],
             }
-        except AccountNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except (ProviderAuthenticationError, ProviderAuthorizationError) as exc:
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
-        except ProviderUnavailableError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-        except ProviderResponseError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise _schwab_mapping_error(exc) from exc
 
     @app.get("/api/schwab/mapping/{account_id}")
     async def get_schwab_mapping(account_id: str) -> dict[str, object]:
@@ -337,7 +350,7 @@ def create_app(
         if mapping is None:
             raise HTTPException(
                 status_code=404,
-                detail=f"No Schwab mapping for account '{account_id}'",
+                detail="No Schwab mapping exists for this portfolio account",
             )
         return {"mapping": mapping.to_dict()}
 
@@ -352,18 +365,8 @@ def create_app(
                 confirmed=request.confirmed,
             )
             return {"mapping": mapping.to_dict()}
-        except AccountNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except SchwabAccountMappingConflictError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except ProviderUnavailableError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-        except ProviderResponseError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        except (ProviderAuthenticationError, ProviderAuthorizationError) as exc:
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise _schwab_mapping_error(exc) from exc
 
     @app.delete("/api/schwab/mapping/{account_id}")
     async def delete_schwab_mapping(account_id: str) -> dict[str, object]:
@@ -371,7 +374,7 @@ def create_app(
         if not deleted:
             raise HTTPException(
                 status_code=404,
-                detail=f"No Schwab mapping for account '{account_id}'",
+                detail="No Schwab mapping exists for this portfolio account",
             )
         return {"deleted": True, "account_id": account_id}
 

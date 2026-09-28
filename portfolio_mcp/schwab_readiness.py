@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import re
 import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -13,7 +14,11 @@ from portfolio_mcp.database import (
     PortfolioRepository,
     StoredSchwabAccountMapping,
 )
-from portfolio_mcp.models import Account, is_schwab_account_eligible
+from portfolio_mcp.models import (
+    Account,
+    is_schwab_account_eligible,
+    is_schwab_account_masked,
+)
 from portfolio_mcp.provider import (
     ProviderAuthenticationError,
     ProviderAuthorizationError,
@@ -26,6 +31,7 @@ from portfolio_mcp.schwab_transport import (
 )
 
 _PROCESS_HMAC_KEY: bytes = secrets.token_bytes(32)
+_SCHWAB_ACCOUNT_NUMBER = re.compile(r"[0-9]{5,}\Z")
 
 
 class SchwabReadinessState(StrEnum):
@@ -85,8 +91,9 @@ def extract_last_four(account_number_str: str) -> str:
 
 
 def mask_account_number(account_number_str: str) -> str:
-    suffix = extract_last_four(account_number_str)
-    return f"*{suffix}" if suffix else account_number_str
+    if _SCHWAB_ACCOUNT_NUMBER.fullmatch(account_number_str) is None:
+        return "Unavailable"
+    return f"*{account_number_str[-4:]}"
 
 
 class SchwabReadinessService:
@@ -155,10 +162,16 @@ class SchwabReadinessService:
         for item in body:
             if not isinstance(item, Mapping):
                 continue
-            raw_acc = str(item.get("accountNumber") or "").strip()
-            hash_val = str(item.get("hashValue") or "").strip()
-            if not raw_acc or not hash_val:
+            raw_acc = item.get("accountNumber")
+            hash_val = item.get("hashValue")
+            if (
+                not isinstance(raw_acc, str)
+                or _SCHWAB_ACCOUNT_NUMBER.fullmatch(raw_acc) is None
+                or not isinstance(hash_val, str)
+                or not hash_val.strip()
+            ):
                 continue
+            hash_val = hash_val.strip()
 
             # Strip full account number immediately to masked suffix
             suffix = extract_last_four(raw_acc)
@@ -230,6 +243,11 @@ class SchwabReadinessService:
 
         mapping = self._repository.get_schwab_account_mapping(account_id)
 
+        if mapping is not None and not is_schwab_account_masked(
+            mapping.masked_account_number
+        ):
+            mapping = None
+
         if not self.mapping_eligible(account_detail.account):
             return SchwabAccountReadiness(
                 account_id=account_id,
@@ -294,23 +312,32 @@ class SchwabReadinessService:
         assert self._transport is not None
         try:
             await self._transport.access_token()
-        except ProviderAuthenticationError as exc:
+        except ProviderAuthenticationError:
             return SchwabAccountReadiness(
                 account_id=account_id,
                 state=SchwabReadinessState.AUTH_FAILED,
                 ready=False,
                 schwab_account_hash=mapping.schwab_account_hash,
                 masked_account_number=mapping.masked_account_number,
-                message=f"Schwab authentication failed: {exc}",
+                message="Schwab authentication failed",
             )
-        except (ProviderUnavailableError, ProviderResponseError) as exc:
+        except (ProviderUnavailableError, ProviderResponseError):
             return SchwabAccountReadiness(
                 account_id=account_id,
                 state=SchwabReadinessState.ACCOUNT_UNAVAILABLE,
                 ready=False,
                 schwab_account_hash=mapping.schwab_account_hash,
                 masked_account_number=mapping.masked_account_number,
-                message=f"Schwab service is unavailable: {exc}",
+                message="Schwab service is unavailable",
+            )
+        except Exception:
+            return SchwabAccountReadiness(
+                account_id=account_id,
+                state=SchwabReadinessState.ACCOUNT_UNAVAILABLE,
+                ready=False,
+                schwab_account_hash=mapping.schwab_account_hash,
+                masked_account_number=mapping.masked_account_number,
+                message="Schwab service is unavailable",
             )
 
         # 6. Check entitlement and account list
@@ -330,23 +357,23 @@ class SchwabReadinessService:
                     "Schwab Accounts and Trading product is not authorized or entitled"
                 ),
             )
-        except ProviderAuthenticationError as exc:
+        except ProviderAuthenticationError:
             return SchwabAccountReadiness(
                 account_id=account_id,
                 state=SchwabReadinessState.AUTH_FAILED,
                 ready=False,
                 schwab_account_hash=mapping.schwab_account_hash,
                 masked_account_number=mapping.masked_account_number,
-                message=f"Schwab authentication failed: {exc}",
+                message="Schwab authentication failed",
             )
-        except Exception as exc:
+        except Exception:
             return SchwabAccountReadiness(
                 account_id=account_id,
                 state=SchwabReadinessState.ACCOUNT_UNAVAILABLE,
                 ready=False,
                 schwab_account_hash=mapping.schwab_account_hash,
                 masked_account_number=mapping.masked_account_number,
-                message=f"Failed to fetch Schwab account numbers: {exc}",
+                message="Failed to fetch Schwab account numbers",
             )
 
         if not isinstance(body, list):
@@ -403,14 +430,14 @@ class SchwabReadinessService:
                 masked_account_number=mapping.masked_account_number,
                 message="Schwab account detail access is not authorized",
             )
-        except Exception as exc:
+        except Exception:
             return SchwabAccountReadiness(
                 account_id=account_id,
                 state=SchwabReadinessState.ACCOUNT_UNAVAILABLE,
                 ready=False,
                 schwab_account_hash=mapping.schwab_account_hash,
                 masked_account_number=mapping.masked_account_number,
-                message=f"Failed to read Schwab account detail: {exc}",
+                message="Failed to read Schwab account detail",
             )
 
         if not isinstance(detail_body, Mapping):
@@ -434,7 +461,7 @@ class SchwabReadinessService:
                 message="Schwab account details missing securitiesAccount",
             )
 
-        if sec_account.get("isClosingOnlyRestricted") is True:
+        if sec_account.get("isClosingOnlyRestricted") is not False:
             return SchwabAccountReadiness(
                 account_id=account_id,
                 state=SchwabReadinessState.UNSUPPORTED_ACCOUNT,
@@ -446,8 +473,8 @@ class SchwabReadinessService:
 
         broker_currency = sec_account.get("currency")
         if (
-            broker_currency is not None
-            and str(broker_currency).strip().upper() != "USD"
+            not isinstance(broker_currency, str)
+            or broker_currency.strip().upper() != "USD"
         ):
             return SchwabAccountReadiness(
                 account_id=account_id,
@@ -455,13 +482,13 @@ class SchwabReadinessService:
                 ready=False,
                 schwab_account_hash=mapping.schwab_account_hash,
                 masked_account_number=mapping.masked_account_number,
-                message=(
-                    f"Schwab account currency '{broker_currency}' "
-                    "is not supported (USD required)"
-                ),
+                message="Schwab account currency is unsupported (USD required)",
             )
 
-        account_type = str(sec_account.get("type") or "").upper()
+        raw_account_type = sec_account.get("type")
+        account_type = (
+            raw_account_type.upper() if isinstance(raw_account_type, str) else ""
+        )
         if account_type not in ("MARGIN", "CASH", "INDIVIDUAL"):
             return SchwabAccountReadiness(
                 account_id=account_id,
@@ -469,10 +496,18 @@ class SchwabReadinessService:
                 ready=False,
                 schwab_account_hash=mapping.schwab_account_hash,
                 masked_account_number=mapping.masked_account_number,
-                message=(
-                    f"Schwab account type '{account_type}' is "
-                    "not supported for execution"
-                ),
+                message="Schwab account type is not supported for execution",
+            )
+
+        is_day_trader = sec_account.get("isDayTrader")
+        if not isinstance(is_day_trader, bool):
+            return SchwabAccountReadiness(
+                account_id=account_id,
+                state=SchwabReadinessState.UNSUPPORTED_ACCOUNT,
+                ready=False,
+                schwab_account_hash=mapping.schwab_account_hash,
+                masked_account_number=mapping.masked_account_number,
+                message="Schwab account details are incomplete",
             )
 
         return SchwabAccountReadiness(
@@ -484,7 +519,7 @@ class SchwabReadinessService:
             message="Schwab execution is ready for this account",
             details={
                 "account_type": account_type,
-                "is_day_trader": bool(sec_account.get("isDayTrader", False)),
+                "is_day_trader": is_day_trader,
             },
         )
 

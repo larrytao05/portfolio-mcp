@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 
 from portfolio_mcp.config import ExecutionSettings, SchwabSettings
 from portfolio_mcp.database import (
@@ -277,6 +278,295 @@ def test_repository_schwab_mapping_crud_and_uniqueness(tmp_path: Path) -> None:
     assert repo.delete_schwab_account_mapping("schwab-taxable-1") is False
 
 
+@pytest.mark.parametrize(
+    "masked", ["1234", "x1234", "*123", "*１２３４", "*12345", "Unavailable"]
+)
+def test_repository_rejects_noncanonical_schwab_account_masks(
+    tmp_path: Path, masked: str
+) -> None:
+    repo = _make_repo(tmp_path)
+    _seed_accounts(repo)
+
+    with pytest.raises(ValueError, match="masked account number"):
+        repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1", masked)
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        {
+            "type": "MARGIN",
+            "currency": "USD",
+            "isClosingOnlyRestricted": None,
+            "isDayTrader": False,
+        },
+        {
+            "type": "MARGIN",
+            "currency": "USD",
+            "isClosingOnlyRestricted": "false",
+            "isDayTrader": False,
+        },
+        {"type": "MARGIN", "isClosingOnlyRestricted": False, "isDayTrader": False},
+        {
+            "type": "MARGIN",
+            "currency": 1,
+            "isClosingOnlyRestricted": False,
+            "isDayTrader": False,
+        },
+        {
+            "type": "MARGIN",
+            "currency": "USD",
+            "isClosingOnlyRestricted": False,
+            "isDayTrader": "false",
+        },
+        {
+            "type": 1,
+            "currency": "USD",
+            "isClosingOnlyRestricted": False,
+            "isDayTrader": False,
+        },
+    ],
+)
+@pytest.mark.asyncio
+async def test_readiness_fails_closed_on_malformed_broker_details(
+    tmp_path: Path, details: dict[str, object]
+) -> None:
+    repo = _make_repo(tmp_path)
+    _seed_accounts(repo)
+    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1234", "*1234")
+    settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
+    client = FakeHttpClient(
+        [
+            (200, {"access_token": "token"}),
+            (200, [{"accountNumber": "12345678", "hashValue": "hash-1234"}]),
+            (200, {"securitiesAccount": details}),
+        ]
+    )
+    service = SchwabReadinessService(
+        repo,
+        transport=SchwabOAuthTransport(settings, http_client=client),
+        execution_settings=ExecutionSettings(
+            provider="schwab", schwab_execution_enabled=True
+        ),
+        schwab_settings=settings,
+    )
+
+    result = await service.check_account_readiness("schwab-taxable-1")
+
+    assert result.state == SchwabReadinessState.UNSUPPORTED_ACCOUNT
+    assert result.ready is False
+
+
+@pytest.mark.asyncio
+async def test_candidates_skip_malformed_account_numbers(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    _seed_accounts(repo)
+    settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
+    client = FakeHttpClient(
+        [
+            (200, {"access_token": "token"}),
+            (
+                200,
+                [
+                    {"accountNumber": "1234", "hashValue": "short"},
+                    {"accountNumber": "ABCDEFGH", "hashValue": "letters"},
+                    {"accountNumber": 12345678, "hashValue": "number"},
+                    {"accountNumber": "１２３４５６７８", "hashValue": "unicode"},
+                    {"accountNumber": "87654321", "hashValue": 1234},
+                    {"accountNumber": "87654321", "hashValue": "   "},
+                    {"accountNumber": "12345678", "hashValue": "valid"},
+                ],
+            ),
+        ]
+    )
+    service = SchwabReadinessService(
+        repo,
+        transport=SchwabOAuthTransport(settings, http_client=client),
+        schwab_settings=settings,
+    )
+
+    candidates = await service.list_candidates_for_account("schwab-taxable-1")
+
+    assert [candidate.masked_account_number for candidate in candidates] == ["*5678"]
+
+
+@pytest.mark.parametrize(
+    "failure_stage", ["token", "account_numbers", "account_detail"]
+)
+@pytest.mark.asyncio
+async def test_readiness_does_not_expose_provider_exception_text(
+    tmp_path: Path, failure_stage: str
+) -> None:
+    repo = _make_repo(tmp_path)
+    _seed_accounts(repo)
+    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1234", "*1234")
+    settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
+    provider_secret = "private-provider-payload-marker"
+    responses: list[tuple[int, object] | Exception] = []
+    responses.append(
+        RuntimeError(provider_secret)
+        if failure_stage == "token"
+        else (200, {"access_token": "token"})
+    )
+    if failure_stage != "token":
+        responses.append(
+            RuntimeError(provider_secret)
+            if failure_stage == "account_numbers"
+            else (200, [{"accountNumber": "12345678", "hashValue": "hash-1234"}])
+        )
+    if failure_stage == "account_detail":
+        responses.append(RuntimeError(provider_secret))
+    service = SchwabReadinessService(
+        repo,
+        transport=SchwabOAuthTransport(settings, http_client=FakeHttpClient(responses)),
+        execution_settings=ExecutionSettings(
+            provider="schwab", schwab_execution_enabled=True
+        ),
+        schwab_settings=settings,
+    )
+
+    result = await service.check_account_readiness("schwab-taxable-1")
+
+    assert provider_secret not in str(result.to_dict())
+    assert result.ready is False
+
+
+def test_legacy_schwab_mapping_mask_is_unavailable_and_not_ready(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    _seed_accounts(repo)
+    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1234", "*1234")
+    with repo._sessions() as session:
+        record = session.scalar(
+            select(SchwabAccountMappingRecord).where(
+                SchwabAccountMappingRecord.account_id == "schwab-taxable-1"
+            )
+        )
+        assert record is not None
+        record.masked_account_number = "123456789012"
+        session.commit()
+
+    mapping = repo.get_schwab_account_mapping("schwab-taxable-1")
+    assert mapping is not None
+    assert mapping.masked_account_number == "Unavailable"
+
+
+@pytest.mark.asyncio
+async def test_legacy_schwab_mapping_requires_owner_reverification(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    _seed_accounts(repo)
+    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1234", "*1234")
+    with repo._sessions() as session:
+        record = session.scalar(
+            select(SchwabAccountMappingRecord).where(
+                SchwabAccountMappingRecord.account_id == "schwab-taxable-1"
+            )
+        )
+        assert record is not None
+        record.masked_account_number = "123456789012"
+        session.commit()
+    settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
+    service = SchwabReadinessService(
+        repo,
+        transport=SchwabOAuthTransport(settings, http_client=FakeHttpClient([])),
+        execution_settings=ExecutionSettings(
+            provider="schwab", schwab_execution_enabled=True
+        ),
+        schwab_settings=settings,
+    )
+
+    result = await service.check_account_readiness("schwab-taxable-1")
+
+    assert result.state == SchwabReadinessState.UNMAPPED
+    assert result.ready is False
+
+
+def test_migration_0015_invalidates_existing_schwab_account_masks(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    from alembic.config import Config
+
+    from alembic import command
+
+    database_path = tmp_path / "schwab-migration.db"
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+    config.set_main_option("sqlalchemy.url", f"sqlite:///{database_path}")
+    command.upgrade(config, "20260926_0014")
+    now = datetime.now(UTC).isoformat()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO accounts "
+            "(id, provider, label, account_type, currency, refreshed_at, is_stale) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("schwab-taxable-1", "schwab", "Taxable", "Brokerage", "USD", now, 0),
+        )
+        connection.execute(
+            "INSERT INTO accounts "
+            "(id, provider, label, account_type, currency, refreshed_at, is_stale) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("schwab-roth-2", "schwab", "Roth", "Brokerage", "USD", now, 0),
+        )
+        connection.executemany(
+            "INSERT INTO schwab_account_mappings "
+            "(id, account_id, schwab_account_hash, masked_account_number, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("mapping-1", "schwab-taxable-1", "opaque-hash-1", "*1234", now, now),
+                (
+                    "mapping-2",
+                    "schwab-roth-2",
+                    "opaque-hash-2",
+                    "123456789012",
+                    now,
+                    now,
+                ),
+            ],
+        )
+    command.upgrade(config, "head")
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(
+            "SELECT schwab_account_hash, masked_account_number "
+            "FROM schwab_account_mappings ORDER BY schwab_account_hash"
+        ).fetchall()
+
+    assert rows == [
+        ("opaque-hash-1", "Unavailable"),
+        ("opaque-hash-2", "Unavailable"),
+    ]
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO accounts "
+            "(id, provider, label, account_type, currency, refreshed_at, is_stale) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("schwab-new-3", "schwab", "New", "Brokerage", "USD", now, 0),
+        )
+        connection.execute(
+            "INSERT INTO schwab_account_mappings "
+            "(id, account_id, schwab_account_hash, masked_account_number, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("mapping-3", "schwab-new-3", "opaque-hash-3", "*9999", now, now),
+        )
+
+    command.downgrade(config, "20260926_0014")
+    with sqlite3.connect(database_path) as connection:
+        downgraded_rows = connection.execute(
+            "SELECT schwab_account_hash, masked_account_number "
+            "FROM schwab_account_mappings ORDER BY schwab_account_hash"
+        ).fetchall()
+    assert downgraded_rows == [
+        ("opaque-hash-1", "Unavailable"),
+        ("opaque-hash-2", "Unavailable"),
+        ("opaque-hash-3", "*9999"),
+    ]
+
+
 # --- 4. Candidate Listing & Suggestions Tests ---
 
 
@@ -489,6 +779,7 @@ async def test_readiness_ready_when_all_valid(tmp_path: Path) -> None:
                 {
                     "securitiesAccount": {
                         "type": "MARGIN",
+                        "currency": "USD",
                         "isClosingOnlyRestricted": False,
                         "isDayTrader": True,
                     }
@@ -535,7 +826,9 @@ async def test_check_all_readiness_concurrent(tmp_path: Path) -> None:
                 {
                     "securitiesAccount": {
                         "type": "CASH",
+                        "currency": "USD",
                         "isClosingOnlyRestricted": False,
+                        "isDayTrader": False,
                     }
                 },
             ),
@@ -544,7 +837,9 @@ async def test_check_all_readiness_concurrent(tmp_path: Path) -> None:
                 {
                     "securitiesAccount": {
                         "type": "MARGIN",
+                        "currency": "USD",
                         "isClosingOnlyRestricted": False,
+                        "isDayTrader": False,
                     }
                 },
             ),
@@ -668,7 +963,8 @@ async def test_readiness_broker_contradictory_currency_rejected(tmp_path: Path) 
     result = await service.check_account_readiness("schwab-taxable-1")
     assert result.state == SchwabReadinessState.UNSUPPORTED_ACCOUNT
     assert result.ready is False
-    assert "currency 'EUR' is not supported" in result.message
+    assert "currency is unsupported" in result.message
+    assert "EUR" not in result.message
 
 
 @pytest.mark.asyncio
@@ -688,7 +984,9 @@ async def test_readiness_broker_unsupported_type_rejected(tmp_path: Path) -> Non
                 {
                     "securitiesAccount": {
                         "type": "FUTURES",  # unsupported type
+                        "currency": "USD",
                         "isClosingOnlyRestricted": False,
+                        "isDayTrader": False,
                     }
                 },
             ),
@@ -703,7 +1001,7 @@ async def test_readiness_broker_unsupported_type_rejected(tmp_path: Path) -> Non
     result = await service.check_account_readiness("schwab-taxable-1")
     assert result.state == SchwabReadinessState.UNSUPPORTED_ACCOUNT
     assert result.ready is False
-    assert "FUTURES" in result.message
+    assert "not supported" in result.message
 
 
 @pytest.mark.asyncio

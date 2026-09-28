@@ -1,9 +1,15 @@
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 
 _KNOWN_SCHWAB_PROVIDERS = frozenset({"schwab", "charles schwab"})
+_SCHWAB_ACCOUNT_MASK = re.compile(r"\*[0-9]{4}\Z")
+
+
+def is_schwab_account_masked(value: str) -> bool:
+    return _SCHWAB_ACCOUNT_MASK.fullmatch(value) is not None
 
 
 def is_schwab_provider(provider: str) -> bool:

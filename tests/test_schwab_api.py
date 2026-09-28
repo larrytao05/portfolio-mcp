@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 from fastapi.testclient import TestClient
 
@@ -10,6 +11,7 @@ from portfolio_mcp.database import (
     PortfolioRepository,
 )
 from portfolio_mcp.fixtures import FixturePortfolioProvider
+from portfolio_mcp.provider import ProviderRateLimitError, ProviderResponseError
 from portfolio_mcp.schwab_readiness import SchwabReadinessService
 from portfolio_mcp.schwab_transport import SchwabOAuthTransport
 
@@ -128,7 +130,7 @@ def test_api_schwab_mapping_crud_flow(tmp_path: Path) -> None:
         },
     )
     assert resp.status_code == 400
-    assert "confirmation is required" in resp.json()["detail"].lower()
+    assert resp.json()["detail"] == "Invalid Schwab mapping request"
 
     # Saving mapping with confirmation succeeds
     resp = client.post(
@@ -207,7 +209,9 @@ def test_api_schwab_readiness_endpoints(tmp_path: Path) -> None:
                 {
                     "securitiesAccount": {
                         "type": "CASH",
+                        "currency": "USD",
                         "isClosingOnlyRestricted": False,
+                        "isDayTrader": False,
                     }
                 },
             ),
@@ -295,10 +299,7 @@ def test_api_schwab_mapping_candidate_validation(tmp_path: Path) -> None:
         },
     )
     assert resp.status_code == 400
-    assert (
-        "not recognized" in resp.json()["detail"].lower()
-        or "invalid candidate" in resp.json()["detail"].lower()
-    )
+    assert resp.json()["detail"] == "Invalid Schwab mapping request"
 
 
 def test_api_schwab_candidates_error_handling(tmp_path: Path) -> None:
@@ -426,3 +427,56 @@ def test_json_responses_contain_no_full_account_numbers_or_hashes(
     assert all_readiness_resp.status_code == 200
     assert raw_secret_number not in all_readiness_resp.text
     assert raw_hash not in all_readiness_resp.text
+
+
+def test_schwab_mapping_api_redacts_provider_errors_and_maps_rate_limits(
+    tmp_path: Path,
+) -> None:
+    settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
+    database_url = f"sqlite:///{tmp_path / 'api-errors.db'}"
+    repo = PortfolioRepository(database_url)
+    _seed_accounts(repo)
+    provider_secret = "private-provider-payload-marker"
+
+    class LeakyFailureService:
+        candidate_error: Exception = ProviderResponseError(provider_secret)
+
+        async def list_candidates_for_account(self, account_id: str) -> list[object]:
+            raise self.candidate_error
+
+        async def save_verified_mapping(
+            self, *, account_id: str, candidate_id: str, confirmed: bool
+        ) -> object:
+            raise ProviderRateLimitError(provider_secret)
+
+    service = LeakyFailureService()
+    app = create_app(
+        FixturePortfolioProvider(),
+        database_url=database_url,
+        schwab_readiness_service=cast(SchwabReadinessService, service),
+        schwab_settings=settings,
+    )
+    client = TestClient(app)
+
+    candidates = client.get(
+        "/api/schwab/mapping/candidates?account_id=schwab-taxable-1"
+    )
+    assert candidates.status_code == 502
+    assert candidates.json()["detail"] == "Schwab returned an invalid response"
+    assert provider_secret not in candidates.text
+
+    service.candidate_error = RuntimeError(provider_secret)
+    unexpected = client.get(
+        "/api/schwab/mapping/candidates?account_id=schwab-taxable-1"
+    )
+    assert unexpected.status_code == 500
+    assert unexpected.json()["detail"] == "Unable to process Schwab mapping"
+    assert provider_secret not in unexpected.text
+
+    save = client.post(
+        "/api/schwab/mapping/schwab-taxable-1",
+        json={"candidate_id": "candidate", "confirmed": True},
+    )
+    assert save.status_code == 429
+    assert save.json()["detail"] == "Schwab rate limit reached"
+    assert provider_secret not in save.text
