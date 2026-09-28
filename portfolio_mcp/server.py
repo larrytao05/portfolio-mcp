@@ -108,7 +108,9 @@ def create_server(
     active_cancellation_service = (
         cancellation_service
         or cancellation_request_service
-        or OrderCancellationService(repo, execution, service_clock)
+        or OrderCancellationService(
+            repo, execution, service_clock, mcp_auth_service=active_mcp_auth
+        )
     )
 
     @mcp.tool()
@@ -323,6 +325,43 @@ def create_server(
                 ),
             }
         except TradingValidationError as error:
+            raise ToolError(f"{error.code}: {error}") from error
+
+    @mcp.tool()
+    async def create_order_cancellation(order_id: str) -> dict[str, object]:
+        """Create a pending cancellation request for an active order.
+
+        Alias for request_order_cancellation. Creates a pending cancellation request
+        that must be independently reviewed and authorized on the dashboard with a
+        one-time code before cancellation can be executed.
+        """
+        return await request_order_cancellation(order_id)
+
+    @mcp.tool()
+    async def cancel_authorized_order(
+        cancellation_request_id: str, code: str
+    ) -> dict[str, object]:
+        """Cancel an active order using a dashboard-authorized one-time code.
+
+        Verifies and consumes the one-time authorization code generated from the
+        dashboard for the specified cancellation request, then executes order
+        cancellation through the guarded execution provider.
+        """
+        if not cancellation_request_id or not cancellation_request_id.strip():
+            raise ToolError(
+                "invalid_cancellation_request_id: Cancellation request ID is required"
+            )
+        if not code or not code.strip():
+            raise ToolError("invalid_code: Authorization code is required")
+        try:
+            order = await active_cancellation_service.cancel_authorized(
+                cancellation_request_id=cancellation_request_id.strip(),
+                code=code.strip(),
+            )
+            return {"order": order.to_dict()}
+        except TradingValidationError as error:
+            raise ToolError(f"{error.code}: {error}") from error
+        except McpAuthorizationError as error:
             raise ToolError(f"{error.code}: {error}") from error
 
     return mcp
