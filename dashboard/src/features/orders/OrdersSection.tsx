@@ -17,7 +17,10 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
     typeof document !== "undefined" ? document.visibilityState : "visible",
   );
   const [filters, setFilters] = useState<OrderListFilters>({});
-  const [cursor, setCursor] = useState<string | undefined>(undefined);
+  const [cursorHistory, setCursorHistory] = useState<Array<string | undefined>>([
+    undefined,
+  ]);
+  const cursor = cursorHistory[cursorHistory.length - 1];
   const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
   const [auditCursor, setAuditCursor] = useState<string | undefined>(undefined);
   const [auditCursorHistory, setAuditCursorHistory] = useState<string[]>([]);
@@ -176,7 +179,7 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
       start_date,
       end_date,
     });
-    setCursor(undefined);
+    setCursorHistory([undefined]);
   }
 
   const offPageGroup = ordersQuery.data?.refresh_groups.find(
@@ -460,14 +463,37 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
         </div>
       )}
 
-      {ordersQuery.data?.next_cursor && (
+      {(cursorHistory.length > 1 || ordersQuery.data?.next_cursor) && (
         <div className="pagination">
-          <button
-            type="button"
-            onClick={() => setCursor(ordersQuery.data?.next_cursor ?? undefined)}
-          >
-            Next page →
-          </button>
+          {cursorHistory.length > 1 && (
+            <button
+              type="button"
+              aria-label="Previous order page"
+              onClick={() =>
+                setCursorHistory((history) => history.slice(0, -1))
+              }
+            >
+              ← Previous page
+            </button>
+          )}
+          {ordersQuery.data?.next_cursor && (
+            <button
+              type="button"
+              disabled={ordersQuery.isFetching}
+              aria-label="Next order page"
+              onClick={() => {
+                const nextCursor = ordersQuery.data?.next_cursor;
+                if (!nextCursor || nextCursor === cursor) return;
+                setCursorHistory((history) =>
+                  history[history.length - 1] === nextCursor
+                    ? history
+                    : [...history, nextCursor],
+                );
+              }}
+            >
+              Next page →
+            </button>
+          )}
         </div>
       )}
 
