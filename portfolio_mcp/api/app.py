@@ -9,7 +9,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
-from portfolio_mcp.database import CorruptedAuditRecordError, PortfolioRepository
+from portfolio_mcp.bootstrap import (
+    create_execution_settings,
+    create_schwab_settings,
+)
+from portfolio_mcp.config import ExecutionSettings, SchwabSettings
+from portfolio_mcp.database import (
+    AccountNotFoundError,
+    CorruptedAuditRecordError,
+    PortfolioRepository,
+    SchwabAccountMappingConflictError,
+)
 from portfolio_mcp.execution import (
     ExecutionProvider,
     FixtureExecutionProvider,
@@ -33,9 +43,16 @@ from portfolio_mcp.provider import (
     InstrumentNotFoundError,
     MarketDataProvider,
     PortfolioProvider,
+    ProviderAuthenticationError,
+    ProviderAuthorizationError,
     ProviderError,
+    ProviderRateLimitError,
+    ProviderResponseError,
+    ProviderUnavailableError,
 )
 from portfolio_mcp.refresh import PortfolioRefreshService
+from portfolio_mcp.schwab_readiness import SchwabReadinessService
+from portfolio_mcp.schwab_transport import SchwabOAuthTransport
 from portfolio_mcp.trading_safety import (
     TradingGuard,
     TradingSettingsError,
@@ -53,6 +70,33 @@ from portfolio_mcp.trading_service import (
     TradingValidationError,
     fixture_submission_validator,
 )
+
+
+class SaveSchwabMappingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: str = Field(min_length=1, max_length=128)
+    confirmed: StrictBool
+
+
+def _schwab_mapping_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, AccountNotFoundError):
+        return HTTPException(status_code=404, detail="Portfolio account was not found")
+    if isinstance(exc, SchwabAccountMappingConflictError):
+        return HTTPException(status_code=409, detail="Schwab account is already mapped")
+    if isinstance(exc, (ProviderAuthenticationError, ProviderAuthorizationError)):
+        return HTTPException(status_code=403, detail="Schwab access is not authorized")
+    if isinstance(exc, ProviderRateLimitError):
+        return HTTPException(status_code=429, detail="Schwab rate limit reached")
+    if isinstance(exc, ProviderUnavailableError):
+        return HTTPException(status_code=503, detail="Schwab service is unavailable")
+    if isinstance(exc, ProviderResponseError):
+        return HTTPException(
+            status_code=502, detail="Schwab returned an invalid response"
+        )
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=400, detail="Invalid Schwab mapping request")
+    return HTTPException(status_code=500, detail="Unable to process Schwab mapping")
 
 
 class CreateCancellationMcpAuthorizationRequest(BaseModel):
@@ -115,9 +159,36 @@ def create_app(
     cancellation_service: OrderCancellationService | None = None,
     cancellation_request_service: OrderCancellationRequestService | None = None,
     mcp_auth_service: McpAuthorizationService | None = None,
+    schwab_readiness_service: SchwabReadinessService | None = None,
+    execution_settings: ExecutionSettings | None = None,
+    schwab_settings: SchwabSettings | None = None,
 ) -> FastAPI:
     service_clock = clock or (lambda: datetime.now(UTC))
     repository = PortfolioRepository(database_url, service_clock)
+    exec_settings = (
+        execution_settings
+        if execution_settings is not None
+        else create_execution_settings()
+    )
+    schwab_conf = (
+        schwab_settings if schwab_settings is not None else create_schwab_settings()
+    )
+
+    schwab_transport = (
+        SchwabOAuthTransport(schwab_conf, context="Schwab Trader API")
+        if schwab_conf is not None
+        else None
+    )
+    readiness_service = (
+        schwab_readiness_service
+        if schwab_readiness_service is not None
+        else SchwabReadinessService(
+            repository,
+            schwab_transport,
+            exec_settings,
+            schwab_conf,
+        )
+    )
     refresh_service = PortfolioRefreshService(provider, repository, service_clock)
     market_data = market_data_provider or FixtureMarketDataProvider()
     execution = (
@@ -250,6 +321,72 @@ def create_app(
                 detail={"code": "account_not_found", "message": "Account not found"},
             )
         return {"capability": capability.to_dict()}
+
+    @app.get("/api/schwab/mapping")
+    async def list_schwab_mappings() -> dict[str, object]:
+        return {
+            "mappings": [
+                mapping.to_dict()
+                for mapping in repository.list_schwab_account_mappings()
+            ]
+        }
+
+    @app.get("/api/schwab/mapping/candidates")
+    async def list_schwab_candidates(
+        account_id: Annotated[str, Query(min_length=1)],
+    ) -> dict[str, object]:
+        try:
+            candidates = await readiness_service.list_candidates_for_account(account_id)
+            return {
+                "account_id": account_id,
+                "candidates": [candidate.to_dict() for candidate in candidates],
+            }
+        except Exception as exc:
+            raise _schwab_mapping_error(exc) from exc
+
+    @app.get("/api/schwab/mapping/{account_id}")
+    async def get_schwab_mapping(account_id: str) -> dict[str, object]:
+        mapping = repository.get_schwab_account_mapping(account_id)
+        if mapping is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No Schwab mapping exists for this portfolio account",
+            )
+        return {"mapping": mapping.to_dict()}
+
+    @app.post("/api/schwab/mapping/{account_id}")
+    async def save_schwab_mapping(
+        account_id: str, request: SaveSchwabMappingRequest
+    ) -> dict[str, object]:
+        try:
+            mapping = await readiness_service.save_verified_mapping(
+                account_id=account_id,
+                candidate_id=request.candidate_id,
+                confirmed=request.confirmed,
+            )
+            return {"mapping": mapping.to_dict()}
+        except Exception as exc:
+            raise _schwab_mapping_error(exc) from exc
+
+    @app.delete("/api/schwab/mapping/{account_id}")
+    async def delete_schwab_mapping(account_id: str) -> dict[str, object]:
+        deleted = repository.delete_schwab_account_mapping(account_id)
+        if not deleted:
+            raise HTTPException(
+                status_code=404,
+                detail="No Schwab mapping exists for this portfolio account",
+            )
+        return {"deleted": True, "account_id": account_id}
+
+    @app.get("/api/schwab/readiness")
+    async def all_schwab_readiness() -> dict[str, object]:
+        readiness_list = await readiness_service.check_all_readiness()
+        return {"readiness": [r.to_dict() for r in readiness_list]}
+
+    @app.get("/api/schwab/readiness/{account_id}")
+    async def account_schwab_readiness(account_id: str) -> dict[str, object]:
+        readiness = await readiness_service.check_account_readiness(account_id)
+        return {"readiness": readiness.to_dict()}
 
     @app.get("/api/refreshes/latest")
     async def latest_refresh() -> dict[str, object]:

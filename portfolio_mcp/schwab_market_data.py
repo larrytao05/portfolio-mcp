@@ -1,54 +1,23 @@
-import asyncio
-import base64
-import json
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Protocol
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
-from urllib.request import Request, urlopen
+from urllib.parse import quote, urlencode
 
-from portfolio_mcp.config import SchwabMarketDataSettings
+from portfolio_mcp.config import SchwabSettings
 from portfolio_mcp.models import Instrument, Quote
 from portfolio_mcp.provider import (
     InstrumentNotFoundError,
-    ProviderAuthenticationError,
-    ProviderAuthorizationError,
-    ProviderRateLimitError,
     ProviderResponseError,
-    ProviderUnavailableError,
+)
+from portfolio_mcp.schwab_transport import (
+    SchwabHttpClient,
+    SchwabOAuthTransport,
+    UrllibSchwabHttpClient,
+    decode_body,
+    raise_for_status,
 )
 
-
-class SchwabHttpClient(Protocol):
-    def request(
-        self,
-        method: str,
-        url: str,
-        headers: dict[str, str],
-        body: bytes | None = None,
-    ) -> tuple[int, object]: ...
-
-
-class UrllibSchwabHttpClient:
-    def request(
-        self,
-        method: str,
-        url: str,
-        headers: dict[str, str],
-        body: bytes | None = None,
-    ) -> tuple[int, object]:
-        request = Request(url, data=body, headers=headers, method=method)
-        try:
-            with urlopen(request, timeout=15) as response:
-                return response.status, _decode_body(response.read())
-        except HTTPError as error:
-            return error.code, _decode_body(error.read())
-        except URLError:
-            raise ProviderUnavailableError(
-                "Schwab market data is temporarily unavailable"
-            ) from None
+_decode_body = decode_body
 
 
 class SchwabMarketDataProvider:
@@ -58,59 +27,32 @@ class SchwabMarketDataProvider:
 
     def __init__(
         self,
-        settings: SchwabMarketDataSettings,
+        settings: SchwabSettings,
         *,
         http_client: SchwabHttpClient | None = None,
         clock: Callable[[], datetime] | None = None,
+        transport: SchwabOAuthTransport | None = None,
     ) -> None:
         self._settings = settings
-        self._http_client = http_client or UrllibSchwabHttpClient()
+        self._http_client = http_client or UrllibSchwabHttpClient(
+            context="Schwab market data"
+        )
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._transport = transport or SchwabOAuthTransport(
+            settings,
+            http_client=self._http_client,
+            token_url=self._token_url,
+            context="Schwab market data",
+        )
 
     def authorization_url(self) -> str:
-        parameters = urlencode(
-            {
-                "client_id": self._settings.client_id,
-                "response_type": "code",
-                "redirect_uri": self._settings.callback_url,
-            }
-        )
-        return f"https://api.schwabapi.com/v1/oauth/authorize?{parameters}"
+        return self._transport.authorization_url()
 
     def authorization_code_from_redirect_url(self, redirect_url: str) -> str:
-        redirect = urlparse(redirect_url)
-        callback = urlparse(self._settings.callback_url)
-        redirect_base = urlunparse(
-            (redirect.scheme, redirect.netloc, redirect.path, "", "", "")
-        ).rstrip("/")
-        callback_base = urlunparse(
-            (callback.scheme, callback.netloc, callback.path, "", "", "")
-        ).rstrip("/")
-        if redirect_base != callback_base:
-            raise ProviderResponseError(
-                "Authorization redirect did not match the configured callback URL"
-            )
-
-        code = parse_qs(redirect.query).get("code", [""])[0]
-        if not code:
-            raise ProviderResponseError("Authorization redirect did not include a code")
-        return code
+        return self._transport.authorization_code_from_redirect_url(redirect_url)
 
     async def exchange_authorization_code(self, code: str) -> str:
-        status, response = await self._http_request(
-            "POST",
-            self._token_url,
-            self._token_headers(),
-            urlencode(
-                {
-                    "grant_type": "authorization_code",
-                    "code": code,
-                    "redirect_uri": self._settings.callback_url,
-                }
-            ).encode(),
-        )
-        _raise_for_status(status)
-        return _required_string(_required_mapping(response).get("refresh_token"))
+        return await self._transport.exchange_authorization_code(code)
 
     async def search_instruments(self, query: str) -> list[Instrument]:
         normalized_query = query.strip()
@@ -172,35 +114,10 @@ class SchwabMarketDataProvider:
         )
 
     async def _access_token(self) -> str:
-        body = urlencode(
-            {
-                "grant_type": "refresh_token",
-                "refresh_token": self._settings.refresh_token,
-            }
-        ).encode()
-        status, response = await self._http_request(
-            "POST",
-            self._token_url,
-            self._token_headers(),
-            body,
-        )
-        if status == 400:
-            raise ProviderAuthenticationError(
-                "Refresh token was rejected by Schwab; run "
-                "`uv run --env-file .env python -m portfolio_mcp.schwab_oauth` "
-                "to replace it"
-            )
-        _raise_for_status(status)
-        return _required_string(_required_mapping(response).get("access_token"))
+        return await self._transport.access_token()
 
     def _token_headers(self) -> dict[str, str]:
-        credentials = f"{self._settings.client_id}:{self._settings.client_secret}"
-        authorization = base64.b64encode(credentials.encode()).decode()
-        return {
-            "Authorization": f"Basic {authorization}",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        }
+        return self._transport.token_headers()
 
     async def _http_request(
         self,
@@ -209,41 +126,11 @@ class SchwabMarketDataProvider:
         headers: dict[str, str],
         body: bytes | None = None,
     ) -> tuple[int, object]:
-        try:
-            return await asyncio.to_thread(
-                self._http_client.request,
-                method,
-                url,
-                headers,
-                body,
-            )
-        except TimeoutError:
-            raise ProviderUnavailableError(
-                "Schwab market data is temporarily unavailable"
-            ) from None
-
-
-def _decode_body(body: bytes) -> object:
-    try:
-        return json.loads(body)
-    except (TypeError, ValueError):
-        return None
+        return await self._transport.http_request(method, url, headers, body)
 
 
 def _raise_for_status(status: int) -> None:
-    if 200 <= status < 300:
-        return
-    if status == 401:
-        raise ProviderAuthenticationError("Unable to authenticate with Schwab")
-    if status == 403:
-        raise ProviderAuthorizationError("Schwab market data access is not authorized")
-    if status == 429:
-        raise ProviderRateLimitError(
-            "Schwab market data rate limit reached; try again later"
-        )
-    if status <= 0 or status >= 500:
-        raise ProviderUnavailableError("Schwab market data is temporarily unavailable")
-    raise ProviderResponseError("Schwab market data returned an unexpected response")
+    raise_for_status(status, context="Schwab market data")
 
 
 def _required_mapping(value: object, key: str | None = None) -> Mapping[str, object]:

@@ -23,6 +23,7 @@ dev = [
 [tool.ruff]
 target-version = "py312"
 line-length = 88
+extend-exclude = ["scratch"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
