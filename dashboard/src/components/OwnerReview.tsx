@@ -11,15 +11,20 @@ export type OwnerReviewProps =
   | {
       action: "submit";
       draftId: string;
-      onClose?: () => void;
+      onClose: () => void;
     }
   | {
       action: "cancel";
       requestId: string;
-      onClose?: () => void;
+      onClose: () => void;
     };
 
 export function OwnerReview(props: OwnerReviewProps) {
+  const targetId = props.action === "submit" ? props.draftId : props.requestId;
+  return <OwnerReviewSession key={`${props.action}:${targetId}`} {...props} />;
+}
+
+function OwnerReviewSession(props: OwnerReviewProps) {
   const { action, onClose } = props;
   const targetId = action === "submit" ? props.draftId : props.requestId;
 
@@ -30,6 +35,12 @@ export function OwnerReview(props: OwnerReviewProps) {
   const [issuing, setIssuing] = useState(false);
   const [issuedCode, setIssuedCode] =
     useState<CreateMcpAuthorizationResult | null>(null);
+
+  useEffect(() => {
+    const closeOnNavigation = () => onClose();
+    window.addEventListener("hashchange", closeOnNavigation);
+    return () => window.removeEventListener("hashchange", closeOnNavigation);
+  }, [onClose]);
 
   useEffect(() => {
     let active = true;
@@ -64,8 +75,6 @@ export function OwnerReview(props: OwnerReviewProps) {
 
     return () => {
       active = false;
-      // Code is cleared from memory on unmount/navigation
-      setIssuedCode(null);
     };
   }, [action, targetId]);
 
@@ -105,16 +114,14 @@ export function OwnerReview(props: OwnerReviewProps) {
           </h3>
           <span className="muted">ID: {targetId}</span>
         </div>
-        {onClose && (
-          <button
-            type="button"
-            className="close-button"
-            onClick={onClose}
-            aria-label="Close review"
-          >
-            ✕
-          </button>
-        )}
+        <button
+          type="button"
+          className="close-button"
+          onClick={onClose}
+          aria-label="Close review"
+        >
+          ✕
+        </button>
       </div>
 
       {loading && <p className="muted">Loading review details…</p>}
