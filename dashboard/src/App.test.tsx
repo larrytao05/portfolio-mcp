@@ -27,6 +27,17 @@ const api = vi.hoisted(() => ({
   refreshPortfolio: vi.fn(),
   updateTradingSettings: vi.fn(),
   searchInstruments: vi.fn(),
+  getOrders: vi.fn().mockResolvedValue({
+    orders: [],
+    next_cursor: null,
+    refresh_groups: [],
+    server_time: "2026-09-12T20:00:00Z",
+  }),
+  getOrderAudit: vi.fn().mockResolvedValue({
+    events: [],
+    next_cursor: null,
+  }),
+  refreshOrder: vi.fn(),
 }));
 
 vi.mock("./api/client", () => api);
@@ -281,7 +292,7 @@ describe("App", () => {
     await waitFor(() =>
       expect(
         screen.getAllByRole("option", { name: "Schwab Taxable ••••4821" }),
-      ).toHaveLength(2),
+      ).toHaveLength(3),
     );
     fireEvent.change(await screen.findByLabelText("Trade account"), {
       target: { value: "schwab-taxable-demo" },
@@ -331,7 +342,7 @@ describe("App", () => {
     });
     renderApp();
 
-    await waitFor(() => expect(screen.getAllByRole("option", { name: "Schwab Taxable ••••4821" })).toHaveLength(2));
+    await waitFor(() => expect(screen.getAllByRole("option", { name: "Schwab Taxable ••••4821" })).toHaveLength(3));
     fireEvent.change(screen.getByLabelText("Trade account"), { target: { value: "schwab-taxable-demo" } });
     fireEvent.change(screen.getByLabelText("Trade instrument search"), { target: { value: "VTI" } });
     fireEvent.click(screen.getByRole("button", { name: "Search trade instruments" }));

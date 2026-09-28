@@ -160,6 +160,7 @@ function outcomeMessage(order: Order | null): string | null {
 }
 
 export function TradeSection({ accounts }: { accounts: Account[] }) {
+  const queryClient = useQueryClient();
   const [draft, setDraft] = useState<OrderDraft | null>(null);
   const [order, setOrder] = useState<Order | null>(null);
   const [instrumentQuery, setInstrumentQuery] = useState("");
@@ -191,7 +192,13 @@ export function TradeSection({ accounts }: { accounts: Account[] }) {
       draft === null
         ? Promise.reject(new Error("No draft to confirm"))
         : confirmOrderDraft(draft.id, draft.fingerprint),
-    onSuccess: ({ order: nextOrder }) => setOrder(nextOrder),
+    onSuccess: async ({ order: nextOrder }) => {
+      setOrder(nextOrder);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["orders"] }),
+        queryClient.invalidateQueries({ queryKey: ["order-audit"] }),
+      ]);
+    },
   });
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
