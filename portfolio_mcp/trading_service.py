@@ -14,6 +14,7 @@ from portfolio_mcp.database import (
     ConcurrentOrderUpdate,
     OrderDraft,
     PortfolioRepository,
+    StoredCancellationRequest,
     StoredOrder,
     StoredOrderAuthorization,
 )
@@ -25,6 +26,18 @@ from portfolio_mcp.execution import (
     ExecutionProvider,
     ExecutionResult,
     OrderState,
+)
+from portfolio_mcp.mcp_authorization import (
+    CreatedMcpAuthorization as CreatedMcpAuthorization,
+)
+from portfolio_mcp.mcp_authorization import (
+    McpAuthorizationError as McpAuthorizationError,
+)
+from portfolio_mcp.mcp_authorization import (
+    McpAuthorizationService as McpAuthorizationService,
+)
+from portfolio_mcp.mcp_authorization import (
+    StoredMcpAuthorization as StoredMcpAuthorization,
 )
 from portfolio_mcp.order_history import (
     OrderEventActor,
@@ -179,6 +192,7 @@ class OrderSubmissionService:
         clock: Callable[[], datetime],
         validator: SubmissionValidator,
         trading_guard: TradingGuard | None = None,
+        mcp_auth_service: McpAuthorizationService | None = None,
     ) -> None:
         self._repository = repository
         self._execution_provider = execution_provider
@@ -187,6 +201,7 @@ class OrderSubmissionService:
         self._trading_guard = trading_guard or TradingGuard(
             repository, TradingSettingsService(repository, clock)
         )
+        self._mcp_auth_service = mcp_auth_service
         if self._repository.has_stranded_submissions():
             self._repository.recover_stranded_submissions(_utc_now(self._clock()))
 
@@ -239,6 +254,43 @@ class OrderSubmissionService:
                     "authorization_invalid", "Order authorization is invalid"
                 )
             return existing
+        return await self._execute_submission(draft, OrderEventActor.DASHBOARD)
+
+    async def submit_authorized(self, draft_id: str, code: str) -> StoredOrder:
+        if self._mcp_auth_service is None:
+            raise TradingValidationError(
+                "mcp_auth_unavailable", "MCP authorization service is unavailable"
+            )
+        draft = self._repository.order_draft(draft_id)
+        if draft is None:
+            raise TradingValidationError("draft_not_found", "Order draft not found")
+        now = _utc_now(self._clock())
+        if now > draft.expires_at:
+            raise TradingValidationError("draft_expired", "Order draft has expired")
+        existing = self._repository.order_for_draft(draft_id)
+        if existing is not None:
+            raise TradingValidationError(
+                "draft_already_submitted",
+                "An order has already been created for this draft",
+            )
+        try:
+            self._mcp_auth_service.consume_authorization(
+                action="submit",
+                target_draft_id=draft.id,
+                expected_fingerprint=draft.fingerprint,
+                account_id=draft.account_id,
+                candidate_code=code,
+            )
+        except McpAuthorizationError as error:
+            raise TradingValidationError(
+                error.code, "Authorization code is invalid or expired"
+            ) from error
+
+        return await self._execute_submission(draft, OrderEventActor.MCP)
+
+    async def _execute_submission(
+        self, draft: OrderDraft, actor: OrderEventActor
+    ) -> StoredOrder:
         await self._validator(draft, _utc_now(self._clock()))
         try:
             capability = await self._execution_provider.get_execution_capability(
@@ -263,7 +315,9 @@ class OrderSubmissionService:
         if now > draft.expires_at:
             raise TradingValidationError("draft_expired", "Order draft has expired")
         self._require_fresh_market_quote(draft, now)
-        order, created = self._repository.begin_order_submission(draft, now)
+        order, created = self._repository.begin_order_submission(
+            draft, now, actor=actor
+        )
         if not created:
             return order
         command = ExecutionCommand(
@@ -293,7 +347,7 @@ class OrderSubmissionService:
                 result_message=str(error),
                 expected_version=order.version,
                 result_source=OrderStatusSource.LOCAL,
-                actor=OrderEventActor.DASHBOARD,
+                actor=actor,
             )
         try:
             order = self._repository.mark_provider_submission_started(
@@ -303,9 +357,11 @@ class OrderSubmissionService:
             )
             result = await self._execution_provider.submit_order(command)
             observed_at = _utc_now(self._clock())
-            return self._persist_provider_result(order, result, observed_at)
+            return self._persist_provider_result(
+                order, result, observed_at, actor=actor
+            )
         except asyncio.CancelledError:
-            self._unknown(order, _utc_now(self._clock()))
+            self._unknown(order, _utc_now(self._clock()), actor=actor)
             raise
         except ConcurrentOrderUpdate:
             latest = self._repository.order(order.id)
@@ -313,29 +369,33 @@ class OrderSubmissionService:
                 raise
             return latest
         except (ExecutionIndeterminateError, TimeoutError):
-            return self._unknown(order, _utc_now(self._clock()))
+            return self._unknown(order, _utc_now(self._clock()), actor=actor)
         except Exception:
-            return self._unknown(order, _utc_now(self._clock()))
+            return self._unknown(order, _utc_now(self._clock()), actor=actor)
 
     def _persist_provider_result(
-        self, order: StoredOrder, result: object, now: datetime
+        self,
+        order: StoredOrder,
+        result: object,
+        now: datetime,
+        actor: OrderEventActor = OrderEventActor.DASHBOARD,
     ) -> StoredOrder:
         if not isinstance(result, ExecutionResult):
-            return self._unknown(order, now)
+            return self._unknown(order, now, actor=actor)
         if not isinstance(result.state, OrderState):
-            return self._unknown(order, now)
+            return self._unknown(order, now, actor=actor)
         if result.state not in {
             OrderState.ACCEPTED,
             OrderState.PARTIALLY_FILLED,
             OrderState.FILLED,
             OrderState.REJECTED,
         }:
-            return self._unknown(order, now)
+            return self._unknown(order, now, actor=actor)
         broker_order_id = result.broker_order_id
         if result.state != OrderState.REJECTED and (
             not isinstance(broker_order_id, str) or not broker_order_id.strip()
         ):
-            return self._unknown(order, now)
+            return self._unknown(order, now, actor=actor)
         return self._repository.finish_order_submission(
             order.id,
             result.state,
@@ -348,7 +408,7 @@ class OrderSubmissionService:
             expected_version=order.version,
             fill=result.fill,
             result_source=OrderStatusSource.PROVIDER,
-            actor=OrderEventActor.DASHBOARD,
+            actor=actor,
         )
 
     def _require_fresh_market_quote(self, draft: OrderDraft, now: datetime) -> None:
@@ -364,7 +424,12 @@ class OrderSubmissionService:
                 "quote_stale", "The market quote is stale; create a new draft"
             )
 
-    def _unknown(self, order: StoredOrder, now: datetime) -> StoredOrder:
+    def _unknown(
+        self,
+        order: StoredOrder,
+        now: datetime,
+        actor: OrderEventActor = OrderEventActor.DASHBOARD,
+    ) -> StoredOrder:
         return self._repository.finish_order_submission(
             order.id,
             OrderState.UNKNOWN,
@@ -373,7 +438,7 @@ class OrderSubmissionService:
             result_message="Order outcome is unknown. Reconciliation is required.",
             expected_version=order.version,
             result_source=OrderStatusSource.SYSTEM,
-            actor=OrderEventActor.DASHBOARD,
+            actor=actor,
         )
 
 
@@ -612,12 +677,14 @@ class OrderCancellationService:
     def __init__(
         self,
         repository: PortfolioRepository,
-        execution_provider: ExecutionProvider,
-        clock: Callable[[], datetime],
+        execution_provider: ExecutionProvider | None = None,
+        clock: Callable[[], datetime] | None = None,
+        mcp_auth_service: McpAuthorizationService | None = None,
     ) -> None:
         self._repository = repository
         self._execution_provider = execution_provider
-        self._clock = clock
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._mcp_auth_service = mcp_auth_service
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
@@ -645,6 +712,10 @@ class OrderCancellationService:
         order = self._repository.order(order_id)
         if order is None:
             raise TradingValidationError("order_not_found", "Order not found")
+        if self._execution_provider is None:
+            raise TradingValidationError(
+                "execution_unavailable", "Execution provider is not configured"
+            )
 
         try:
             capability = await self._execution_provider.get_execution_capability(
@@ -712,3 +783,125 @@ class OrderCancellationService:
                 now=_utc_now(self._clock()),
                 actor=actor,
             )
+
+    def create_request(self, order_id: str) -> StoredCancellationRequest:
+        now = _utc_now(self._clock())
+        order = self._repository.order(order_id)
+        if order is None:
+            raise TradingValidationError("order_not_found", "Order not found")
+        if not order.can_cancel:
+            raise TradingValidationError(
+                "order_not_cancelable",
+                order.blocking_reason or "Order cannot be canceled",
+            )
+        expires_at = now + timedelta(minutes=5)
+        return self._repository.create_cancellation_request(
+            order=order, now=now, expires_at=expires_at
+        )
+
+    def get_request(self, request_id: str) -> StoredCancellationRequest | None:
+        return self._repository.get_cancellation_request(request_id)
+
+    async def cancel_authorized(
+        self,
+        *,
+        cancellation_request_id: str,
+        code: str,
+    ) -> StoredOrder:
+        if not cancellation_request_id or not cancellation_request_id.strip():
+            raise TradingValidationError(
+                "invalid_cancellation_request_id",
+                "Cancellation request ID is required",
+            )
+        if not code or not code.strip():
+            raise TradingValidationError(
+                "invalid_code", "Authorization code is required"
+            )
+        if self._mcp_auth_service is None:
+            raise TradingValidationError(
+                "mcp_auth_unavailable", "MCP authorization service is unavailable"
+            )
+
+        req = self._repository.get_cancellation_request(cancellation_request_id.strip())
+        if req is None:
+            raise TradingValidationError(
+                "cancellation_request_not_found", "Cancellation request not found"
+            )
+        if req.status != "authorized":
+            if req.status == "pending":
+                raise TradingValidationError(
+                    "cancellation_request_not_authorized",
+                    "Cancellation request has not been authorized on the dashboard",
+                )
+            if req.status in ("invalidated", "expired"):
+                raise TradingValidationError(
+                    f"cancellation_request_{req.status}",
+                    f"Cancellation request is {req.status}",
+                )
+            if req.status in ("attempted", "executed"):
+                raise TradingValidationError(
+                    "cancellation_request_already_consumed",
+                    "Cancellation request has already been attempted",
+                )
+            raise TradingValidationError(
+                "cancellation_request_not_authorized",
+                f"Cancellation request is {req.status}",
+            )
+
+        now = _utc_now(self._clock())
+        if now > req.expires_at:
+            self._repository.update_cancellation_request_status(
+                req.id, status="expired"
+            )
+            raise TradingValidationError(
+                "cancellation_request_expired",
+                "Cancellation request has expired",
+            )
+
+        order = self._repository.order(req.order_id)
+        if order is None:
+            raise TradingValidationError("order_not_found", "Order not found")
+        if (
+            order.version != req.expected_order_version
+            or order.state != req.expected_order_state
+        ):
+            self._repository.invalidate_cancellation_requests_for_order(
+                req.order_id, reason="order_state_changed"
+            )
+            raise TradingValidationError(
+                "order_conflict", "Order changed before cancellation"
+            )
+        if not order.can_cancel:
+            self._repository.invalidate_cancellation_requests_for_order(
+                req.order_id, reason="order_not_cancelable"
+            )
+            raise TradingValidationError(
+                "order_not_cancelable",
+                order.blocking_reason or "Order cannot be canceled",
+            )
+
+        try:
+            self._mcp_auth_service.consume_authorization(
+                action="cancel",
+                target_cancellation_request_id=req.id,
+                expected_fingerprint=req.action_fingerprint,
+                account_id=req.account_id,
+                candidate_code=code.strip(),
+            )
+        except McpAuthorizationError as error:
+            raise TradingValidationError(
+                error.code, "Authorization code is invalid or expired"
+            ) from error
+
+        self._repository.update_cancellation_request_status(req.id, status="attempted")
+
+        return await self.cancel(
+            order_id=req.order_id,
+            expected_version=req.expected_order_version,
+            expected_state=OrderState(req.expected_order_state),
+            confirmed=True,
+            actor=OrderEventActor.MCP,
+        )
+
+
+OrderCancellationRequestService = OrderCancellationService

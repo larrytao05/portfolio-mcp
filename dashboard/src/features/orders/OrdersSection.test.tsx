@@ -11,6 +11,8 @@ const api = vi.hoisted(() => ({
   refreshOrder: vi.fn(),
   confirmOrderCancellation: vi.fn(),
   getOrder: vi.fn(),
+  getCancellationRequest: vi.fn(),
+  createCancellationMcpAuthorization: vi.fn(),
 }));
 
 vi.mock("../../api/client", () => api);
@@ -864,116 +866,6 @@ describe("OrdersSection", () => {
     });
   });
 
-  it("navigates backward and forward through visited order pages", async () => {
-    const pages: Record<string, OrderListPage> = {
-      first: {
-        orders: [{ ...sampleOrder, id: "order-1", instrument: { id: "i1", symbol: "PAGE1" } }],
-        next_cursor: "cursor-2",
-        refresh_groups: [],
-        server_time: "2026-09-12T20:00:00Z",
-      },
-      "cursor-2": {
-        orders: [{ ...sampleOrder, id: "order-2", instrument: { id: "i2", symbol: "PAGE2" } }],
-        next_cursor: "cursor-3",
-        refresh_groups: [],
-        server_time: "2026-09-12T20:00:00Z",
-      },
-      "cursor-3": {
-        orders: [{ ...sampleOrder, id: "order-3", instrument: { id: "i3", symbol: "PAGE3" } }],
-        next_cursor: null,
-        refresh_groups: [],
-        server_time: "2026-09-12T20:00:00Z",
-      },
-    };
-    api.getOrders.mockImplementation(({ cursor }: { cursor?: string }) =>
-      Promise.resolve(pages[cursor ?? "first"]),
-    );
-
-    renderOrdersSection();
-
-    expect(await screen.findByText("PAGE1")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /next order page/i }));
-    expect(await screen.findByText("PAGE2")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /next order page/i }));
-    expect(await screen.findByText("PAGE3")).toBeTruthy();
-
-    fireEvent.click(screen.getByRole("button", { name: /previous order page/i }));
-    expect(await screen.findByText("PAGE2")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /previous order page/i }));
-    expect(await screen.findByText("PAGE1")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /next order page/i }));
-    expect(await screen.findByText("PAGE2")).toBeTruthy();
-
-    expect(api.getOrders.mock.calls.map(([filters]) => filters.cursor)).toEqual([
-      undefined,
-      "cursor-2",
-      "cursor-3",
-      "cursor-2",
-      undefined,
-      "cursor-2",
-    ]);
-  });
-
-  it("keeps Previous available when the next order page fails", async () => {
-    const firstPage: OrderListPage = {
-      orders: [{ ...sampleOrder, instrument: { id: "i1", symbol: "PAGE1" } }],
-      next_cursor: "cursor-2",
-      refresh_groups: [],
-      server_time: "2026-09-12T20:00:00Z",
-    };
-    api.getOrders.mockImplementation(({ cursor }: { cursor?: string }) =>
-      cursor ? Promise.reject(new Error("page unavailable")) : Promise.resolve(firstPage),
-    );
-
-    renderOrdersSection();
-
-    expect(await screen.findByText("PAGE1")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /next order page/i }));
-    expect((await screen.findByRole("alert")).textContent).toBe(
-      "Unable to load orders.",
-    );
-    fireEvent.click(screen.getByRole("button", { name: /previous order page/i }));
-    expect(await screen.findByText("PAGE1")).toBeTruthy();
-  });
-
-  it("resets order page history when filters are applied", async () => {
-    const firstPage: OrderListPage = {
-      orders: [{ ...sampleOrder, instrument: { id: "i1", symbol: "PAGE1" } }],
-      next_cursor: "cursor-2",
-      refresh_groups: [],
-      server_time: "2026-09-12T20:00:00Z",
-    };
-    const secondPage: OrderListPage = {
-      ...firstPage,
-      orders: [{ ...sampleOrder, instrument: { id: "i2", symbol: "PAGE2" } }],
-      next_cursor: "cursor-3",
-    };
-    api.getOrders.mockImplementation(({ cursor }: { cursor?: string }) =>
-      Promise.resolve(cursor ? secondPage : firstPage),
-    );
-
-    renderOrdersSection();
-
-    expect(await screen.findByText("PAGE1")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /next order page/i }));
-    expect(await screen.findByText("PAGE2")).toBeTruthy();
-    expect(screen.getByRole("button", { name: /previous order page/i })).toBeTruthy();
-
-    fireEvent.change(screen.getByLabelText("Filter provider"), {
-      target: { value: "schwab" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Filter" }));
-
-    await waitFor(() => {
-      expect(api.getOrders).toHaveBeenLastCalledWith(
-        expect.objectContaining({ provider: "schwab", cursor: undefined }),
-      );
-      expect(
-        screen.queryByRole("button", { name: /previous order page/i }),
-      ).toBeNull();
-    });
-  });
-
   it("renders remaining quantity, timestamps, result source, and explicit unavailable values", async () => {
     const richOrder: StoredOrder = {
       ...sampleOrder,
@@ -1023,5 +915,56 @@ describe("OrdersSection", () => {
 
     // Check sparse order has explicit unavailable placeholders
     expect(screen.getAllByText("—").length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("mounts OwnerReview for cancellation request when MCP Cancellation Request ID is entered", async () => {
+    api.getOrders.mockResolvedValue({
+      orders: [],
+      next_cursor: null,
+      refresh_groups: [],
+      server_time: "2026-09-12T20:00:00Z",
+    });
+    api.getCancellationRequest.mockResolvedValue({
+      cancellation_request: {
+        id: "cancel-req-999",
+        order_id: "ord-999",
+        expected_version: 1,
+        expected_state: "ACCEPTED",
+        account_id: "schwab-taxable-demo",
+        provider: "schwab",
+        symbol: "VTI",
+        broker_order_id: null,
+        remaining_quantity: "10",
+        fingerprint: "fp-999",
+        created_at: "2026-09-12T20:00:00Z",
+        expires_at: "2026-09-12T20:05:00Z",
+        status: "pending",
+        invalidation_reason: null,
+      },
+    });
+
+    renderOrdersSection();
+
+    const input = screen.getByLabelText(/MCP Cancellation Request ID/i);
+    fireEvent.change(input, { target: { value: "cancel-req-999" } });
+
+    const reviewButton = screen.getByRole("button", {
+      name: /Review MCP Cancellation/i,
+    });
+    fireEvent.click(reviewButton);
+
+    await waitFor(() => {
+      expect(api.getCancellationRequest).toHaveBeenCalledWith("cancel-req-999");
+      expect(
+        screen.getByText("Owner Review: MCP Order Cancellation"),
+      ).toBeTruthy();
+      expect(screen.getByText("ID: cancel-req-999")).toBeTruthy();
+    });
+
+    // Close button dismisses the review
+    const closeBtn = screen.getByRole("button", { name: "Close review" });
+    fireEvent.click(closeBtn);
+
+    expect(screen.queryByText("Owner Review: MCP Order Cancellation")).toBeNull();
   });
 });

@@ -1,7 +1,23 @@
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
+
+_KNOWN_SCHWAB_PROVIDERS = frozenset({"schwab", "charles schwab"})
+_SCHWAB_ACCOUNT_MASK = re.compile(r"\*[0-9]{4}\Z")
+
+
+def is_schwab_account_masked(value: str) -> bool:
+    return _SCHWAB_ACCOUNT_MASK.fullmatch(value) is not None
+
+
+def is_schwab_provider(provider: str) -> bool:
+    return provider.strip().lower() in _KNOWN_SCHWAB_PROVIDERS
+
+
+def is_schwab_account_eligible(provider: str, currency: str) -> bool:
+    return is_schwab_provider(provider) and currency.strip().upper() == "USD"
 
 
 @dataclass(frozen=True)
@@ -12,13 +28,18 @@ class Account:
     account_type: str
     currency: str
 
-    def to_dict(self) -> dict[str, str]:
+    @property
+    def schwab_mapping_eligible(self) -> bool:
+        return is_schwab_account_eligible(self.provider, self.currency)
+
+    def to_dict(self) -> dict[str, str | bool]:
         return {
             "id": self.id,
             "provider": self.provider,
             "label": self.label,
             "account_type": self.account_type,
             "currency": self.currency,
+            "schwab_mapping_eligible": self.schwab_mapping_eligible,
         }
 
 
@@ -82,6 +103,7 @@ class AccountCapabilities:
     source: str
     blocks: tuple[CapabilityBlock, ...] = ()
     is_stale: bool = False
+    schwab_mapping_eligible: bool = False
 
     @property
     def is_trade_capable(self) -> bool:
@@ -115,6 +137,7 @@ class AccountCapabilities:
             "blocks": [block.to_dict() for block in self.blocks],
             "is_stale": self.is_stale,
             "is_trade_capable": self.is_trade_capable,
+            "schwab_mapping_eligible": self.schwab_mapping_eligible,
         }
 
 

@@ -9,7 +9,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
-from portfolio_mcp.database import CorruptedAuditRecordError, PortfolioRepository
+from portfolio_mcp.bootstrap import (
+    create_execution_settings,
+    create_schwab_settings,
+)
+from portfolio_mcp.config import ExecutionSettings, SchwabSettings
+from portfolio_mcp.database import (
+    AccountNotFoundError,
+    CorruptedAuditRecordError,
+    PortfolioRepository,
+    SchwabAccountMappingConflictError,
+)
 from portfolio_mcp.execution import (
     ExecutionProvider,
     FixtureExecutionProvider,
@@ -22,18 +32,27 @@ from portfolio_mcp.order_history import (
     OrderListFilters,
     decode_order_cursor,
     decode_order_event_cursor,
-    encode_order_cursor,
     encode_order_event_cursor,
 )
-from portfolio_mcp.order_reconciliation import OrderReconciliationService
+from portfolio_mcp.order_reconciliation import (
+    OrderReconciliationService,
+    format_order_page_response,
+)
 from portfolio_mcp.overview import OverviewService
 from portfolio_mcp.provider import (
     InstrumentNotFoundError,
     MarketDataProvider,
     PortfolioProvider,
+    ProviderAuthenticationError,
+    ProviderAuthorizationError,
     ProviderError,
+    ProviderRateLimitError,
+    ProviderResponseError,
+    ProviderUnavailableError,
 )
 from portfolio_mcp.refresh import PortfolioRefreshService
+from portfolio_mcp.schwab_readiness import SchwabReadinessService
+from portfolio_mcp.schwab_transport import SchwabOAuthTransport
 from portfolio_mcp.trading_safety import (
     TradingGuard,
     TradingSettingsError,
@@ -41,6 +60,9 @@ from portfolio_mcp.trading_safety import (
     settings_dict,
 )
 from portfolio_mcp.trading_service import (
+    McpAuthorizationError,
+    McpAuthorizationService,
+    OrderCancellationRequestService,
     OrderCancellationService,
     OrderDraftService,
     OrderSubmissionService,
@@ -48,6 +70,38 @@ from portfolio_mcp.trading_service import (
     TradingValidationError,
     fixture_submission_validator,
 )
+
+
+class SaveSchwabMappingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: str = Field(min_length=1, max_length=128)
+    confirmed: StrictBool
+
+
+def _schwab_mapping_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, AccountNotFoundError):
+        return HTTPException(status_code=404, detail="Portfolio account was not found")
+    if isinstance(exc, SchwabAccountMappingConflictError):
+        return HTTPException(status_code=409, detail="Schwab account is already mapped")
+    if isinstance(exc, (ProviderAuthenticationError, ProviderAuthorizationError)):
+        return HTTPException(status_code=403, detail="Schwab access is not authorized")
+    if isinstance(exc, ProviderRateLimitError):
+        return HTTPException(status_code=429, detail="Schwab rate limit reached")
+    if isinstance(exc, ProviderUnavailableError):
+        return HTTPException(status_code=503, detail="Schwab service is unavailable")
+    if isinstance(exc, ProviderResponseError):
+        return HTTPException(
+            status_code=502, detail="Schwab returned an invalid response"
+        )
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=400, detail="Invalid Schwab mapping request")
+    return HTTPException(status_code=500, detail="Unable to process Schwab mapping")
+
+
+class CreateCancellationMcpAuthorizationRequest(BaseModel):
+    expected_fingerprint: str
+    confirmed: StrictBool
 
 
 class CreateOrderDraftRequest(BaseModel):
@@ -62,6 +116,13 @@ class CreateOrderDraftRequest(BaseModel):
 class ConfirmOrderDraftRequest(BaseModel):
     expected_fingerprint: str
     confirmed: bool
+
+
+class CreateMcpAuthorizationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_fingerprint: str = Field(min_length=1, max_length=128)
+    confirmed: StrictBool
 
 
 class ConfirmOrderCancellationRequest(BaseModel):
@@ -93,11 +154,43 @@ def create_app(
     submission_validator: SubmissionValidator | None = None,
     database_url: str = "sqlite:///portfolio.db",
     clock: Callable[[], datetime] | None = None,
+    draft_service: OrderDraftService | None = None,
+    submission_service: OrderSubmissionService | None = None,
+    cancellation_service: OrderCancellationService | None = None,
+    cancellation_request_service: OrderCancellationRequestService | None = None,
+    mcp_auth_service: McpAuthorizationService | None = None,
+    schwab_readiness_service: SchwabReadinessService | None = None,
+    execution_settings: ExecutionSettings | None = None,
+    schwab_settings: SchwabSettings | None = None,
 ) -> FastAPI:
-    repository = PortfolioRepository(database_url, clock)
-    refresh_service = PortfolioRefreshService(provider, repository, clock)
-    market_data = market_data_provider or FixtureMarketDataProvider()
     service_clock = clock or (lambda: datetime.now(UTC))
+    repository = PortfolioRepository(database_url, service_clock)
+    exec_settings = (
+        execution_settings
+        if execution_settings is not None
+        else create_execution_settings()
+    )
+    schwab_conf = (
+        schwab_settings if schwab_settings is not None else create_schwab_settings()
+    )
+
+    schwab_transport = (
+        SchwabOAuthTransport(schwab_conf, context="Schwab Trader API")
+        if schwab_conf is not None
+        else None
+    )
+    readiness_service = (
+        schwab_readiness_service
+        if schwab_readiness_service is not None
+        else SchwabReadinessService(
+            repository,
+            schwab_transport,
+            exec_settings,
+            schwab_conf,
+        )
+    )
+    refresh_service = PortfolioRefreshService(provider, repository, service_clock)
+    market_data = market_data_provider or FixtureMarketDataProvider()
     execution = (
         execution_provider
         if execution_provider is not None
@@ -110,14 +203,37 @@ def create_app(
         validator = fixture_submission_validator(provider)
     settings_service = TradingSettingsService(repository, service_clock)
     trading_guard = TradingGuard(repository, settings_service)
-    draft_service = OrderDraftService(
-        repository, market_data, service_clock, trading_guard
+    active_mcp_auth = (
+        mcp_auth_service
+        if mcp_auth_service is not None
+        else McpAuthorizationService(repository, clock=service_clock)
     )
-    submission_service = OrderSubmissionService(
-        repository, execution, service_clock, validator, trading_guard
+    draft_service = (
+        draft_service
+        if draft_service is not None
+        else OrderDraftService(repository, market_data, service_clock, trading_guard)
     )
-    cancellation_service = OrderCancellationService(
-        repository, execution, service_clock
+    submission_service = (
+        submission_service
+        if submission_service is not None
+        else OrderSubmissionService(
+            repository,
+            execution,
+            service_clock,
+            validator,
+            trading_guard,
+            mcp_auth_service=active_mcp_auth,
+        )
+    )
+    active_cancellation_service = (
+        cancellation_service
+        if cancellation_service is not None
+        else OrderCancellationService(repository, execution, service_clock)
+    )
+    active_cancellation_request_service = (
+        cancellation_request_service
+        if cancellation_request_service is not None
+        else OrderCancellationRequestService(repository, execution, service_clock)
     )
     order_reader = order_read_provider
     if order_reader is None and type(execution) is FixtureExecutionProvider:
@@ -206,6 +322,72 @@ def create_app(
             )
         return {"capability": capability.to_dict()}
 
+    @app.get("/api/schwab/mapping")
+    async def list_schwab_mappings() -> dict[str, object]:
+        return {
+            "mappings": [
+                mapping.to_dict()
+                for mapping in repository.list_schwab_account_mappings()
+            ]
+        }
+
+    @app.get("/api/schwab/mapping/candidates")
+    async def list_schwab_candidates(
+        account_id: Annotated[str, Query(min_length=1)],
+    ) -> dict[str, object]:
+        try:
+            candidates = await readiness_service.list_candidates_for_account(account_id)
+            return {
+                "account_id": account_id,
+                "candidates": [candidate.to_dict() for candidate in candidates],
+            }
+        except Exception as exc:
+            raise _schwab_mapping_error(exc) from exc
+
+    @app.get("/api/schwab/mapping/{account_id}")
+    async def get_schwab_mapping(account_id: str) -> dict[str, object]:
+        mapping = repository.get_schwab_account_mapping(account_id)
+        if mapping is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No Schwab mapping exists for this portfolio account",
+            )
+        return {"mapping": mapping.to_dict()}
+
+    @app.post("/api/schwab/mapping/{account_id}")
+    async def save_schwab_mapping(
+        account_id: str, request: SaveSchwabMappingRequest
+    ) -> dict[str, object]:
+        try:
+            mapping = await readiness_service.save_verified_mapping(
+                account_id=account_id,
+                candidate_id=request.candidate_id,
+                confirmed=request.confirmed,
+            )
+            return {"mapping": mapping.to_dict()}
+        except Exception as exc:
+            raise _schwab_mapping_error(exc) from exc
+
+    @app.delete("/api/schwab/mapping/{account_id}")
+    async def delete_schwab_mapping(account_id: str) -> dict[str, object]:
+        deleted = repository.delete_schwab_account_mapping(account_id)
+        if not deleted:
+            raise HTTPException(
+                status_code=404,
+                detail="No Schwab mapping exists for this portfolio account",
+            )
+        return {"deleted": True, "account_id": account_id}
+
+    @app.get("/api/schwab/readiness")
+    async def all_schwab_readiness() -> dict[str, object]:
+        readiness_list = await readiness_service.check_all_readiness()
+        return {"readiness": [r.to_dict() for r in readiness_list]}
+
+    @app.get("/api/schwab/readiness/{account_id}")
+    async def account_schwab_readiness(account_id: str) -> dict[str, object]:
+        readiness = await readiness_service.check_account_readiness(account_id)
+        return {"readiness": readiness.to_dict()}
+
     @app.get("/api/refreshes/latest")
     async def latest_refresh() -> dict[str, object]:
         result = repository.latest_refresh()
@@ -272,6 +454,92 @@ def create_app(
         )
         return {"order": order.to_dict()}
 
+    @app.post("/api/order-drafts/{draft_id}/mcp-authorization")
+    async def create_mcp_authorization(
+        draft_id: str, request: CreateMcpAuthorizationRequest
+    ) -> dict[str, object]:
+        if not request.confirmed:
+            raise HTTPException(
+                status_code=422,
+                detail="Explicit confirmation is required",
+            )
+        draft = repository.order_draft(draft_id)
+        if draft is None:
+            raise HTTPException(status_code=404, detail="Order draft not found")
+        if draft.fingerprint != request.expected_fingerprint:
+            raise HTTPException(
+                status_code=409,
+                detail="The reviewed draft no longer matches",
+            )
+        now = service_clock()
+        if now > draft.expires_at:
+            raise HTTPException(status_code=409, detail="Order draft has expired")
+        existing = repository.order_for_draft(draft_id)
+        if existing is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="An order has already been created for this draft",
+            )
+        try:
+            created = active_mcp_auth.create_authorization(
+                action="submit", target_draft_id=draft_id
+            )
+        except McpAuthorizationError as error:
+            raise HTTPException(status_code=409, detail=str(error))
+        return {
+            "authorization_id": created.id,
+            "code": created.plaintext_code,
+            "expires_at": created.expires_at.isoformat(),
+            "draft": {
+                "id": draft.id,
+                "symbol": draft.symbol,
+                "side": draft.side,
+                "quantity": str(draft.quantity),
+                "order_type": draft.order_type,
+                "limit_price": (
+                    str(draft.limit_price) if draft.limit_price is not None else None
+                ),
+                "fingerprint": draft.fingerprint,
+            },
+        }
+
+    @app.get("/api/cancellation-requests/{request_id}")
+    async def get_cancellation_request(request_id: str) -> dict[str, object]:
+        req = active_cancellation_request_service.get_request(request_id)
+        if req is None:
+            raise HTTPException(
+                status_code=404, detail="Cancellation request not found"
+            )
+        return {"cancellation_request": req.to_dict()}
+
+    @app.post("/api/cancellation-requests/{request_id}/mcp-authorization")
+    async def create_cancellation_mcp_authorization(
+        request_id: str, request: CreateCancellationMcpAuthorizationRequest
+    ) -> dict[str, object]:
+        if not request.confirmed:
+            raise HTTPException(
+                status_code=422,
+                detail="Explicit confirmation is required",
+            )
+        try:
+            stored_req, created = active_mcp_auth.authorize_cancellation_request(
+                request_id=request_id,
+                expected_fingerprint=request.expected_fingerprint,
+                now=service_clock(),
+            )
+            return {
+                "authorization_id": created.id,
+                "code": created.plaintext_code,
+                "expires_at": created.expires_at.isoformat(),
+                "cancellation_request": stored_req.to_dict(),
+            }
+        except McpAuthorizationError as error:
+            if error.code == "cancellation_request_not_found":
+                raise HTTPException(
+                    status_code=404, detail="Cancellation request not found"
+                )
+            raise HTTPException(status_code=409, detail=error.message)
+
     @app.get("/api/orders")
     async def list_orders(
         account_id: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
@@ -315,44 +583,7 @@ def create_app(
             start_date=start_date,
             end_date=end_date,
         )
-        plans = reconciliation.plan_for_orders(page.items) if reconciliation else ()
-        plans_by_group = {(plan.provider, plan.account_id): plan for plan in plans}
-        orders: list[dict[str, object]] = []
-        for order in page.items:
-            plan = plans_by_group.get((order.provider, order.account_id))
-            serialized = order.to_dict()
-            serialized["reconciliation"] = {
-                "status": order.result_code or "pending",
-                "source": (
-                    order.result_source.value
-                    if order.result_source is not None
-                    else None
-                ),
-                "provider_updated_at": (
-                    order.provider_updated_at.isoformat()
-                    if order.provider_updated_at is not None
-                    else None
-                ),
-                "next_refresh_at": (
-                    plan.next_refresh_at.isoformat() if plan is not None else None
-                ),
-                "target_order_id": plan.target_order_id if plan is not None else None,
-            }
-            orders.append(serialized)
-        return {
-            "orders": orders,
-            "next_cursor": encode_order_cursor(page.next_cursor),
-            "refresh_groups": [
-                {
-                    "provider": plan.provider,
-                    "account_id": plan.account_id,
-                    "target_order_id": plan.target_order_id,
-                    "next_refresh_at": plan.next_refresh_at.isoformat(),
-                }
-                for plan in plans
-            ],
-            "server_time": service_clock().astimezone(UTC).isoformat(),
-        }
+        return format_order_page_response(page, reconciliation, service_clock())
 
     @app.get("/api/order-audit")
     async def list_order_audit(
@@ -459,7 +690,7 @@ def create_app(
     async def confirm_order_cancellation(
         order_id: str, request: ConfirmOrderCancellationRequest
     ) -> dict[str, object]:
-        order = await cancellation_service.cancel(
+        order = await active_cancellation_service.cancel(
             order_id=order_id,
             expected_version=request.expected_version,
             expected_state=request.expected_state,
