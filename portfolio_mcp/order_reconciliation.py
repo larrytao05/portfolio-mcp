@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from portfolio_mcp.database import (
+    OrderPage,
     OrderRefreshPlan,
     PortfolioRepository,
     ReconciliationClaim,
@@ -18,7 +19,11 @@ from portfolio_mcp.execution import (
     OrderReadProvider,
     OrderState,
 )
-from portfolio_mcp.order_history import OrderStatusSource, require_aware_utc
+from portfolio_mcp.order_history import (
+    OrderStatusSource,
+    encode_order_cursor,
+    require_aware_utc,
+)
 
 _MATCH_BEFORE = timedelta(seconds=30)
 _MATCH_AFTER = timedelta(minutes=2)
@@ -377,3 +382,47 @@ class OrderReconciliationService:
             )
         except (ExecutionError, ValueError):
             return self._finish_without_match(claim, now, "refused")
+
+
+def format_order_page_response(
+    page: OrderPage[StoredOrder],
+    reconciliation: OrderReconciliationService | None,
+    server_time: datetime,
+) -> dict[str, object]:
+    plans = reconciliation.plan_for_orders(page.items) if reconciliation else ()
+    plans_by_group = {(plan.provider, plan.account_id): plan for plan in plans}
+    orders: list[dict[str, object]] = []
+    for order in page.items:
+        plan = plans_by_group.get((order.provider, order.account_id))
+        serialized = order.to_dict()
+        serialized["reconciliation"] = {
+            "status": order.result_code or "pending",
+            "source": (
+                order.result_source.value if order.result_source is not None else None
+            ),
+            "provider_updated_at": (
+                order.provider_updated_at.isoformat()
+                if order.provider_updated_at is not None
+                else None
+            ),
+            "next_refresh_at": (
+                plan.next_refresh_at.isoformat() if plan is not None else None
+            ),
+            "target_order_id": plan.target_order_id if plan is not None else None,
+        }
+        orders.append(serialized)
+
+    return {
+        "orders": orders,
+        "next_cursor": encode_order_cursor(page.next_cursor),
+        "refresh_groups": [
+            {
+                "provider": plan.provider,
+                "account_id": plan.account_id,
+                "target_order_id": plan.target_order_id,
+                "next_refresh_at": plan.next_refresh_at.isoformat(),
+            }
+            for plan in plans
+        ],
+        "server_time": require_aware_utc(server_time).isoformat(),
+    }
