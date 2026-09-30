@@ -4,7 +4,8 @@ import asyncio
 import hashlib
 import json
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from uuid import uuid4
@@ -45,6 +46,7 @@ from portfolio_mcp.order_history import (
     OrderStatusSource,
 )
 from portfolio_mcp.provider import MarketDataProvider, PortfolioProvider
+from portfolio_mcp.submission_locks import SubmissionLockError
 from portfolio_mcp.trading_safety import (
     GuardDecision,
     TradeIntent,
@@ -202,16 +204,17 @@ class OrderSubmissionService:
             repository, TradingSettingsService(repository, clock)
         )
         self._mcp_auth_service = mcp_auth_service
-        if self._repository.has_stranded_submissions():
-            self._repository.recover_stranded_submissions(_utc_now(self._clock()))
 
     async def confirm(
         self, draft_id: str, expected_fingerprint: str, confirmed: bool
     ) -> StoredOrder:
         attempt_id = uuid4()
         try:
-            return await self._confirm(draft_id, expected_fingerprint, confirmed)
+            with self._submission_claim(draft_id):
+                return await self._confirm(draft_id, expected_fingerprint, confirmed)
         except TradingValidationError as error:
+            if error.code in {"submission_in_progress", "submission_lock_unavailable"}:
+                raise
             now = _utc_now(self._clock())
             self._repository.record_authorization_failure(
                 attempt_id=attempt_id,
@@ -257,6 +260,10 @@ class OrderSubmissionService:
         return await self._execute_submission(draft, OrderEventActor.DASHBOARD)
 
     async def submit_authorized(self, draft_id: str, code: str) -> StoredOrder:
+        with self._submission_claim(draft_id):
+            return await self._submit_authorized(draft_id, code)
+
+    async def _submit_authorized(self, draft_id: str, code: str) -> StoredOrder:
         if self._mcp_auth_service is None:
             raise TradingValidationError(
                 "mcp_auth_unavailable", "MCP authorization service is unavailable"
@@ -287,6 +294,23 @@ class OrderSubmissionService:
             ) from error
 
         return await self._execute_submission(draft, OrderEventActor.MCP)
+
+    @contextmanager
+    def _submission_claim(self, draft_id: str) -> Iterator[None]:
+        try:
+            with self._repository.submission_claim(draft_id) as claimed:
+                if not claimed:
+                    raise TradingValidationError(
+                        "submission_in_progress",
+                        "A submission for this draft is already in progress",
+                    )
+                yield
+        except SubmissionLockError as error:
+            raise TradingValidationError(
+                "submission_lock_unavailable",
+                "Submission is unavailable because its ownership lock could not "
+                "be acquired",
+            ) from error
 
     async def _execute_submission(
         self, draft: OrderDraft, actor: OrderEventActor

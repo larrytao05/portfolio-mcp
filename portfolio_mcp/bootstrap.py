@@ -7,6 +7,7 @@ from portfolio_mcp.config import (
     SchwabSettings,
     SnapTradeSettings,
 )
+from portfolio_mcp.execution import ExecutionProvider, FixtureExecutionProvider
 from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
 from portfolio_mcp.provider import (
     MarketDataProvider,
@@ -15,6 +16,22 @@ from portfolio_mcp.provider import (
 )
 from portfolio_mcp.schwab_market_data import SchwabMarketDataProvider
 from portfolio_mcp.snaptrade import SnapTradeProvider
+from portfolio_mcp.trading_service import (
+    SubmissionValidator,
+    fixture_submission_validator,
+)
+
+
+def resolve_submission_validator(
+    provider: PortfolioProvider,
+    execution_provider: ExecutionProvider,
+    validator: SubmissionValidator | None,
+) -> SubmissionValidator:
+    if validator is not None:
+        return validator
+    if type(execution_provider) is FixtureExecutionProvider:
+        return fixture_submission_validator(provider)
+    raise ValueError("A final trading policy validator is required")
 
 
 def create_provider(

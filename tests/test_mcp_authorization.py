@@ -10,6 +10,7 @@ from portfolio_mcp.database import (
     OrderDraftRecord,
     PortfolioRepository,
 )
+from portfolio_mcp.order_history import OrderEventType
 from portfolio_mcp.trading_service import (
     CreatedMcpAuthorization,
     McpAuthorizationError,
@@ -236,6 +237,15 @@ def test_consume_fails_with_generic_error_and_increments_attempts(tmp_path) -> N
         assert rec.failed_attempts == 1
         assert rec.consumed_at is None
 
+    failed_events = [
+        event
+        for event in repo.list_order_events(draft_id="draft-1").items
+        if event.event_type == OrderEventType.AUTHORIZATION_FAILED
+    ]
+    assert len(failed_events) == 1
+    assert failed_events[0].details["reason"] == "verification_failed"
+    assert "00000000" not in str(failed_events[0].details)
+
 
 def test_consume_locks_out_after_five_failed_attempts(tmp_path) -> None:
     now = datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
@@ -314,6 +324,12 @@ def test_consume_fails_on_expired_code(tmp_path) -> None:
         assert rec is not None
         assert rec.invalidation_reason == "expired"
         assert rec.consumed_at is None
+    failed_events = [
+        event
+        for event in repo.list_order_events(draft_id="draft-1").items
+        if event.event_type == OrderEventType.AUTHORIZATION_FAILED
+    ]
+    assert failed_events[-1].details["reason"] == "authorization_expired"
 
 
 def test_consume_fails_on_mismatched_target_or_fingerprint_or_account(
@@ -341,6 +357,13 @@ def test_consume_fails_on_mismatched_target_or_fingerprint_or_account(
             candidate_code="12345678",
         )
     assert exc_info.value.code == "invalid_or_expired_code"
+    failed_events = [
+        event
+        for event in repo.list_order_events(limit=100).items
+        if event.event_type == OrderEventType.AUTHORIZATION_FAILED
+    ]
+    assert failed_events[-1].details["reason"] == "no_active_authorization"
+    assert failed_events[-1].details["action"] == "submit"
 
     # Wrong action
     with pytest.raises(McpAuthorizationError) as exc_info:

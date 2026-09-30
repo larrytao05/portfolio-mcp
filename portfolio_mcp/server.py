@@ -6,6 +6,7 @@ from datetime import UTC, date, datetime
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
+from portfolio_mcp.bootstrap import resolve_submission_validator
 from portfolio_mcp.database import PortfolioRepository
 from portfolio_mcp.execution import (
     ExecutionProvider,
@@ -28,6 +29,7 @@ from portfolio_mcp.provider import (
     MarketDataProvider,
     PortfolioProvider,
 )
+from portfolio_mcp.submission_locks import SubmissionLockError
 from portfolio_mcp.trading_safety import (
     TradingGuard,
     TradingSettingsService,
@@ -39,8 +41,8 @@ from portfolio_mcp.trading_service import (
     OrderCancellationService,
     OrderDraftService,
     OrderSubmissionService,
+    SubmissionValidator,
     TradingValidationError,
-    fixture_submission_validator,
 )
 
 
@@ -50,6 +52,7 @@ def create_server(
     market_data_provider: MarketDataProvider | None = None,
     execution_provider: ExecutionProvider | None = None,
     order_read_provider: OrderReadProvider | None = None,
+    submission_validator: SubmissionValidator | None = None,
     database_url: str = "sqlite:///portfolio.db",
     clock: Callable[[], datetime] | None = None,
     repository: PortfolioRepository | None = None,
@@ -79,6 +82,7 @@ def create_server(
         if execution_provider is not None
         else FixtureExecutionProvider(clock=service_clock)
     )
+    validator = resolve_submission_validator(provider, execution, submission_validator)
 
     order_reader = order_read_provider
     if order_reader is None and isinstance(execution, FixtureExecutionProvider):
@@ -95,15 +99,27 @@ def create_server(
     )
 
     active_submission_service = submission_service
+    recover_on_reads = active_submission_service is None
     if active_submission_service is None:
         active_submission_service = OrderSubmissionService(
             repository=repo,
             execution_provider=execution,
             clock=service_clock,
-            validator=fixture_submission_validator(provider),
+            validator=validator,
             trading_guard=trading_guard,
             mcp_auth_service=active_mcp_auth,
         )
+
+    if recover_on_reads:
+        repo.recover_stranded_submissions(service_clock())
+
+    def recover_before_order_read() -> None:
+        if not recover_on_reads:
+            return
+        try:
+            repo.recover_stranded_submissions(service_clock())
+        except SubmissionLockError as error:
+            raise ToolError("submission_recovery_unavailable") from error
 
     active_cancellation_service = (
         cancellation_service
@@ -220,8 +236,9 @@ def create_server(
     ) -> dict[str, object]:
         """List orders matching optional filters with forward-only pagination.
 
-        Read-only. Does not place or modify orders. Does not expose raw provider
-        responses or broker account hashes.
+        Does not place broker orders or expose raw provider responses or broker
+        account hashes. It may mark an interrupted submission UNKNOWN after checking
+        that its owner has exited.
         """
         start = _parse_date(start_date, "start_date") if start_date else None
         end = _parse_date(end_date, "end_date") if end_date else None
@@ -256,6 +273,7 @@ def create_server(
         except ValueError as error:
             raise ToolError("invalid_cursor: Invalid order cursor") from error
 
+        recover_before_order_read()
         page = repo.list_orders(
             limit=limit,
             after=after,
@@ -273,9 +291,11 @@ def create_server(
     async def get_order(order_id: str) -> dict[str, object]:
         """Get details of an existing order by ID.
 
-        Read-only. Does not place or modify orders. Does not expose raw provider
-        responses or broker account hashes.
+        Does not place broker orders or expose raw provider responses or broker
+        account hashes. It may mark an interrupted submission UNKNOWN after checking
+        that its owner has exited.
         """
+        recover_before_order_read()
         order = repo.order(order_id)
         if order is None:
             raise ToolError(f"order_not_found: Order '{order_id}' not found")

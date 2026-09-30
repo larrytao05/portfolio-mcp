@@ -31,6 +31,8 @@ class OrderEventType(StrEnum):
     RECONCILIATION_RESULT = "reconciliation_result"
     CANCELLATION_REQUESTED = "cancellation_requested"
     CANCELLATION_RESULT = "cancellation_result"
+    CANCELLATION_REQUEST_CREATED = "cancellation_request_created"
+    CANCELLATION_REQUEST_INVALIDATED = "cancellation_request_invalidated"
 
 
 class OrderEventCode(StrEnum):
@@ -324,7 +326,8 @@ _EVENT_DETAILS: dict[OrderEventType, EventDetailsSchema] = {
         frozenset({"authorization_id", "action"}),
     ),
     OrderEventType.AUTHORIZATION_FAILED: EventDetailsSchema(
-        frozenset({"attempt_id", "action"}), frozenset({"attempt_id", "action"})
+        frozenset({"attempt_id", "action", "reason"}),
+        frozenset({"attempt_id", "action"}),
     ),
     OrderEventType.SUBMISSION_STARTED: EventDetailsSchema(frozenset()),
     OrderEventType.SUBMISSION_RESULT: EventDetailsSchema(
@@ -358,6 +361,12 @@ _EVENT_DETAILS: dict[OrderEventType, EventDetailsSchema] = {
     OrderEventType.CANCELLATION_RESULT: EventDetailsSchema(
         frozenset({"attempt_id", "outcome"}), frozenset({"attempt_id", "outcome"})
     ),
+    OrderEventType.CANCELLATION_REQUEST_CREATED: EventDetailsSchema(
+        frozenset({"request_id", "expires_at"}), frozenset({"request_id", "expires_at"})
+    ),
+    OrderEventType.CANCELLATION_REQUEST_INVALIDATED: EventDetailsSchema(
+        frozenset({"request_id", "reason"}), frozenset({"request_id", "reason"})
+    ),
 }
 if set(_EVENT_DETAILS) != set(OrderEventType):
     raise RuntimeError("Every order event type must define a details schema")
@@ -381,6 +390,35 @@ def encode_event_details(
             except (TypeError, ValueError, AttributeError) as error:
                 raise ValueError(f"Invalid {key} for order event") from error
             continue
+        if key == "request_id":
+            try:
+                normalized[key] = str(UUID(str(value)))
+            except (TypeError, ValueError, AttributeError) as error:
+                raise ValueError(
+                    "Invalid cancellation request id for order event"
+                ) from error
+            continue
+        if key == "reason" and value not in {
+            "no_active_authorization",
+            "authorization_expired",
+            "verification_failed",
+            "authorization_unavailable",
+            "superseded",
+            "order_state_changed",
+            "order_not_cancelable",
+            "cancellation_started",
+            "order_accepted",
+            "order_submitting",
+            "order_partially_filled",
+            "order_cancel_pending",
+            "order_canceled",
+            "order_filled",
+            "order_rejected",
+            "order_expired",
+            "order_unknown",
+            "expired",
+        }:
+            raise ValueError("Invalid cancellation invalidation reason")
         if key == "action" and value not in {"submit", "cancel"}:
             raise ValueError("Invalid authorization action for order event")
         if key == "status_source" and value not in set(OrderStatusSource):

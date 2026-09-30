@@ -450,3 +450,59 @@ def test_pre_migration_order_remains_readable_without_synthetic_history(
     assert order.result_source is None
     assert order.draft.id == "draft-legacy"
     assert repository.list_order_events(order_id=order.id).items == ()
+
+
+def test_cancellation_audit_migration_preserves_events_and_append_only_triggers(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "cancellation-audit-migration.db"
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+    config.set_main_option("sqlalchemy.url", f"sqlite:///{database_path}")
+    command.upgrade(config, "20260927_0015")
+
+    with connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO order_events "
+            "(event_id, draft_id, order_id, account_id, event_type, actor, "
+            "previous_state, next_state, code, details_schema_version, details_json, "
+            "deduplication_key, occurred_at) "
+            "VALUES (?, NULL, NULL, NULL, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)",
+            (
+                str(uuid4()),
+                "draft_created",
+                "system",
+                1,
+                "{}",
+                "migration-preservation-check",
+                datetime(2026, 9, 30, 12, 0, tzinfo=UTC).isoformat(),
+            ),
+        )
+
+    command.upgrade(config, "head")
+    with connect(database_path) as connection:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM order_events "
+                "WHERE deduplication_key = 'migration-preservation-check'"
+            ).fetchone()[0]
+            == 1
+        )
+        connection.execute(
+            "INSERT INTO order_events "
+            "(event_id, event_type, actor, details_schema_version, details_json, "
+            "deduplication_key, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                str(uuid4()),
+                "cancellation_request_created",
+                "system",
+                1,
+                "{}",
+                "new-cancellation-event-check",
+                datetime(2026, 9, 30, 12, 1, tzinfo=UTC).isoformat(),
+            ),
+        )
+        with pytest.raises(SQLiteIntegrityError, match="append-only"):
+            connection.execute(
+                "UPDATE order_events SET actor = 'mcp' "
+                "WHERE deduplication_key = 'migration-preservation-check'"
+            )

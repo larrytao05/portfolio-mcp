@@ -1,9 +1,11 @@
 import asyncio
+import multiprocessing
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import cast
+from multiprocessing.connection import Connection
+from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,6 +23,8 @@ from portfolio_mcp.execution import (
     require_transition,
 )
 from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
+from portfolio_mcp.server import create_server
+from portfolio_mcp.submission_locks import SubmissionLockError
 from portfolio_mcp.trading_safety import (
     TradeIntent,
     TradingGuard,
@@ -33,6 +37,43 @@ from portfolio_mcp.trading_service import (
     allow_fixture_submission,
     fixture_submission_validator,
 )
+
+
+def _start_mcp_and_report_order_state(
+    database_url: str, draft_id: str, now: datetime, connection: Connection
+) -> None:
+    repository = PortfolioRepository(database_url, lambda: now)
+    create_server(
+        FixturePortfolioProvider(),
+        database_url=database_url,
+        clock=lambda: now,
+        repository=repository,
+    )
+    order = repository.order_for_draft(draft_id)
+    connection.send(order.state.value if order is not None else None)
+    connection.close()
+
+
+def _submit_and_wait_for_termination(
+    database_url: str,
+    draft_id: str,
+    fingerprint: str,
+    now: datetime,
+    started: Any,
+) -> None:
+    repository = PortfolioRepository(database_url, lambda: now)
+
+    class BlockingProvider(FixtureExecutionProvider):
+        async def submit_order(self, command: ExecutionCommand) -> ExecutionResult:
+            self.invocations.append(("submit", command.client_order_id))
+            started.set()
+            await asyncio.sleep(3600)
+            raise AssertionError("the terminated provider call unexpectedly returned")
+
+    service = OrderSubmissionService(
+        repository, BlockingProvider(), lambda: now, allow_fixture_submission
+    )
+    asyncio.run(service.confirm(draft_id, fingerprint, True))
 
 
 def command() -> ExecutionCommand:
@@ -992,15 +1033,139 @@ async def test_startup_recovers_stranded_submitting_order_without_resubmission(
     pending, created = repository.begin_order_submission(draft, now)
     assert created
     provider = FixtureExecutionProvider()
-    restarted = OrderSubmissionService(
-        repository, provider, lambda: now, allow_fixture_submission
+    create_server(
+        FixturePortfolioProvider(),
+        execution_provider=provider,
+        database_url=f"sqlite:///{tmp_path / 'portfolio.db'}",
+        clock=lambda: now,
+        repository=repository,
     )
 
-    order = await restarted.confirm(draft.id, draft.fingerprint, True)
+    order = repository.order_for_draft(draft.id)
 
+    assert order is not None
     assert order.id == pending.id
     assert order.state == OrderState.UNKNOWN
     assert provider.invocations == []
+
+
+@pytest.mark.asyncio
+async def test_api_order_list_recovers_submission_after_app_startup(tmp_path) -> None:
+    now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+    database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
+    repository = PortfolioRepository(database_url, lambda: now)
+    draft = await create_limit_draft(repository, now)
+    provider = FixtureExecutionProvider()
+    app = create_app(
+        FixturePortfolioProvider(),
+        execution_provider=provider,
+        database_url=database_url,
+        clock=lambda: now,
+    )
+    pending, created = repository.begin_order_submission(draft, now)
+    assert created
+
+    response = TestClient(app).get("/api/orders")
+
+    assert response.status_code == 200
+    assert response.json()["orders"][0]["id"] == pending.id
+    assert response.json()["orders"][0]["state"] == OrderState.UNKNOWN.value
+    assert provider.invocations == []
+
+
+@pytest.mark.asyncio
+async def test_mcp_startup_does_not_recover_live_submission(tmp_path) -> None:
+    now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+    database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
+    repository = PortfolioRepository(database_url, lambda: now)
+    draft = await create_limit_draft(repository, now)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingProvider(FixtureExecutionProvider):
+        async def submit_order(self, command: ExecutionCommand) -> ExecutionResult:
+            self.invocations.append(("submit", command.client_order_id))
+            entered.set()
+            await release.wait()
+            return ExecutionResult(
+                OrderState.ACCEPTED, f"fixture-{command.client_order_id}"
+            )
+
+    provider = BlockingProvider()
+    service = OrderSubmissionService(
+        repository, provider, lambda: now, allow_fixture_submission
+    )
+    submission = asyncio.create_task(service.confirm(draft.id, draft.fingerprint, True))
+    await entered.wait()
+
+    context = multiprocessing.get_context("spawn")
+    receive, send = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_start_mcp_and_report_order_state,
+        args=(database_url, draft.id, now, send),
+    )
+    process.start()
+    send.close()
+    process_state = None
+    got_process_state = False
+    try:
+        got_process_state = receive.poll(30)
+        if got_process_state:
+            process_state = receive.recv()
+        process.join(timeout=30)
+    finally:
+        receive.close()
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=30)
+        release.set()
+    completed = await submission
+
+    assert got_process_state, "MCP process did not finish startup recovery"
+    assert process.exitcode == 0
+    assert process_state == OrderState.SUBMITTING.value
+    assert completed.state == OrderState.ACCEPTED
+    assert completed.broker_order_id == f"fixture-{completed.client_order_id}"
+    assert [name for name, _ in provider.invocations].count("submit") == 1
+
+
+@pytest.mark.asyncio
+async def test_dead_submission_process_is_recovered_without_retry(tmp_path) -> None:
+    now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+    database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
+    repository = PortfolioRepository(database_url, lambda: now)
+    draft = await create_limit_draft(repository, now)
+    context = multiprocessing.get_context("spawn")
+    started = context.Event()
+    process = context.Process(
+        target=_submit_and_wait_for_termination,
+        args=(database_url, draft.id, draft.fingerprint, now, started),
+    )
+    process.start()
+    try:
+        assert started.wait(30), "provider write did not start"
+        pending = repository.order_for_draft(draft.id)
+        assert pending is not None
+        assert pending.state == OrderState.SUBMITTING
+    finally:
+        process.terminate()
+        process.join(timeout=30)
+
+    assert process.exitcode is not None
+    assert repository.recover_stranded_submissions(now) == 1
+    recovered = repository.order_for_draft(draft.id)
+    assert recovered is not None
+    assert recovered.state == OrderState.UNKNOWN
+    assert repository.recover_stranded_submissions(now) == 0
+
+    retry_provider = FixtureExecutionProvider()
+    service = OrderSubmissionService(
+        repository, retry_provider, lambda: now, allow_fixture_submission
+    )
+    result = await service.confirm(draft.id, draft.fingerprint, True)
+
+    assert result.state == OrderState.UNKNOWN
+    assert retry_provider.invocations == []
 
 
 @pytest.mark.asyncio
@@ -1028,11 +1193,13 @@ async def test_concurrent_confirmations_create_one_order_and_authorization(
     )
     first = asyncio.create_task(service.confirm(draft.id, draft.fingerprint, True))
     await started.wait()
-    second = await service.confirm(draft.id, draft.fingerprint, True)
+    with pytest.raises(TradingValidationError) as error:
+        await service.confirm(draft.id, draft.fingerprint, True)
+    assert error.value.code == "submission_in_progress"
     release.set()
     completed = await first
 
-    assert completed.id == second.id
+    assert completed.state == OrderState.ACCEPTED
     assert [entry for entry in provider.invocations if entry[0] == "submit"] == [
         ("submit", completed.client_order_id)
     ]
@@ -1041,6 +1208,34 @@ async def test_concurrent_confirmations_create_one_order_and_authorization(
     assert authorization.expected_fingerprint == draft.fingerprint
     assert authorization.account_id == draft.account_id
     assert authorization.actor == "dashboard-owner"
+    events = repository.list_order_events(order_id=completed.id, limit=100).items
+    assert not any(event.event_type.value == "authorization_failed" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_submission_lock_failure_fails_closed_without_auth_failure_audit(
+    tmp_path, monkeypatch
+) -> None:
+    now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    draft = await create_limit_draft(repository, now)
+    provider = FixtureExecutionProvider()
+    service = OrderSubmissionService(
+        repository, provider, lambda: now, allow_fixture_submission
+    )
+
+    def fail_claim(draft_id: str):
+        del draft_id
+        raise SubmissionLockError("permission denied")
+
+    monkeypatch.setattr(repository, "submission_claim", fail_claim)
+    with pytest.raises(TradingValidationError) as error:
+        await service.confirm(draft.id, draft.fingerprint, True)
+
+    assert error.value.code == "submission_lock_unavailable"
+    assert provider.invocations == []
+    events = repository.list_order_events(draft_id=draft.id, limit=100).items
+    assert not any(event.event_type.value == "authorization_failed" for event in events)
 
 
 @pytest.mark.asyncio

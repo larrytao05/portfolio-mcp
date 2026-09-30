@@ -74,12 +74,17 @@ async def test_tool_descriptions_conformance() -> None:
         "get_trading_status",
         "search_instruments",
         "get_order_draft",
-        "list_orders",
-        "get_order",
     ]
     for name in read_only_tools:
         description = (tools_by_name[name].description or "").lower()
         assert "read-only" in description, f"{name} must state it is read-only"
+
+    recovery_tools = ["list_orders", "get_order"]
+    for name in recovery_tools:
+        description = (tools_by_name[name].description or "").lower()
+        assert "does not place broker orders" in description
+        assert "interrupted submission" in description
+        assert "unknown" in description
 
     # Draft tools must state drafts are not orders and require independent review
     for name in ["create_order_draft", "get_order_draft"]:
@@ -267,7 +272,14 @@ async def test_list_orders_and_get_order_tools(tmp_path) -> None:
 
     await PortfolioRefreshService(provider, repo, clock=lambda: now).refresh()
 
-    # Seed an order in repository
+    server = create_server(
+        provider,
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        repository=repo,
+        clock=lambda: now,
+    )
+
+    # Seed an interrupted submission after startup to exercise read recovery.
     with repo._sessions.begin() as session:
         session.add(
             OrderDraftRecord(
@@ -309,11 +321,11 @@ async def test_list_orders_and_get_order_tools(tmp_path) -> None:
                 order_type="limit",
                 quantity=Decimal("10"),
                 limit_price=Decimal("220.00"),
-                state=OrderState.ACCEPTED.value,
-                broker_order_id="broker-12345",
-                result_code="accepted",
-                result_message="Order accepted by broker",
-                result_source=OrderStatusSource.PROVIDER.value,
+                state=OrderState.SUBMITTING.value,
+                broker_order_id=None,
+                result_code="submitting",
+                result_message=None,
+                result_source=OrderStatusSource.SYSTEM.value,
                 filled_quantity=Decimal("0"),
                 average_fill_price=None,
                 provider_submission_started_at=now,
@@ -324,13 +336,6 @@ async def test_list_orders_and_get_order_tools(tmp_path) -> None:
                 version=1,
             )
         )
-
-    server = create_server(
-        provider,
-        database_url=f"sqlite:///{tmp_path / 'test.db'}",
-        repository=repo,
-        clock=lambda: now,
-    )
 
     # 1. List orders
     list_result = await server.call_tool(
@@ -345,6 +350,7 @@ async def test_list_orders_and_get_order_tools(tmp_path) -> None:
     assert len(list_data["orders"]) == 1
     order_item = list_data["orders"][0]
     assert order_item["id"] == "order-test-1"
+    assert order_item["state"] == OrderState.UNKNOWN.value
     assert order_item["instrument"]["symbol"] == "VTI"
 
     # 2. Get order by ID

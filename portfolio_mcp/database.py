@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal, cast
+from typing import ContextManager, Literal, cast
 from uuid import UUID, uuid4
 
 from alembic.config import Config
@@ -63,6 +63,7 @@ from portfolio_mcp.order_history import (
     order_list_filter_digest,
     require_aware_utc,
 )
+from portfolio_mcp.submission_locks import SubmissionLocks
 
 
 class Base(DeclarativeBase):
@@ -398,7 +399,8 @@ class OrderEventRecord(Base):
             "'authorization_consumed', 'authorization_failed', "
             "'submission_started', 'submission_result', 'status_transition', "
             "'reconciliation_attempted', 'reconciliation_result', "
-            "'cancellation_requested', 'cancellation_result')",
+            "'cancellation_requested', 'cancellation_result', "
+            "'cancellation_request_created', 'cancellation_request_invalidated')",
             name="ck_order_events_type",
         ),
     )
@@ -965,11 +967,15 @@ class PortfolioRepository:
         database_url: str,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        self._submission_locks = SubmissionLocks.from_database_url(database_url)
         upgrade_database(database_url)
         self._sessions = sessionmaker(
             create_engine_for(database_url), expire_on_commit=False
         )
         self._clock = clock or (lambda: datetime.now(UTC))
+
+    def submission_claim(self, draft_id: str) -> ContextManager[bool]:
+        return self._submission_locks.claim(draft_id)
 
     def save_order_draft(
         self,
@@ -1128,44 +1134,102 @@ class PortfolioRepository:
             return self._active_mcp_authorization(record)
 
     def record_mcp_authorization_failure(
-        self, *, authorization_id: str, max_attempts: int = 5
+        self,
+        *,
+        action: str,
+        reason: str,
+        authorization_id: str | None = None,
+        target_draft_id: str | None = None,
+        target_cancellation_request_id: str | None = None,
+        max_attempts: int = 5,
     ) -> None:
         with self._sessions.begin() as session:
-            record = session.get(McpAuthorizationRecord, authorization_id)
-            stmt = (
-                update(McpAuthorizationRecord)
-                .where(
-                    McpAuthorizationRecord.id == authorization_id,
-                    McpAuthorizationRecord.consumed_at.is_(None),
-                    McpAuthorizationRecord.invalidation_reason.is_(None),
-                )
-                .values(
-                    failed_attempts=McpAuthorizationRecord.failed_attempts + 1,
-                    invalidation_reason=case(
-                        (
-                            McpAuthorizationRecord.failed_attempts + 1 >= max_attempts,
-                            "max_attempts_exceeded",
-                        ),
-                        else_=None,
-                    ),
-                )
+            record = (
+                session.get(McpAuthorizationRecord, authorization_id)
+                if authorization_id is not None
+                else None
             )
-            session.execute(stmt)
-            if record is not None:
-                attempt_id = str(uuid4())
-                now = require_aware_utc(self._clock())
-                _append_order_event(
-                    session,
-                    draft_id=record.target_draft_id,
-                    order_id=record.target_order_id,
-                    account_id=record.account_id,
-                    event_type=OrderEventType.AUTHORIZATION_FAILED,
-                    actor=OrderEventActor.MCP,
-                    occurred_at=now,
-                    code=OrderEventCode.AUTHORIZATION_INVALID,
-                    details={"attempt_id": attempt_id, "action": record.action},
-                    deduplication_key=f"mcp_authorization:{authorization_id}:failure:{attempt_id}",
+            if record is not None and reason == "authorization_expired":
+                record.invalidation_reason = "expired"
+            elif record is not None and reason == "verification_failed":
+                session.execute(
+                    update(McpAuthorizationRecord)
+                    .where(
+                        McpAuthorizationRecord.id == record.id,
+                        McpAuthorizationRecord.consumed_at.is_(None),
+                        McpAuthorizationRecord.invalidation_reason.is_(None),
+                    )
+                    .values(
+                        failed_attempts=McpAuthorizationRecord.failed_attempts + 1,
+                        invalidation_reason=case(
+                            (
+                                McpAuthorizationRecord.failed_attempts + 1
+                                >= max_attempts,
+                                "max_attempts_exceeded",
+                            ),
+                            else_=None,
+                        ),
+                    )
                 )
+            event_draft_id = (
+                record.target_draft_id if record is not None else target_draft_id
+            )
+            event_request_id = (
+                record.target_cancellation_request_id
+                if record is not None
+                else target_cancellation_request_id
+            )
+            draft = (
+                session.get(OrderDraftRecord, event_draft_id)
+                if event_draft_id is not None
+                else None
+            )
+            request = (
+                session.get(CancellationRequestRecord, event_request_id)
+                if event_request_id is not None
+                else None
+            )
+            event_order_id = (
+                record.target_order_id
+                if record is not None
+                else request.order_id
+                if request is not None
+                else None
+            )
+            order = (
+                session.get(OrderRecord, event_order_id)
+                if event_order_id is not None
+                else None
+            )
+            event_account_id = (
+                record.account_id
+                if record is not None
+                else order.account_id
+                if order is not None
+                else draft.account_id
+                if draft is not None
+                else request.account_id
+                if request is not None
+                else None
+            )
+            now = require_aware_utc(self._clock())
+            attempt_id = str(uuid4())
+            _append_order_event(
+                session,
+                draft_id=event_draft_id if draft is not None else None,
+                order_id=order.id if order is not None else None,
+                account_id=event_account_id,
+                event_type=OrderEventType.AUTHORIZATION_FAILED,
+                actor=OrderEventActor.MCP,
+                occurred_at=max(now, order.updated_at) if order is not None else now,
+                code=OrderEventCode.AUTHORIZATION_INVALID,
+                details={
+                    "attempt_id": attempt_id,
+                    "action": record.action if record is not None else action,
+                    "reason": reason,
+                },
+                deduplication_key=f"mcp_authorization:failure:{attempt_id}",
+            )
 
     def invalidate_mcp_authorization(
         self, *, authorization_id: str, reason: str
@@ -1256,8 +1320,41 @@ class PortfolioRepository:
             remaining_quantity=remaining,
         )
         with self._sessions.begin() as session:
+            current_version = cast(
+                CursorResult[object],
+                session.execute(
+                    update(OrderRecord)
+                    .where(
+                        OrderRecord.id == order.id,
+                        OrderRecord.version == order.version,
+                        OrderRecord.state == order.state.value,
+                        OrderRecord.account_id == order.account_id,
+                    )
+                    .values(version=OrderRecord.version)
+                ),
+            )
+            if current_version.rowcount != 1:
+                raise ConcurrentOrderUpdate(
+                    "Order changed while preparing cancellation"
+                )
+            current = session.get(OrderRecord, order.id)
+            if (
+                current is None
+                or current.version != order.version
+                or current.state != order.state.value
+                or current.account_id != order.account_id
+            ):
+                raise ConcurrentOrderUpdate(
+                    "Order changed while preparing cancellation"
+                )
+            current_draft = session.get(OrderDraftRecord, current.draft_id)
+            current_order = self._stored_order(current, current_draft)
+            if not current_order.can_cancel:
+                raise ValueError(
+                    current_order.blocking_reason or "Order cannot be canceled"
+                )
             self._invalidate_cancellation_requests_for_order_in_session(
-                session, order.id, "superseded", now
+                session, order.id, "superseded", now, actor=OrderEventActor.MCP
             )
             record = CancellationRequestRecord(
                 id=req_id,
@@ -1277,34 +1374,63 @@ class PortfolioRepository:
             )
             session.add(record)
             session.flush()
+            _append_order_event(
+                session,
+                draft_id=current.draft_id,
+                order_id=current.id,
+                account_id=current.account_id,
+                event_type=OrderEventType.CANCELLATION_REQUEST_CREATED,
+                actor=OrderEventActor.MCP,
+                occurred_at=now,
+                details={"request_id": req_id, "expires_at": expires_at.isoformat()},
+                deduplication_key=f"cancellation_request:{req_id}:created",
+            )
             return self._stored_cancellation_request(record)
 
     def _invalidate_cancellation_requests_for_order_in_session(
-        self, session: Session, order_id: str, reason: str, now: datetime
+        self,
+        session: Session,
+        order_id: str,
+        reason: str,
+        now: datetime,
+        *,
+        actor: OrderEventActor = OrderEventActor.SYSTEM,
+        request_id: str | None = None,
     ) -> None:
-        superseded_req_ids = session.scalars(
-            select(CancellationRequestRecord.id).where(
-                CancellationRequestRecord.order_id == order_id,
-                CancellationRequestRecord.status.in_(["pending", "authorized"]),
+        request_query = select(CancellationRequestRecord).where(
+            CancellationRequestRecord.order_id == order_id,
+            CancellationRequestRecord.status.in_(["pending", "authorized"]),
+        )
+        if request_id is not None:
+            request_query = request_query.where(
+                CancellationRequestRecord.id == request_id
             )
-        ).all()
-        if superseded_req_ids:
-            session.execute(
-                update(CancellationRequestRecord)
-                .where(CancellationRequestRecord.id.in_(superseded_req_ids))
-                .values(status="invalidated", invalidation_reason=reason)
-            )
+        requests = session.scalars(request_query).all()
+        order = session.get(OrderRecord, order_id)
+        for request in requests:
+            request.status = "expired" if reason == "expired" else "invalidated"
+            request.invalidation_reason = reason
             session.execute(
                 update(McpAuthorizationRecord)
                 .where(
-                    McpAuthorizationRecord.target_cancellation_request_id.in_(
-                        superseded_req_ids
-                    ),
+                    McpAuthorizationRecord.target_cancellation_request_id == request.id,
                     McpAuthorizationRecord.consumed_at.is_(None),
                     McpAuthorizationRecord.invalidation_reason.is_(None),
                 )
                 .values(invalidation_reason=reason)
             )
+            if order is not None:
+                _append_order_event(
+                    session,
+                    draft_id=order.draft_id,
+                    order_id=order.id,
+                    account_id=order.account_id,
+                    event_type=OrderEventType.CANCELLATION_REQUEST_INVALIDATED,
+                    actor=actor,
+                    occurred_at=max(now, order.updated_at),
+                    details={"request_id": request.id, "reason": reason},
+                    deduplication_key=f"cancellation_request:{request.id}:invalidated",
+                )
 
     def invalidate_cancellation_requests_for_order(
         self, order_id: str, reason: str = "order_state_changed"
@@ -1340,7 +1466,14 @@ class PortfolioRepository:
                     f"Cancellation request is already {req.status}",
                 )
             if now > req.expires_at:
-                req.status = "expired"
+                self._invalidate_cancellation_requests_for_order_in_session(
+                    session,
+                    req.order_id,
+                    "expired",
+                    now,
+                    actor=OrderEventActor.MCP,
+                    request_id=req.id,
+                )
                 session.commit()
                 raise McpAuthorizationError(
                     "cancellation_request_expired",
@@ -1363,8 +1496,13 @@ class PortfolioRepository:
                 or order.version != req.expected_order_version
                 or order.state != req.expected_order_state
             ):
-                req.status = "invalidated"
-                req.invalidation_reason = "order_state_changed"
+                self._invalidate_cancellation_requests_for_order_in_session(
+                    session,
+                    req.order_id,
+                    "order_state_changed",
+                    now,
+                    actor=OrderEventActor.DASHBOARD,
+                )
                 session.commit()
                 raise McpAuthorizationError(
                     "order_state_changed",
@@ -1374,8 +1512,13 @@ class PortfolioRepository:
 
             stored = self._stored_order(order, draft)
             if not stored.can_cancel:
-                req.status = "invalidated"
-                req.invalidation_reason = "order_not_cancelable"
+                self._invalidate_cancellation_requests_for_order_in_session(
+                    session,
+                    req.order_id,
+                    "order_not_cancelable",
+                    now,
+                    actor=OrderEventActor.DASHBOARD,
+                )
                 session.commit()
                 raise McpAuthorizationError(
                     "order_not_cancelable",
@@ -1439,9 +1582,15 @@ class PortfolioRepository:
             if record is None:
                 return None
             now = require_aware_utc(self._clock())
-            if record.status == "pending" and now > record.expires_at:
-                record.status = "expired"
-                session.flush()
+            if record.status in {"pending", "authorized"} and now > record.expires_at:
+                self._invalidate_cancellation_requests_for_order_in_session(
+                    session,
+                    record.order_id,
+                    "expired",
+                    now,
+                    actor=OrderEventActor.SYSTEM,
+                    request_id=record.id,
+                )
             return self._stored_cancellation_request(record)
 
     def active_cancellation_request_for_order(
@@ -1464,14 +1613,12 @@ class PortfolioRepository:
 
     def invalidate_cancellation_request(self, request_id: str, reason: str) -> None:
         with self._sessions.begin() as session:
-            session.execute(
-                update(CancellationRequestRecord)
-                .where(
-                    CancellationRequestRecord.id == request_id,
-                    CancellationRequestRecord.status.in_(["pending", "authorized"]),
-                )
-                .values(status="invalidated", invalidation_reason=reason)
-            )
+            request = session.get(CancellationRequestRecord, request_id)
+            if request is None or request.status not in {"pending", "authorized"}:
+                return
+            order = session.get(OrderRecord, request.order_id)
+            request.status = "invalidated"
+            request.invalidation_reason = reason
             session.execute(
                 update(McpAuthorizationRecord)
                 .where(
@@ -1481,9 +1628,33 @@ class PortfolioRepository:
                 )
                 .values(invalidation_reason=reason)
             )
+            if order is not None:
+                _append_order_event(
+                    session,
+                    draft_id=order.draft_id,
+                    order_id=order.id,
+                    account_id=order.account_id,
+                    event_type=OrderEventType.CANCELLATION_REQUEST_INVALIDATED,
+                    actor=OrderEventActor.SYSTEM,
+                    occurred_at=max(require_aware_utc(self._clock()), order.updated_at),
+                    details={"request_id": request.id, "reason": reason},
+                    deduplication_key=f"cancellation_request:{request.id}:invalidated",
+                )
 
     def update_cancellation_request_status(self, request_id: str, status: str) -> None:
         with self._sessions.begin() as session:
+            if status == "expired":
+                request = session.get(CancellationRequestRecord, request_id)
+                if request is not None and request.status in {"pending", "authorized"}:
+                    self._invalidate_cancellation_requests_for_order_in_session(
+                        session,
+                        request.order_id,
+                        "expired",
+                        require_aware_utc(self._clock()),
+                        actor=OrderEventActor.MCP,
+                        request_id=request.id,
+                    )
+                return
             session.execute(
                 update(CancellationRequestRecord)
                 .where(CancellationRequestRecord.id == request_id)
@@ -2312,6 +2483,18 @@ class PortfolioRepository:
             )
             if update_result.rowcount != 1:
                 raise ConcurrentOrderUpdate("Order changed during reconciliation")
+            invalidation_reason = (
+                f"order_{state.value.lower()}"
+                if state != previous_state
+                else "order_state_changed"
+            )
+            self._invalidate_cancellation_requests_for_order_in_session(
+                session,
+                record.id,
+                invalidation_reason,
+                updated_at,
+                actor=OrderEventActor.SYSTEM,
+            )
             result_details: dict[str, object] = {
                 "attempt_id": attempt_id,
                 "outcome": outcome,
@@ -2382,59 +2565,70 @@ class PortfolioRepository:
 
     def recover_stranded_submissions(self, now: datetime) -> int:
         now = require_aware_utc(now)
-        with self._sessions.begin() as session:
-            records = list(
-                session.scalars(
-                    select(OrderRecord).where(
+        with self._sessions() as session:
+            candidates = list(
+                session.execute(
+                    select(OrderRecord.id, OrderRecord.draft_id).where(
                         OrderRecord.state == OrderState.SUBMITTING
                     )
                 )
             )
-            recovered = 0
-            for record in records:
-                previous_version = record.version
-                updated_at = max(now, record.updated_at)
-                result = cast(
-                    CursorResult[object],
-                    session.execute(
-                        update(OrderRecord)
-                        .where(
-                            OrderRecord.id == record.id,
-                            OrderRecord.version == previous_version,
-                            OrderRecord.state == OrderState.SUBMITTING,
-                        )
-                        .values(
-                            state=OrderState.UNKNOWN,
-                            result_code="unknown",
-                            result_message=(
-                                "Order outcome is unknown. Reconciliation is required."
-                            ),
-                            result_source=OrderStatusSource.SYSTEM.value,
-                            updated_at=updated_at,
-                            version=previous_version + 1,
-                        )
-                    ),
-                )
-                if result.rowcount != 1:
+        recovered = 0
+        for order_id, draft_id in candidates:
+            with self.submission_claim(draft_id) as claimed:
+                if not claimed:
                     continue
-                recovered += 1
-                _append_order_event(
-                    session,
-                    draft_id=record.draft_id,
-                    order_id=record.id,
-                    account_id=record.account_id,
-                    event_type=OrderEventType.STATUS_TRANSITION,
-                    actor=OrderEventActor.SYSTEM,
-                    occurred_at=now,
-                    previous_state=OrderState.SUBMITTING,
-                    next_state=OrderState.UNKNOWN,
-                    code=OrderEventCode.UNKNOWN,
-                    details={"status_source": OrderStatusSource.SYSTEM},
-                    deduplication_key=(
-                        f"order:{record.id}:version:{previous_version + 1}:recovery"
-                    ),
-                )
-            return recovered
+                with self._sessions.begin() as session:
+                    record = session.get(OrderRecord, order_id)
+                    if record is None or record.state != OrderState.SUBMITTING:
+                        continue
+                    previous_version = record.version
+                    updated_at = max(now, record.updated_at)
+                    result = cast(
+                        CursorResult[object],
+                        session.execute(
+                            update(OrderRecord)
+                            .where(
+                                OrderRecord.id == order_id,
+                                OrderRecord.version == previous_version,
+                                OrderRecord.state == OrderState.SUBMITTING,
+                            )
+                            .values(
+                                state=OrderState.UNKNOWN,
+                                result_code="unknown",
+                                result_message=(
+                                    "Order outcome is unknown. Reconciliation is "
+                                    "required."
+                                ),
+                                result_source=OrderStatusSource.SYSTEM.value,
+                                updated_at=updated_at,
+                                version=previous_version + 1,
+                            )
+                        ),
+                    )
+                    if result.rowcount != 1:
+                        continue
+                    self._invalidate_cancellation_requests_for_order_in_session(
+                        session, record.id, "order_state_changed", updated_at
+                    )
+                    _append_order_event(
+                        session,
+                        draft_id=record.draft_id,
+                        order_id=record.id,
+                        account_id=record.account_id,
+                        event_type=OrderEventType.STATUS_TRANSITION,
+                        actor=OrderEventActor.SYSTEM,
+                        occurred_at=updated_at,
+                        previous_state=OrderState.SUBMITTING,
+                        next_state=OrderState.UNKNOWN,
+                        code=OrderEventCode.UNKNOWN,
+                        details={"status_source": OrderStatusSource.SYSTEM},
+                        deduplication_key=(
+                            f"order:{record.id}:version:{previous_version + 1}:recovery"
+                        ),
+                    )
+                    recovered += 1
+        return recovered
 
     def has_stranded_submissions(self) -> bool:
         with self._sessions() as session:
@@ -2719,7 +2913,11 @@ class PortfolioRepository:
             )
 
             self._invalidate_cancellation_requests_for_order_in_session(
-                session, record.id, "cancellation_started", event_occurred_at
+                session,
+                record.id,
+                "cancellation_started",
+                event_occurred_at,
+                actor=actor,
             )
             session.flush()
 
@@ -2795,6 +2993,7 @@ class PortfolioRepository:
                 record.id,
                 f"order_{target_state.value.lower()}",
                 event_occurred_at,
+                actor=actor,
             )
             session.flush()
 

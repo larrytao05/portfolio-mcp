@@ -200,10 +200,18 @@ class McpAuthorizationService:
             target_cancellation_request_id=target_cancellation_request_id,
         )
         if record is None:
+            self._repository.record_mcp_authorization_failure(
+                action=action,
+                reason="no_active_authorization",
+                target_draft_id=target_draft_id,
+                target_cancellation_request_id=target_cancellation_request_id,
+            )
             raise McpAuthorizationError("invalid_or_expired_code")
         if now > record.expires_at:
-            self._repository.invalidate_mcp_authorization(
-                authorization_id=record.id, reason="expired"
+            self._repository.record_mcp_authorization_failure(
+                action=action,
+                reason="authorization_expired",
+                authorization_id=record.id,
             )
             raise McpAuthorizationError("invalid_or_expired_code")
 
@@ -228,13 +236,21 @@ class McpAuthorizationService:
 
         if not matches:
             self._repository.record_mcp_authorization_failure(
-                authorization_id=record.id, max_attempts=5
+                action=action,
+                reason="verification_failed",
+                authorization_id=record.id,
+                max_attempts=5,
             )
             raise McpAuthorizationError("invalid_or_expired_code")
 
         if not self._repository.mark_mcp_authorization_consumed(
             authorization_id=record.id, now=now
         ):
+            self._repository.record_mcp_authorization_failure(
+                action=action,
+                reason="authorization_unavailable",
+                authorization_id=record.id,
+            )
             raise McpAuthorizationError("invalid_or_expired_code")
 
         return StoredMcpAuthorization(

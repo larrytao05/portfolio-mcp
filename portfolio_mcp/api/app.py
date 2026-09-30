@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool
 from portfolio_mcp.bootstrap import (
     create_execution_settings,
     create_schwab_settings,
+    resolve_submission_validator,
 )
 from portfolio_mcp.config import ExecutionSettings, SchwabSettings
 from portfolio_mcp.database import (
@@ -53,6 +54,7 @@ from portfolio_mcp.provider import (
 from portfolio_mcp.refresh import PortfolioRefreshService
 from portfolio_mcp.schwab_readiness import SchwabReadinessService
 from portfolio_mcp.schwab_transport import SchwabOAuthTransport
+from portfolio_mcp.submission_locks import SubmissionLockError
 from portfolio_mcp.trading_safety import (
     TradingGuard,
     TradingSettingsError,
@@ -68,7 +70,6 @@ from portfolio_mcp.trading_service import (
     OrderSubmissionService,
     SubmissionValidator,
     TradingValidationError,
-    fixture_submission_validator,
 )
 
 
@@ -196,11 +197,7 @@ def create_app(
         if execution_provider is not None
         else FixtureExecutionProvider(clock=service_clock)
     )
-    validator = submission_validator
-    if validator is None:
-        if type(execution) is not FixtureExecutionProvider:
-            raise ValueError("A final trading policy validator is required")
-        validator = fixture_submission_validator(provider)
+    validator = resolve_submission_validator(provider, execution, submission_validator)
     settings_service = TradingSettingsService(repository, service_clock)
     trading_guard = TradingGuard(repository, settings_service)
     active_mcp_auth = (
@@ -213,6 +210,7 @@ def create_app(
         if draft_service is not None
         else OrderDraftService(repository, market_data, service_clock, trading_guard)
     )
+    recover_on_reads = submission_service is None
     submission_service = (
         submission_service
         if submission_service is not None
@@ -243,6 +241,19 @@ def create_app(
         if order_reader is not None
         else None
     )
+    if recover_on_reads:
+        repository.recover_stranded_submissions(service_clock())
+
+    def recover_before_order_read() -> None:
+        if not recover_on_reads:
+            return
+        try:
+            repository.recover_stranded_submissions(service_clock())
+        except SubmissionLockError as error:
+            raise HTTPException(
+                status_code=503, detail="Order recovery is unavailable"
+            ) from error
+
     overview_service = OverviewService(repository)
     app = FastAPI(title="Portfolio Dashboard API")
     app.add_middleware(
@@ -551,6 +562,7 @@ def create_app(
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
         cursor: Annotated[str | None, Query(max_length=2048)] = None,
     ) -> dict[str, object]:
+        recover_before_order_read()
         if start_date is not None and end_date is not None and start_date > end_date:
             raise HTTPException(
                 status_code=422, detail="start_date must be on or before end_date"
@@ -657,6 +669,7 @@ def create_app(
         order_id: str,
         request: RefreshOrderRequest = Body(default=RefreshOrderRequest()),
     ) -> dict[str, object]:
+        recover_before_order_read()
         if reconciliation is None:
             if repository.order(order_id) is None:
                 raise HTTPException(status_code=404, detail="Order not found")
@@ -700,6 +713,7 @@ def create_app(
 
     @app.get("/api/orders/{order_id}")
     async def get_order(order_id: str) -> dict[str, object]:
+        recover_before_order_read()
         order = repository.order(order_id)
         if order is None:
             raise HTTPException(status_code=404, detail="Order not found")
