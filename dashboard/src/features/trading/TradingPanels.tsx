@@ -20,6 +20,7 @@ import {
 } from "../../api/client";
 import { OwnerReview } from "../../components/OwnerReview";
 import { capabilityLabel } from "../../lib/capabilityLabel";
+import { quoteSourceLabel } from "../../lib/portfolioDisplay";
 
 export function ExecutionStatus({
   status,
@@ -545,7 +546,7 @@ export function TradeSection({ accounts }: { accounts: Account[] }) {
               <div><dt>Canonical instrument ID</dt><dd>{draft.instrument.id}</dd></div>
               <div><dt>Time in force</dt><dd>{draft.instruction.time_in_force.toUpperCase()}</dd></div>
               <div><dt>Quote</dt><dd>Last {draft.quote.last_price ?? "unavailable"} · Bid {draft.quote.bid_price ?? "unavailable"} · Ask {draft.quote.ask_price ?? "unavailable"}</dd></div>
-              <div><dt>Quote source</dt><dd>{draft.quote.source ?? "unavailable"}</dd></div>
+              <div><dt>Quote source</dt><dd>{quoteSourceLabel(draft.quote.source)}</dd></div>
               <div><dt>Quote observed</dt><dd>{draft.quote.observed_at === null ? "unavailable" : new Date(draft.quote.observed_at).toLocaleString()}</dd></div>
               <div><dt>Estimated notional</dt><dd>{draft.safety.estimated_notional ?? "unavailable"}</dd></div>
               <div><dt>Account refreshed</dt><dd>{draft.safety.account_refreshed_at === null ? "unavailable" : new Date(draft.safety.account_refreshed_at).toLocaleString()}</dd></div>

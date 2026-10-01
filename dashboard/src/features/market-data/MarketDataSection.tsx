@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
 
 import { getQuote, searchInstruments } from "../../api/client";
+import { quoteSourceLabel } from "../../lib/portfolioDisplay";
 
 export function MarketDataSection() {
   const [instrumentQuery, setInstrumentQuery] = useState(""),
@@ -96,7 +97,7 @@ export function MarketDataSection() {
           <div>
             <h3>{quote.data.quote.instrument.symbol} quote</h3>
             <p>
-              Source: {quote.data.quote.source} · Observed:{" "}
+              Source: {quoteSourceLabel(quote.data.quote.source)} · Observed:{" "}
               {new Date(quote.data.quote.observed_at).toLocaleString()}
             </p>
           </div>

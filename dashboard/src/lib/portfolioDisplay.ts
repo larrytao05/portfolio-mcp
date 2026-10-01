@@ -1,3 +1,8 @@
+const quoteSourceLabels = new Map([
+  ["schwab_market_data", "Schwab market data"],
+  ["fixture_market_data", "Fixture market data"],
+]);
+
 export function displayValue(
   value: string | null | undefined,
   currency?: string,
@@ -6,6 +11,12 @@ export function displayValue(
   const [whole, fraction] = value.split(".");
   const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
   return `${grouped}${fraction === undefined ? "" : `.${fraction}`}${currency ? ` ${currency}` : ""}`;
+}
+
+export function quoteSourceLabel(source: string | null) {
+  const normalizedSource = source?.trim();
+  if (!normalizedSource) return "Unavailable";
+  return quoteSourceLabels.get(normalizedSource) ?? "Unknown source";
 }
 
 export function accountTypeLabel(value: string) {
