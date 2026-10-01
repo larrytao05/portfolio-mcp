@@ -221,10 +221,11 @@ describe("App", () => {
   });
 
   it.each([
-    ["UNKNOWN", /Reconciliation is required/],
-    ["PARTIALLY_FILLED", /partially filled the order/],
-    ["FILLED", /filled the order/],
-  ])("reviews and confirms a fake order with %s outcome", async (state, message) => {
+    ["UNKNOWN", /Reconciliation is required/, "schwab_market_data", "Schwab market data"],
+    ["PARTIALLY_FILLED", /partially filled the order/, "fixture_market_data", "Fixture market data"],
+    ["FILLED", /filled the order/, "future_market_data", "Unknown source"],
+    ["FILLED", /filled the order/, null, "Unavailable"],
+  ])("reviews and confirms a fake order with %s outcome", async (state, message, source, sourceLabel) => {
     api.getAccounts.mockResolvedValue({
       accounts: [
         {
@@ -255,7 +256,7 @@ describe("App", () => {
           limit_price: "333.33",
           time_in_force: "day",
         },
-        quote: { observed_at: null, last_price: null, bid_price: null, ask_price: null, source: null },
+        quote: { observed_at: null, last_price: null, bid_price: null, ask_price: null, source },
         safety: {
           estimated_notional: "333.33",
           account_refreshed_at: "2026-09-12T20:00:00Z",
@@ -312,6 +313,8 @@ describe("App", () => {
     expect(screen.getByText("Canonical instrument ID")).toBeTruthy();
     expect(screen.getByText("us-etf:VTI")).toBeTruthy();
     expect(screen.getByText("Time in force")).toBeTruthy();
+    expect(screen.getByText(sourceLabel, { selector: "dd" })).toBeTruthy();
+    if (source) expect(screen.queryByText(source)).toBeNull();
     expect(screen.getByText(/Fake execution provider/)).toBeTruthy();
     expect(screen.getByText(/preview_unavailable/)).toBeTruthy();
     expect(screen.getByText("Estimated notional")).toBeTruthy();
@@ -823,7 +826,12 @@ describe("App", () => {
     expect(await screen.findByText(/VTI/)).toBeTruthy();
   });
 
-  it("shows no-match and unavailable quote states", async () => {
+  it.each([
+    ["fixture_market_data", "Fixture market data"],
+    ["schwab_market_data", "Schwab market data"],
+    ["future_market_data", "Unknown source"],
+    ["", "Unavailable"],
+  ])("shows no-match and unavailable quote states for %s", async (source, label) => {
     api.searchInstruments
       .mockResolvedValueOnce({ instruments: [] })
       .mockResolvedValueOnce({
@@ -848,7 +856,7 @@ describe("App", () => {
           exchange: null,
           currency: "USD",
         },
-        source: "fixture_market_data",
+        source,
         observed_at: "2026-09-12T20:00:00+00:00",
         last_price: null,
         bid_price: null,
@@ -876,7 +884,8 @@ describe("App", () => {
     expect(quote.textContent).toContain(
       "Canonical identity: us-fund:FIXTURE_UNAVAILABLE",
     );
-    expect(quote.textContent).toContain("Source: fixture_market_data");
+    expect(quote.textContent).toContain(`Source: ${label}`);
+    if (source) expect(quote.textContent).not.toContain(source);
     expect(quote.textContent).toContain("unavailable USD");
     expect(await screen.findByText(/Observed:/)).toBeTruthy();
   });
