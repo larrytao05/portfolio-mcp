@@ -188,20 +188,16 @@ def test_scheduled_target_fairness_across_pages(tmp_path) -> None:
     first = _submit_order(client)
     second = _submit_order(client)
 
-    # Fetch page with limit=1. Descending created_at order returns second order.
     page1 = client.get("/api/orders", params={"limit": 1})
     assert page1.status_code == 200
     body1 = page1.json()
     assert len(body1["orders"]) == 1
     assert body1["orders"][0]["id"] == second["id"]
 
-    # Even though page 1 only contains 'second', the server refresh plan targets
-    # 'first' because 'first' is the earliest unattempted order in the account group.
     refresh_groups = body1["refresh_groups"]
     assert len(refresh_groups) == 1
     assert refresh_groups[0]["target_order_id"] == first["id"]
 
-    # Scheduled refresh on the planned target succeeds
     refresh1 = client.post(
         f"/api/orders/{first['id']}/refresh", json={"mode": "scheduled"}
     )
@@ -222,8 +218,6 @@ def test_scheduled_refresh_rejects_target_change(tmp_path) -> None:
     first = _submit_order(client)
     second = _submit_order(client)
 
-    # Server plans 'first' as fair target (created earlier).
-    # Scheduled refresh on 'second' returns target_changed.
     mismatched = client.post(
         f"/api/orders/{second['id']}/refresh", json={"mode": "scheduled"}
     )
@@ -263,7 +257,6 @@ def test_malformed_audit_details_returns_safe_500(tmp_path) -> None:
     client = _client(tmp_path, execution)
     order = _submit_order(client)
 
-    # Insert a corrupted order event row with illegal details
     db_path = tmp_path / "orders.db"
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()

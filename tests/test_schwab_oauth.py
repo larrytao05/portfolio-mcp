@@ -2,7 +2,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from portfolio_mcp.config import SchwabMarketDataSettings
+from portfolio_mcp.config import SchwabSettings
 from portfolio_mcp.schwab_market_data import SchwabMarketDataProvider
 from portfolio_mcp.schwab_oauth import run_authorization
 
@@ -27,7 +27,7 @@ class RecordingHttpClient:
 async def test_schwab_authorization_uses_the_configured_callback_url() -> None:
     client = RecordingHttpClient([(200, {"refresh_token": "new-refresh-token"})])
     provider = SchwabMarketDataProvider(
-        SchwabMarketDataSettings(
+        SchwabSettings(
             client_id="client-id",
             client_secret="client-secret",
             refresh_token="old-refresh-token",
@@ -68,7 +68,7 @@ async def test_authorization_cli_prints_a_new_refresh_token_without_writing_file
     None
 ):
     provider = SchwabMarketDataProvider(
-        SchwabMarketDataSettings(
+        SchwabSettings(
             client_id="client-id",
             client_secret="client-secret",
             refresh_token="old-refresh-token",

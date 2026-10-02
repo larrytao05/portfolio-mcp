@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { ApiError } from "../../api/client";
 import { SchwabAccountMappingItem } from "./TradingPanels";
 import type {
   SchwabAccountCandidate,
@@ -17,7 +18,10 @@ const api = vi.hoisted(() => ({
   deleteSchwabMapping: vi.fn(),
 }));
 
-vi.mock("../../api/client", () => api);
+vi.mock("../../api/client", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../api/client")>(),
+  ...api,
+}));
 
 function renderItem(accountId: string = "schwab-taxable-demo") {
   const queryClient = new QueryClient({
@@ -83,7 +87,7 @@ describe("SchwabAccountMappingItem", () => {
   });
 
   it("renders unmapped state and allows mapping via candidate selector and confirmation", async () => {
-    api.getSchwabMapping.mockRejectedValue(new Error("Not found"));
+    api.getSchwabMapping.mockRejectedValue(new ApiError(404, "Not found"));
     api.getSchwabReadiness.mockResolvedValue({ readiness: mockUnmappedReadiness });
     api.getSchwabMappingCandidates.mockResolvedValue({
       account_id: "schwab-taxable-demo",
@@ -121,20 +125,14 @@ describe("SchwabAccountMappingItem", () => {
       name: "Confirm and save mapping",
     }) as HTMLButtonElement;
     expect(saveButton.disabled).toBe(true);
-
-    // Select candidate
     const radio1 = screen.getByDisplayValue("cand-hmac-1");
     fireEvent.click(radio1);
     expect(saveButton.disabled).toBe(true);
-
-    // Check confirmation checkbox
     const confirmCheckbox = screen.getByLabelText(
       "I confirm this is the correct Schwab trading account",
     );
     fireEvent.click(confirmCheckbox);
     expect(saveButton.disabled).toBe(false);
-
-    // Save
     fireEvent.click(saveButton);
 
     await waitFor(() => {
@@ -168,7 +166,7 @@ describe("SchwabAccountMappingItem", () => {
   });
 
   it("displays error message when saving mapping fails", async () => {
-    api.getSchwabMapping.mockRejectedValue(new Error("Not found"));
+    api.getSchwabMapping.mockRejectedValue(new ApiError(404, "Not found"));
     api.getSchwabReadiness.mockResolvedValue({ readiness: mockUnmappedReadiness });
     api.getSchwabMappingCandidates.mockResolvedValue({
       account_id: "schwab-taxable-demo",
@@ -195,4 +193,21 @@ describe("SchwabAccountMappingItem", () => {
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("Account already mapped to another entity");
   });
+  it("shows mapping failures without offering to replace an unknown mapping", async () => {
+    api.getSchwabMapping.mockRejectedValue(new ApiError(500, "Mapping unavailable"));
+    api.getSchwabReadiness.mockResolvedValue({ readiness: mockUnmappedReadiness });
+    renderItem();
+    expect((await screen.findByRole("alert")).textContent).toContain("Mapping unavailable");
+    expect(screen.queryByRole("button", { name: "Map to Schwab account" })).toBeNull();
+    expect(api.saveSchwabMapping).not.toHaveBeenCalled();
+  });
+
+  it("shows readiness failures without hiding an existing mapping", async () => {
+    api.getSchwabMapping.mockResolvedValue({ mapping: mockExistingMapping });
+    api.getSchwabReadiness.mockRejectedValue(new Error("Readiness unavailable"));
+    renderItem();
+    expect((await screen.findByRole("alert")).textContent).toContain("Readiness unavailable");
+    expect(screen.getByText(/Mapped to Schwab account/).textContent).toContain("*1234");
+  });
+
 });

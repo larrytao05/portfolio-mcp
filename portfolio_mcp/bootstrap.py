@@ -3,7 +3,6 @@ from collections.abc import Mapping
 
 from portfolio_mcp.config import (
     ExecutionSettings,
-    SchwabMarketDataSettings,
     SchwabSettings,
     SnapTradeSettings,
 )
@@ -59,7 +58,7 @@ def create_market_data_provider(
     if mode == "fixture":
         return FixtureMarketDataProvider()
     if mode == "schwab":
-        settings = SchwabMarketDataSettings.from_environment(source)
+        settings = SchwabSettings.from_environment(source)
         return SchwabMarketDataProvider(settings)
 
     raise ProviderConfigurationError(

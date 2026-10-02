@@ -335,6 +335,16 @@ def test_removed_account_is_excluded_from_current_capability_responses(
     )
     removed.post("/api/refresh")
 
+    overview = removed.get("/api/overview").json()["overview"]
+    assert overview["total_known_usd_value"] == "5199.98"
+    removed_account = next(
+        account
+        for account in overview["accounts"]
+        if account["account_id"] == "schwab-taxable-demo"
+    )
+    assert removed_account["is_stale"] is True
+    assert removed_account["percentage_of_total"] is None
+
     status = removed.get("/api/trading/status").json()
     assert [item["account_id"] for item in status["accounts"]] == ["fidelity-roth-demo"]
     assert (

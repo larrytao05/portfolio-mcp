@@ -177,18 +177,6 @@ class OrderReconciliationService:
     def _now(self) -> datetime:
         return require_aware_utc(self._clock())
 
-    async def _reconcile(self, order: StoredOrder) -> StoredOrder:
-        attempt_at = self._now()
-        claim = self._repository.claim_order_reconciliation(
-            order.id,
-            attempt_at=attempt_at,
-            minimum_interval=self._minimum_interval,
-        )
-        if claim is None:
-            return self._require_order(order.id)
-        updated, _ = await self._execute_claim(claim, attempt_at)
-        return updated
-
     async def _execute_claim(
         self, claim: ReconciliationClaim, attempt_at: datetime
     ) -> tuple[StoredOrder, bool]:

@@ -122,13 +122,6 @@ function OwnerReviewSession(props: OwnerReviewProps) {
 
   useEffect(() => {
     let active = true;
-    setLoading(true);
-    setError(null);
-    setDraft(null);
-    setCancellationRequest(null);
-    setConfirmed(false);
-    setIssuedCode(null);
-
     if (action === "submit") {
       getOrderDraft(targetId)
         .then((res) => {

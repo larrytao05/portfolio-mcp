@@ -1,6 +1,6 @@
 import pytest
 
-from main import create_provider
+from portfolio_mcp.bootstrap import create_provider
 from portfolio_mcp.fixtures import FixturePortfolioProvider
 from portfolio_mcp.provider import ProviderConfigurationError
 from portfolio_mcp.snaptrade import SnapTradeProvider

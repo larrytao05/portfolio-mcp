@@ -128,3 +128,26 @@ This enables only read-only Schwab instrument search and quote requests; it
 does not place, preview, cancel, or modify orders. Leave
 `MARKET_DATA_PROVIDER=fixture` for offline development and tests. Never
 commit `.env` or share credential values.
+
+## Isolated browser verification
+
+Use fictional providers and a separate SQLite database for UI checks:
+
+```sh
+verification_dir="$(mktemp -d)"
+export PORTFOLIO_DATABASE_URL="sqlite:///$verification_dir/portfolio.db"
+export PORTFOLIO_PROVIDER=fixture
+export MARKET_DATA_PROVIDER=fixture
+export EXECUTION_PROVIDER=fixture
+export SCHWAB_EXECUTION_ENABLED=false
+uv run uvicorn api_main:app --host 127.0.0.1 --port 8000
+```
+
+In another terminal, run `npm --prefix dashboard run dev`. Open the printed
+localhost URL and refresh the portfolio. Check Overview, Accounts, Activity,
+Market data, Orders, and Settings. Search for VTI and confirm that its quote
+shows Fixture market data. Order actions use the fixture execution provider.
+
+Stop both servers when finished and remove the temporary directory printed by
+`echo "$verification_dir"`. Attach screenshots and recordings directly to PR
+descriptions. Keep them outside the repository.

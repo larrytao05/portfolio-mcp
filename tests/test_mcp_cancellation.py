@@ -2,103 +2,49 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from decimal import Decimal
-from typing import Any
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 from mcp import types
 from mcp.server.mcpserver.exceptions import ToolError
 
-from portfolio_mcp.database import (
-    PortfolioRepository,
-)
 from portfolio_mcp.execution import (
     ExecutionIndeterminateError,
     ExecutionResult,
-    FixtureExecutionProvider,
     OrderState,
 )
-from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
-from portfolio_mcp.mcp_authorization import McpAuthorizationService
 from portfolio_mcp.order_history import (
     OrderEventActor,
     OrderEventType,
 )
-from portfolio_mcp.refresh import PortfolioRefreshService
 from portfolio_mcp.server import create_server
-from portfolio_mcp.trading_safety import (
-    TradingGuard,
-    TradingSettingsService,
-)
 from portfolio_mcp.trading_service import (
     OrderCancellationRequestService,
     OrderCancellationService,
-    OrderDraftService,
-    OrderSubmissionService,
-    fixture_submission_validator,
 )
+from tests.mcp_support import setup_mcp_services
 
 
-@pytest.fixture
-def mock_clock() -> datetime:
-    return datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
-
-
-async def _setup_services(tmp_path: Any, now: datetime):
-    db_url = f"sqlite:///{tmp_path / 'test.db'}"
-    repo = PortfolioRepository(db_url, clock=lambda: now)
-    provider = FixturePortfolioProvider()
-    await PortfolioRefreshService(provider, repo, clock=lambda: now).refresh()
-
-    repo.replace_trading_settings(
-        live_trading_enabled=True,
-        kill_switch_active=False,
-        max_order_shares=Decimal("100"),
-        max_order_notional_usd=Decimal("50000"),
-        updated_at=now,
-        expected_version=0,
-    )
-
-    market_data = FixtureMarketDataProvider()
-    settings_service = TradingSettingsService(repo, lambda: now)
-    guard = TradingGuard(repo, settings_service)
-    draft_service = OrderDraftService(repo, market_data, lambda: now, guard)
-    mcp_auth_service = McpAuthorizationService(repo, clock=lambda: now, scrypt_n=1024)
-    execution_provider = FixtureExecutionProvider(clock=lambda: now)
-    validator = fixture_submission_validator(provider)
-    submission_service = OrderSubmissionService(
-        repository=repo,
-        execution_provider=execution_provider,
-        clock=lambda: now,
-        validator=validator,
-        trading_guard=guard,
-        mcp_auth_service=mcp_auth_service,
-    )
+async def _setup_services(tmp_path: Path, now: datetime):
+    context = await setup_mcp_services(tmp_path, now)
     cancellation_service = OrderCancellationService(
-        repository=repo,
-        execution_provider=execution_provider,
+        repository=context.repository,
+        execution_provider=context.execution,
         clock=lambda: now,
-        mcp_auth_service=mcp_auth_service,
+        mcp_auth_service=context.authorization,
     )
     cancellation_request_service = OrderCancellationRequestService(
-        repository=repo,
-        execution_provider=execution_provider,
+        repository=context.repository,
         clock=lambda: now,
-        mcp_auth_service=mcp_auth_service,
+        execution_provider=context.execution,
+        mcp_auth_service=context.authorization,
     )
-
     return (
-        repo,
-        provider,
-        market_data,
-        draft_service,
-        mcp_auth_service,
-        execution_provider,
-        submission_service,
+        *context[:-1],
         cancellation_service,
         cancellation_request_service,
-        db_url,
+        context.database_url,
     )
 
 
@@ -145,7 +91,6 @@ async def test_mcp_cancel_authorized_order_success(tmp_path) -> None:
         clock=lambda: now,
     )
 
-    # 1. MCP creates request
     req_res = await server.call_tool(
         "create_order_cancellation", {"order_id": order_id}
     )
@@ -157,13 +102,11 @@ async def test_mcp_cancel_authorized_order_success(tmp_path) -> None:
     assert req is not None
     assert req.status == "pending"
 
-    # 2. Dashboard authorizes request and generates one-time code
     stored_req, created_auth = mcp_auth_service.authorize_cancellation_request(
         req.id, expected_fingerprint=req.action_fingerprint
     )
     assert created_auth.plaintext_code is not None
 
-    # 3. MCP executes cancellation using the authorized code
     res = await server.call_tool(
         "cancel_authorized_order",
         {
@@ -172,17 +115,15 @@ async def test_mcp_cancel_authorized_order_success(tmp_path) -> None:
         },
     )
     assert isinstance(res, types.CallToolResult)
-    assert not res.is_error  # No error flag
+    assert not res.is_error
     order_data = res.model_dump()
     text = order_data["content"][0]["text"]
     assert "canceled" in text.lower()
 
-    # Verify order state in repository
     updated_order = repo.order(order_id)
     assert updated_order is not None
     assert updated_order.state == OrderState.CANCELED
 
-    # Verify audit event actor is MCP
     events = repo.list_order_events(order_id=order_id, limit=50).items
     consumed_events = [
         e
@@ -193,7 +134,6 @@ async def test_mcp_cancel_authorized_order_success(tmp_path) -> None:
     assert len(consumed_events) == 1
     assert consumed_events[0].actor == OrderEventActor.MCP
 
-    # Verify request status transitioned to attempted
     saved_req = cancellation_request_service.get_request(req.id)
     assert saved_req is not None
     assert saved_req.status == "attempted"
@@ -234,14 +174,12 @@ async def test_mcp_cancel_authorized_order_wrong_or_expired_code(tmp_path) -> No
         req.id, expected_fingerprint=req.action_fingerprint
     )
 
-    # Calling with wrong code fails
     with pytest.raises(ToolError, match="invalid_or_expired_code"):
         await server.call_tool(
             "cancel_authorized_order",
             {"cancellation_request_id": req.id, "code": "WRONGCOD"},
         )
 
-    # Order must NOT be canceled
     order = repo.order(order_id)
     assert order is not None
     assert order.state == OrderState.ACCEPTED
@@ -282,7 +220,6 @@ async def test_mcp_cancel_authorized_order_replay_prevented(tmp_path) -> None:
         req.id, expected_fingerprint=req.action_fingerprint
     )
 
-    # First call succeeds
     await server.call_tool(
         "cancel_authorized_order",
         {
@@ -291,7 +228,6 @@ async def test_mcp_cancel_authorized_order_replay_prevented(tmp_path) -> None:
         },
     )
 
-    # Replay call fails
     with pytest.raises(
         ToolError,
         match="(invalid_or_expired_code|cancellation_request_already_consumed)",
@@ -323,7 +259,6 @@ async def test_mcp_cancel_authorized_order_submit_code_rejected(tmp_path) -> Non
 
     order_id = await _create_active_order(draft_service, submission_service)
 
-    # Create a draft and issue a submit code for it
     draft = await draft_service.create(
         account_id="schwab-taxable-demo",
         instrument_id="us-etf:VTI",
@@ -336,9 +271,7 @@ async def test_mcp_cancel_authorized_order_submit_code_rejected(tmp_path) -> Non
         action="submit", target_draft_id=draft.id
     )
 
-    # Create cancellation request for order
     req = cancellation_request_service.create_request(order_id)
-    # Even if authorized, submitting the submit_auth code must be rejected
     mcp_auth_service.authorize_cancellation_request(
         req.id, expected_fingerprint=req.action_fingerprint
     )
@@ -445,7 +378,6 @@ async def test_mcp_cancel_authorized_order_unknown_outcome_directs_to_reconcile(
 
     order_id = await _create_active_order(draft_service, submission_service)
 
-    # Force execution provider cancel_order to raise ExecutionIndeterminateError
     execution_provider.cancel_order = AsyncMock(
         side_effect=ExecutionIndeterminateError("Gateway timeout during cancel")
     )
@@ -480,17 +412,14 @@ async def test_mcp_cancel_authorized_order_unknown_outcome_directs_to_reconcile(
     assert "unknown" in text.lower()
     assert "reconciliation" in text.lower()
 
-    # Verify order state is UNKNOWN
     order = repo.order(order_id)
     assert order is not None
     assert order.state == OrderState.UNKNOWN
 
-    # Verify request status transitioned to attempted
     saved_req = cancellation_request_service.get_request(req.id)
     assert saved_req is not None
     assert saved_req.status == "attempted"
 
-    # Consumed code never enables retry
     with pytest.raises(
         ToolError,
         match="(invalid_or_expired_code|cancellation_request_already_consumed)",
@@ -503,7 +432,6 @@ async def test_mcp_cancel_authorized_order_unknown_outcome_directs_to_reconcile(
             },
         )
 
-    # Audit actor remains MCP
     events = repo.list_order_events(order_id=order_id, limit=50).items
     consumed_events = [
         e
@@ -538,7 +466,6 @@ async def test_mcp_cancel_authorized_order_refusal_retry_prevented(
     order_before = repo.order(order_id)
     assert order_before is not None
 
-    # Force execution provider cancel_order to return refusal (state remains ACCEPTED)
     execution_provider.cancel_order = AsyncMock(
         return_value=ExecutionResult(
             state=OrderState.ACCEPTED,
@@ -574,22 +501,18 @@ async def test_mcp_cancel_authorized_order_refusal_retry_prevented(
     assert isinstance(res, types.CallToolResult)
     order_data = res.model_dump()
     text = order_data["content"][0]["text"]
-    # Refusal accurately reported, not canceled
     assert "cancel_rejected" in text.lower() or "rejected" in text.lower()
     assert "canceled" not in text.lower() or 'state": "accepted"' in text.lower()
 
-    # Order retains prior state (ACCEPTED), does not transition to CANCELED
     order = repo.order(order_id)
     assert order is not None
     assert order.state == OrderState.ACCEPTED
     assert order.result_code == "cancel_rejected"
 
-    # Verify request status transitioned to attempted
     saved_req = cancellation_request_service.get_request(req.id)
     assert saved_req is not None
     assert saved_req.status == "attempted"
 
-    # Consumed code never enables retry
     with pytest.raises(
         ToolError,
         match="(invalid_or_expired_code|cancellation_request_already_consumed)",
@@ -602,7 +525,6 @@ async def test_mcp_cancel_authorized_order_refusal_retry_prevented(
             },
         )
 
-    # Audit actor remains MCP
     events = repo.list_order_events(order_id=order_id, limit=50).items
     consumed_events = [
         e
@@ -649,9 +571,8 @@ async def test_mcp_cancel_authorized_order_state_changed_fails(tmp_path) -> None
         req.id, expected_fingerprint=req.action_fingerprint
     )
 
-    # Mutate order version/state to FILLED
     with repo._sessions() as session:
-        from portfolio_mcp.database import OrderRecord
+        from portfolio_mcp.schema import OrderRecord
 
         rec = session.get(OrderRecord, order_id)
         assert rec is not None

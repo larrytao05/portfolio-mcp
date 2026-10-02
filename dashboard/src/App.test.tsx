@@ -9,6 +9,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
+import { quoteSourceLabel } from "./lib/portfolioDisplay";
 import type { Position } from "./api/client";
 
 const api = vi.hoisted(() => ({
@@ -72,6 +73,18 @@ function savedAccount(positions: Position[] = []) {
     },
   };
 }
+
+it.each([
+  ["schwab_market_data", "Schwab market data"],
+  ["fixture_market_data", "Fixture market data"],
+  ["future_market_data", "Unknown source"],
+  [null, "Unavailable"],
+  ["", "Unavailable"],
+  ["  ", "Unavailable"],
+  [" schwab_market_data ", "Schwab market data"],
+])("labels quote source %s", (source, label) => {
+  expect(quoteSourceLabel(source)).toBe(label);
+});
 
 describe("App", () => {
   afterEach(cleanup);
@@ -221,10 +234,10 @@ describe("App", () => {
   });
 
   it.each([
-    ["UNKNOWN", /Reconciliation is required/],
-    ["PARTIALLY_FILLED", /partially filled the order/],
-    ["FILLED", /filled the order/],
-  ])("reviews and confirms a fake order with %s outcome", async (state, message) => {
+    ["UNKNOWN", /Reconciliation is required/, "schwab_market_data", "Schwab market data"],
+    ["PARTIALLY_FILLED", /partially filled the order/, "fixture_market_data", "Fixture market data"],
+    ["FILLED", /filled the order/, "future_market_data", "Unknown source"],
+  ])("reviews and confirms a fake order with %s outcome", async (state, message, source, sourceLabel) => {
     api.getAccounts.mockResolvedValue({
       accounts: [
         {
@@ -255,7 +268,7 @@ describe("App", () => {
           limit_price: "333.33",
           time_in_force: "day",
         },
-        quote: { observed_at: null, last_price: null, bid_price: null, ask_price: null, source: null },
+        quote: { observed_at: null, last_price: null, bid_price: null, ask_price: null, source },
         safety: {
           estimated_notional: "333.33",
           account_refreshed_at: "2026-09-12T20:00:00Z",
@@ -312,6 +325,8 @@ describe("App", () => {
     expect(screen.getByText("Canonical instrument ID")).toBeTruthy();
     expect(screen.getByText("us-etf:VTI")).toBeTruthy();
     expect(screen.getByText("Time in force")).toBeTruthy();
+    expect(screen.getByText(sourceLabel, { selector: "dd" })).toBeTruthy();
+    if (source) expect(screen.queryByText(source)).toBeNull();
     expect(screen.getByText(/Fake execution provider/)).toBeTruthy();
     expect(screen.getByText(/preview_unavailable/)).toBeTruthy();
     expect(screen.getByText("Estimated notional")).toBeTruthy();
@@ -823,7 +838,9 @@ describe("App", () => {
     expect(await screen.findByText(/VTI/)).toBeTruthy();
   });
 
-  it("shows no-match and unavailable quote states", async () => {
+  it("shows no-match, unavailable quote and readable Schwab source", async () => {
+    const source = "schwab_market_data";
+    const label = "Schwab market data";
     api.searchInstruments
       .mockResolvedValueOnce({ instruments: [] })
       .mockResolvedValueOnce({
@@ -848,7 +865,7 @@ describe("App", () => {
           exchange: null,
           currency: "USD",
         },
-        source: "fixture_market_data",
+        source,
         observed_at: "2026-09-12T20:00:00+00:00",
         last_price: null,
         bid_price: null,
@@ -876,7 +893,8 @@ describe("App", () => {
     expect(quote.textContent).toContain(
       "Canonical identity: us-fund:FIXTURE_UNAVAILABLE",
     );
-    expect(quote.textContent).toContain("Source: fixture_market_data");
+    expect(quote.textContent).toContain(`Source: ${label}`);
+    if (source) expect(quote.textContent).not.toContain(source);
     expect(quote.textContent).toContain("unavailable USD");
     expect(await screen.findByText(/Observed:/)).toBeTruthy();
   });
@@ -1163,4 +1181,11 @@ describe("App", () => {
     expect(screen.getByText("2 of 2 accounts")).toBeTruthy();
     expect(screen.getByText(/Gap in recorded history/)).toBeTruthy();
   });
+  it("reports an unavailable safeguard read instead of permanent loading", async () => {
+    api.getTradingSettings.mockRejectedValue(new Error("Service unavailable"));
+    renderApp();
+    expect(await screen.findByText("Trading safeguards are unavailable. Reload to try again.")).toBeTruthy();
+    expect(screen.queryByText("Loading trading safeguards…")).toBeNull();
+  });
+
 });

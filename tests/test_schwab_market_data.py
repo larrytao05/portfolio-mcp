@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from portfolio_mcp.config import SchwabMarketDataSettings
+from portfolio_mcp.config import SchwabSettings
 from portfolio_mcp.provider import (
     ProviderAuthenticationError,
     ProviderAuthorizationError,
@@ -35,7 +35,7 @@ class FakeSchwabHttpClient:
 @pytest.mark.asyncio
 async def test_schwab_market_data_returns_a_normalized_quote() -> None:
     provider = SchwabMarketDataProvider(
-        SchwabMarketDataSettings(
+        SchwabSettings(
             client_id="client-id",
             client_secret="client-secret",
             refresh_token="refresh-token",
@@ -64,7 +64,6 @@ async def test_schwab_market_data_returns_a_normalized_quote() -> None:
                 ),
             ]
         ),
-        clock=lambda: datetime(2024, 9, 15, 12, 0, tzinfo=UTC),
     )
 
     quote = await provider.get_quote("us-equity:AAPL")
@@ -84,7 +83,7 @@ async def test_schwab_market_data_returns_a_normalized_quote() -> None:
 @pytest.mark.asyncio
 async def test_schwab_market_data_reads_symbol_from_live_quote_record() -> None:
     provider = SchwabMarketDataProvider(
-        SchwabMarketDataSettings(
+        SchwabSettings(
             client_id="client-id",
             client_secret="client-secret",
             refresh_token="refresh-token",
@@ -98,7 +97,10 @@ async def test_schwab_market_data_reads_symbol_from_live_quote_record() -> None:
                         "VTI": {
                             "symbol": "VTI",
                             "assetMainType": "EQUITY",
-                            "quote": {"lastPrice": 300.0},
+                            "quote": {
+                                "lastPrice": 300.0,
+                                "quoteTime": 1_726_316_800_000,
+                            },
                             "reference": {
                                 "description": "VANGUARD TOTAL STOCK MARKET ETF",
                                 "exchangeName": "NYSE Arca",
@@ -129,7 +131,7 @@ async def test_schwab_market_data_encodes_special_symbols_in_quote_paths() -> No
                     "SPY 250117C00500000": {
                         "symbol": "SPY 250117C00500000",
                         "assetMainType": "OPTION",
-                        "quote": {"lastPrice": 3.25},
+                        "quote": {"lastPrice": 3.25, "quoteTime": 1_726_316_800_000},
                         "reference": {"description": "SPY call"},
                     }
                 },
@@ -137,7 +139,7 @@ async def test_schwab_market_data_encodes_special_symbols_in_quote_paths() -> No
         ]
     )
     provider = SchwabMarketDataProvider(
-        SchwabMarketDataSettings(
+        SchwabSettings(
             client_id="client-id",
             client_secret="client-secret",
             refresh_token="refresh-token",
@@ -153,7 +155,7 @@ async def test_schwab_market_data_encodes_special_symbols_in_quote_paths() -> No
 @pytest.mark.asyncio
 async def test_schwab_market_data_searches_normalized_instruments() -> None:
     provider = SchwabMarketDataProvider(
-        SchwabMarketDataSettings(
+        SchwabSettings(
             client_id="client-id",
             client_secret="client-secret",
             refresh_token="refresh-token",
@@ -190,7 +192,7 @@ async def test_schwab_market_data_searches_normalized_instruments() -> None:
 @pytest.mark.asyncio
 async def test_schwab_market_data_searches_live_response_envelope() -> None:
     provider = SchwabMarketDataProvider(
-        SchwabMarketDataSettings(
+        SchwabSettings(
             client_id="client-id",
             client_secret="client-secret",
             refresh_token="refresh-token",
@@ -225,7 +227,7 @@ async def test_schwab_market_data_searches_live_response_envelope() -> None:
 @pytest.mark.asyncio
 async def test_schwab_market_data_sanitizes_authentication_failure() -> None:
     provider = SchwabMarketDataProvider(
-        SchwabMarketDataSettings(
+        SchwabSettings(
             client_id="client-id",
             client_secret="client-secret",
             refresh_token="refresh-token",
@@ -242,7 +244,7 @@ async def test_schwab_market_data_sanitizes_authentication_failure() -> None:
 @pytest.mark.asyncio
 async def test_schwab_market_data_explains_rejected_refresh_token() -> None:
     provider = SchwabMarketDataProvider(
-        SchwabMarketDataSettings(
+        SchwabSettings(
             client_id="client-id",
             client_secret="client-secret",
             refresh_token="refresh-token",
@@ -257,7 +259,7 @@ async def test_schwab_market_data_explains_rejected_refresh_token() -> None:
 @pytest.mark.asyncio
 async def test_schwab_market_data_sanitizes_timeout() -> None:
     provider = SchwabMarketDataProvider(
-        SchwabMarketDataSettings(
+        SchwabSettings(
             client_id="client-id",
             client_secret="client-secret",
             refresh_token="refresh-token",
@@ -284,7 +286,7 @@ async def test_schwab_market_data_sanitizes_provider_statuses(
     status: int, error_type: type[Exception]
 ) -> None:
     provider = SchwabMarketDataProvider(
-        SchwabMarketDataSettings(
+        SchwabSettings(
             client_id="client-id",
             client_secret="client-secret",
             refresh_token="refresh-token",
@@ -299,7 +301,7 @@ async def test_schwab_market_data_sanitizes_provider_statuses(
 @pytest.mark.asyncio
 async def test_schwab_market_data_sanitizes_malformed_token_response() -> None:
     provider = SchwabMarketDataProvider(
-        SchwabMarketDataSettings(
+        SchwabSettings(
             client_id="client-id",
             client_secret="client-secret",
             refresh_token="refresh-token",
@@ -315,9 +317,10 @@ async def test_schwab_market_data_sanitizes_malformed_token_response() -> None:
 
 
 @pytest.mark.asyncio
-async def test_schwab_market_data_sanitizes_invalid_quote_timestamp() -> None:
+@pytest.mark.parametrize("timestamp", [None, True, "invalid", 10**300])
+async def test_schwab_market_data_sanitizes_invalid_quote_timestamp(timestamp) -> None:
     provider = SchwabMarketDataProvider(
-        SchwabMarketDataSettings(
+        SchwabSettings(
             client_id="client-id",
             client_secret="client-secret",
             refresh_token="refresh-token",
@@ -331,7 +334,7 @@ async def test_schwab_market_data_sanitizes_invalid_quote_timestamp() -> None:
                         "VTI": {
                             "symbol": "VTI",
                             "assetMainType": "EQUITY",
-                            "quote": {"quoteTime": 10**300},
+                            "quote": {"quoteTime": timestamp},
                             "reference": {
                                 "description": "Vanguard Total Stock Market ETF"
                             },
@@ -347,3 +350,59 @@ async def test_schwab_market_data_sanitizes_invalid_quote_timestamp() -> None:
         match="Schwab market data returned an unexpected response",
     ):
         await provider.get_quote("us-etf:VTI")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("price", ["NaN", "Infinity", "-Infinity"])
+async def test_schwab_quote_rejects_nonfinite_prices(price) -> None:
+    provider = SchwabMarketDataProvider(
+        SchwabSettings("client-id", "client-secret", "refresh-token"),
+        http_client=FakeSchwabHttpClient(
+            [
+                (200, {"access_token": "access-token"}),
+                (
+                    200,
+                    {
+                        "VTI": {
+                            "symbol": "VTI",
+                            "quote": {
+                                "quoteTime": 1_726_316_800_000,
+                                "lastPrice": price,
+                            },
+                            "reference": {},
+                        }
+                    },
+                ),
+            ]
+        ),
+    )
+    with pytest.raises(ProviderResponseError):
+        await provider.get_quote("us-etf:VTI")
+
+
+@pytest.mark.asyncio
+async def test_schwab_quote_refreshes_rejected_access_token_once() -> None:
+    client = FakeSchwabHttpClient(
+        [
+            (200, {"access_token": "expired-token"}),
+            (401, {}),
+            (200, {"access_token": "new-token"}),
+            (
+                200,
+                {
+                    "VTI": {
+                        "symbol": "VTI",
+                        "quote": {"quoteTime": 1_726_316_800_000, "lastPrice": 300},
+                        "reference": {},
+                    }
+                },
+            ),
+        ]
+    )
+    provider = SchwabMarketDataProvider(
+        SchwabSettings("client-id", "client-secret", "refresh-token"),
+        http_client=client,
+    )
+    quote = await provider.get_quote("us-etf:VTI")
+    assert str(quote.last_price) == "300"
+    assert len(client.urls) == 4

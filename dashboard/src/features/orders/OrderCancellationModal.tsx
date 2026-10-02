@@ -105,8 +105,6 @@ export function OrderCancellationModal({
       }
     },
   });
-
-  // Focus management: capture active element on open, focus initial element, and restore on close
   useEffect(() => {
     if (!isOpen) return;
     triggerElementRef.current = document.activeElement as HTMLElement | null;
@@ -120,8 +118,6 @@ export function OrderCancellationModal({
       triggerElementRef.current?.focus();
     };
   }, [isOpen]);
-
-  // Keyboard navigation: Escape key listener and Tab focus trap
   useEffect(() => {
     if (!isOpen) return;
 

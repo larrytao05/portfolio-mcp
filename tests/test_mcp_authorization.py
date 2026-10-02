@@ -5,12 +5,9 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select
 
-from portfolio_mcp.database import (
-    McpAuthorizationRecord,
-    OrderDraftRecord,
-    PortfolioRepository,
-)
+from portfolio_mcp.database import PortfolioRepository
 from portfolio_mcp.order_history import OrderEventType
+from portfolio_mcp.schema import McpAuthorizationRecord, OrderDraftRecord
 from portfolio_mcp.trading_service import (
     CreatedMcpAuthorization,
     McpAuthorizationError,
@@ -79,11 +76,9 @@ def test_create_mcp_authorization_generates_and_stores_hashed_code(tmp_path) -> 
         )
         assert len(records) == 1
         rec = records[0]
-        # Plaintext code is never stored in DB
         assert created.plaintext_code not in rec.digest
         assert created.plaintext_code not in rec.salt
 
-        # Hash matches scrypt derivation
         expected_digest = hashlib.scrypt(
             created.plaintext_code.encode("utf-8"),
             salt=bytes.fromhex(rec.salt),
@@ -121,7 +116,6 @@ def test_create_authorization_supersedes_previous_active_code_for_same_draft(
         assert first_rec is not None
         assert first_rec.invalidation_reason == "superseded"
 
-    # Attempting to consume first code fails
     with pytest.raises(McpAuthorizationError) as exc_info:
         service.consume_authorization(
             action="submit",
@@ -164,7 +158,6 @@ def test_consume_mcp_authorization_success(tmp_path) -> None:
     assert isinstance(consumed, StoredMcpAuthorization)
     assert consumed.id == created.id
     assert consumed.consumed_at == consume_time
-    # Digest and salt not in StoredMcpAuthorization
     assert not hasattr(consumed, "salt")
     assert not hasattr(consumed, "digest")
 
@@ -196,7 +189,6 @@ def test_consume_mcp_authorization_cannot_be_replayed(tmp_path) -> None:
         candidate_code="12345678",
     )
 
-    # Replay attempt fails
     with pytest.raises(McpAuthorizationError) as exc_info:
         service.consume_authorization(
             action="submit",
@@ -277,7 +269,6 @@ def test_consume_locks_out_after_five_failed_attempts(tmp_path) -> None:
         assert rec.failed_attempts == 5
         assert rec.invalidation_reason == "max_attempts_exceeded"
 
-    # 6th attempt with the CORRECT code now fails because attempts are exhausted
     with pytest.raises(McpAuthorizationError) as exc_info:
         service.consume_authorization(
             action="submit",
@@ -347,7 +338,6 @@ def test_consume_fails_on_mismatched_target_or_fingerprint_or_account(
 
     service.create_authorization(action="submit", target_draft_id="draft-1")
 
-    # Wrong draft ID
     with pytest.raises(McpAuthorizationError) as exc_info:
         service.consume_authorization(
             action="submit",
@@ -365,7 +355,6 @@ def test_consume_fails_on_mismatched_target_or_fingerprint_or_account(
     assert failed_events[-1].details["reason"] == "no_active_authorization"
     assert failed_events[-1].details["action"] == "submit"
 
-    # Wrong action
     with pytest.raises(McpAuthorizationError) as exc_info:
         service.consume_authorization(
             action="cancel",
@@ -376,7 +365,6 @@ def test_consume_fails_on_mismatched_target_or_fingerprint_or_account(
         )
     assert exc_info.value.code == "invalid_or_expired_code"
 
-    # Wrong account ID
     with pytest.raises(McpAuthorizationError) as exc_info:
         service.consume_authorization(
             action="submit",
@@ -387,7 +375,6 @@ def test_consume_fails_on_mismatched_target_or_fingerprint_or_account(
         )
     assert exc_info.value.code == "invalid_or_expired_code"
 
-    # Wrong fingerprint
     with pytest.raises(McpAuthorizationError) as exc_info:
         service.consume_authorization(
             action="submit",
@@ -402,7 +389,6 @@ def test_consume_fails_on_mismatched_target_or_fingerprint_or_account(
 def test_expiry_caps_at_draft_expiry(tmp_path) -> None:
     now = datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
     repo = PortfolioRepository(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
-    # Draft expires in only 2 minutes
     _seed_draft(repo, draft_id="draft-1", expires_at=now + timedelta(minutes=2))
     service = McpAuthorizationService(repo, clock=lambda: now, scrypt_n=1024)
 
@@ -415,12 +401,10 @@ def test_create_authorization_fails_if_draft_not_found_or_expired(tmp_path) -> N
     repo = PortfolioRepository(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
     service = McpAuthorizationService(repo, clock=lambda: now, scrypt_n=1024)
 
-    # Draft not found
     with pytest.raises(McpAuthorizationError) as exc_info:
         service.create_authorization(action="submit", target_draft_id="non-existent")
     assert exc_info.value.code == "draft_not_found"
 
-    # Draft expired
     _seed_draft(
         repo,
         draft_id="draft-expired",
@@ -563,11 +547,8 @@ def test_migration_0012_upgrade_and_downgrade(tmp_path) -> None:
     config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
     config.set_main_option("sqlalchemy.url", database_url)
 
-    # Upgrade to head (includes 0012)
     command.upgrade(config, "head")
 
-    # Downgrade to 0011
     command.downgrade(config, "20260925_0011")
 
-    # Upgrade again to head
     command.upgrade(config, "head")
