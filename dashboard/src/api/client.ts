@@ -517,51 +517,29 @@ export type OrderListFilters = {
   cursor?: string;
 };
 
-export type OrderAuditFilters = {
+export type OrderAuditFilters = OrderListFilters & {
   order_id?: string;
   draft_id?: string;
-  account_id?: string;
-  provider?: string;
-  symbol?: string;
-  state?: string[];
-  start_date?: string;
-  end_date?: string;
-  limit?: number;
-  cursor?: string;
 };
 
-export function getOrders(filters: OrderListFilters = {}): Promise<OrderListPage> {
+function orderQueryString(filters: OrderAuditFilters): string {
   const params = new URLSearchParams();
-  if (filters.account_id) params.set("account_id", filters.account_id);
-  if (filters.provider) params.set("provider", filters.provider);
-  if (filters.symbol) params.set("symbol", filters.symbol);
-  if (filters.state) {
-    for (const s of filters.state) params.append("state", s);
+  for (const key of ["order_id", "draft_id", "account_id", "provider", "symbol", "start_date", "end_date", "cursor"] as const) {
+    const value = filters[key];
+    if (value) params.set(key, value);
   }
-  if (filters.start_date) params.set("start_date", filters.start_date);
-  if (filters.end_date) params.set("end_date", filters.end_date);
+  for (const state of filters.state ?? []) params.append("state", state);
   if (filters.limit) params.set("limit", String(filters.limit));
-  if (filters.cursor) params.set("cursor", filters.cursor);
-  const qs = params.toString();
-  return getJson(`/api/orders${qs ? `?${qs}` : ""}`);
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+export function getOrders(filters: OrderListFilters = {}): Promise<OrderListPage> {
+  return getJson(`/api/orders${orderQueryString(filters)}`);
 }
 
 export function getOrderAudit(filters: OrderAuditFilters = {}): Promise<OrderAuditPage> {
-  const params = new URLSearchParams();
-  if (filters.order_id) params.set("order_id", filters.order_id);
-  if (filters.draft_id) params.set("draft_id", filters.draft_id);
-  if (filters.account_id) params.set("account_id", filters.account_id);
-  if (filters.provider) params.set("provider", filters.provider);
-  if (filters.symbol) params.set("symbol", filters.symbol);
-  if (filters.state) {
-    for (const s of filters.state) params.append("state", s);
-  }
-  if (filters.start_date) params.set("start_date", filters.start_date);
-  if (filters.end_date) params.set("end_date", filters.end_date);
-  if (filters.limit) params.set("limit", String(filters.limit));
-  if (filters.cursor) params.set("cursor", filters.cursor);
-  const qs = params.toString();
-  return getJson(`/api/order-audit${qs ? `?${qs}` : ""}`);
+  return getJson(`/api/order-audit${orderQueryString(filters)}`);
 }
 
 export function refreshOrder(
@@ -718,9 +696,6 @@ export type SchwabAccountReadiness = {
   details: Record<string, unknown>;
 };
 
-export function getSchwabMappings(): Promise<{ mappings: StoredSchwabAccountMapping[] }> {
-  return getJson("/api/schwab/mapping");
-}
 
 export function getSchwabMapping(
   accountId: string,
@@ -760,8 +735,4 @@ export function getSchwabReadiness(
   accountId: string,
 ): Promise<{ readiness: SchwabAccountReadiness }> {
   return getJson(`/api/schwab/readiness/${encodeURIComponent(accountId)}`);
-}
-
-export function getAllSchwabReadiness(): Promise<{ readiness: SchwabAccountReadiness[] }> {
-  return getJson("/api/schwab/readiness");
 }

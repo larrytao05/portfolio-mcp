@@ -28,8 +28,8 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
   const [cancellationMessage, setCancellationMessage] = useState<string | null>(
     null,
   );
-  const [auditCursor, setAuditCursor] = useState<string | undefined>(undefined);
-  const [auditCursorHistory, setAuditCursorHistory] = useState<string[]>([]);
+  const [auditCursorHistory, setAuditCursorHistory] = useState<Array<string | undefined>>([undefined]);
+  const auditCursor = auditCursorHistory[auditCursorHistory.length - 1];
   const [lastRefreshMessage, setLastRefreshMessage] = useState<string | null>(
     null,
   );
@@ -80,6 +80,9 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
       orderId: string;
       mode: "scheduled" | "manual";
     }) => refreshOrder(orderId, mode),
+    onError: () => {
+      setLastRefreshMessage("Order refresh failed. Retry the refresh to check its status.");
+    },
     onSuccess: (data) => {
       if (data.refresh.status === "throttled") {
         const at = data.refresh.next_refresh_at
@@ -100,20 +103,11 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
 
   const { refetch: refetchOrders } = ordersQuery;
   const { mutate: mutateRefresh } = refreshMutation;
-
-  // Visibility and route gated background polling
   useEffect(() => {
     const ordersData = ordersQuery.data;
     if (!isViewActive || !ordersData) return;
 
     const orders = ordersData.orders;
-    const allTerminal =
-      orders.length > 0 &&
-      orders.every((o) =>
-        ["FILLED", "CANCELED", "REJECTED", "EXPIRED"].includes(o.state),
-      );
-    if (allTerminal) return;
-
     const hasSubmitting = orders.some((o) => o.state === "SUBMITTING");
     const groupsWithTarget = ordersData.refresh_groups.filter(
       (g) => g.target_order_id,
@@ -505,8 +499,7 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
                           type="button"
                           onClick={() => {
                             setSelectedOrderId(order.id);
-                            setAuditCursor(undefined);
-                            setAuditCursorHistory([]);
+                            setAuditCursorHistory([undefined]);
                           }}
                         >
                           Audit
@@ -568,8 +561,7 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
                 type="button"
                 onClick={() => {
                   setSelectedOrderId(null);
-                  setAuditCursor(undefined);
-                  setAuditCursorHistory([]);
+                  setAuditCursorHistory([undefined]);
                 }}
                 aria-label="Close audit"
               >
@@ -615,15 +607,12 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
                   ))}
                 </ul>
                 <div className="pagination">
-                  {auditCursorHistory.length > 0 && (
+                  {auditCursorHistory.length > 1 && (
                     <button
                       type="button"
                       aria-label="Previous audit page"
                       onClick={() => {
-                        const historyCopy = [...auditCursorHistory];
-                        const prev = historyCopy.pop();
-                        setAuditCursorHistory(historyCopy);
-                        setAuditCursor(prev || undefined);
+                        setAuditCursorHistory((history) => history.slice(0, -1));
                       }}
                     >
                       ← Previous page
@@ -632,14 +621,15 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
                   {auditQuery.data?.next_cursor && (
                     <button
                       type="button"
+                      disabled={auditQuery.isFetching}
                       aria-label="Next audit page"
                       onClick={() => {
-                        setAuditCursorHistory((prev) => [
-                          ...prev,
-                          auditCursor || "",
-                        ]);
-                        setAuditCursor(
-                          auditQuery.data?.next_cursor ?? undefined,
+                        const nextCursor = auditQuery.data?.next_cursor;
+                        if (!nextCursor || nextCursor === auditCursor) return;
+                        setAuditCursorHistory((history) =>
+                          history[history.length - 1] === nextCursor
+                            ? history
+                            : [...history, nextCursor],
                         );
                       }}
                     >

@@ -95,30 +95,9 @@ describe("OwnerReview", () => {
       expect(screen.getByText("fp-sample-123")).toBeTruthy();
       expect(screen.getByText("1100.00")).toBeTruthy();
     });
-
-    // Issuance endpoint is never called on GET load
     expect(client.issueMcpAuthorization).not.toHaveBeenCalled();
   });
 
-  it("disables Issue code button until confirmation checkbox is checked", async () => {
-    vi.mocked(client.getOrderDraft).mockResolvedValueOnce({ draft: sampleDraft });
-
-    render(<OwnerReview action="submit" draftId="draft-mcp-1" onClose={vi.fn()} />);
-
-    await waitFor(() => {
-      expect(screen.getByText("fp-sample-123")).toBeTruthy();
-    });
-
-    const issueButton = screen.getByRole("button", { name: "Issue code" });
-    expect(issueButton.hasAttribute("disabled")).toBe(true);
-
-    const checkbox = screen.getByRole("checkbox", {
-      name: /I confirm this order instruction/i,
-    });
-    fireEvent.click(checkbox);
-
-    expect(issueButton.hasAttribute("disabled")).toBe(false);
-  });
 
   it("issues authorization code only upon explicit confirmed action", async () => {
     vi.mocked(client.getOrderDraft).mockResolvedValueOnce({ draft: sampleDraft });
@@ -142,6 +121,9 @@ describe("OwnerReview", () => {
     await waitFor(() => {
       expect(screen.getByText("fp-sample-123")).toBeTruthy();
     });
+
+    expect(screen.getByRole("button", { name: "Issue code" }).hasAttribute("disabled")).toBe(true);
+    expect(client.issueMcpAuthorization).not.toHaveBeenCalled();
 
     fireEvent.click(
       screen.getByRole("checkbox", {
@@ -219,32 +201,9 @@ describe("OwnerReview", () => {
       expect(screen.getByText("2")).toBeTruthy();
       expect(screen.getByText("5")).toBeTruthy();
     });
-
-    // Code is never issued on GET load
     expect(client.createCancellationMcpAuthorization).not.toHaveBeenCalled();
   });
 
-  it("disables Issue code button until confirmation checkbox is checked for cancellation", async () => {
-    vi.mocked(client.getCancellationRequest).mockResolvedValueOnce({
-      cancellation_request: sampleCancellationRequest,
-    });
-
-    render(<OwnerReview action="cancel" requestId="cancel-req-1" onClose={vi.fn()} />);
-
-    await waitFor(() => {
-      expect(screen.getByText("fp-cancel-456")).toBeTruthy();
-    });
-
-    const issueButton = screen.getByRole("button", { name: "Issue code" });
-    expect(issueButton.hasAttribute("disabled")).toBe(true);
-
-    const checkbox = screen.getByRole("checkbox", {
-      name: /I confirm this cancellation request/i,
-    });
-    fireEvent.click(checkbox);
-
-    expect(issueButton.hasAttribute("disabled")).toBe(false);
-  });
 
   it("issues cancellation authorization code only upon explicit confirmed action", async () => {
     vi.mocked(client.getCancellationRequest).mockResolvedValueOnce({
@@ -266,6 +225,9 @@ describe("OwnerReview", () => {
       expect(screen.getByText("fp-cancel-456")).toBeTruthy();
       expect(screen.getByText("pending")).toBeTruthy();
     });
+
+    expect(screen.getByRole("button", { name: "Issue code" }).hasAttribute("disabled")).toBe(true);
+    expect(client.createCancellationMcpAuthorization).not.toHaveBeenCalled();
 
     fireEvent.click(
       screen.getByRole("checkbox", {

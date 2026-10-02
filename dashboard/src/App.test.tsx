@@ -9,6 +9,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
+import { quoteSourceLabel } from "./lib/portfolioDisplay";
 import type { Position } from "./api/client";
 
 const api = vi.hoisted(() => ({
@@ -72,6 +73,18 @@ function savedAccount(positions: Position[] = []) {
     },
   };
 }
+
+it.each([
+  ["schwab_market_data", "Schwab market data"],
+  ["fixture_market_data", "Fixture market data"],
+  ["future_market_data", "Unknown source"],
+  [null, "Unavailable"],
+  ["", "Unavailable"],
+  ["  ", "Unavailable"],
+  [" schwab_market_data ", "Schwab market data"],
+])("labels quote source %s", (source, label) => {
+  expect(quoteSourceLabel(source)).toBe(label);
+});
 
 describe("App", () => {
   afterEach(cleanup);
@@ -224,7 +237,6 @@ describe("App", () => {
     ["UNKNOWN", /Reconciliation is required/, "schwab_market_data", "Schwab market data"],
     ["PARTIALLY_FILLED", /partially filled the order/, "fixture_market_data", "Fixture market data"],
     ["FILLED", /filled the order/, "future_market_data", "Unknown source"],
-    ["FILLED", /filled the order/, null, "Unavailable"],
   ])("reviews and confirms a fake order with %s outcome", async (state, message, source, sourceLabel) => {
     api.getAccounts.mockResolvedValue({
       accounts: [
@@ -826,12 +838,9 @@ describe("App", () => {
     expect(await screen.findByText(/VTI/)).toBeTruthy();
   });
 
-  it.each([
-    ["fixture_market_data", "Fixture market data"],
-    ["schwab_market_data", "Schwab market data"],
-    ["future_market_data", "Unknown source"],
-    ["", "Unavailable"],
-  ])("shows no-match and unavailable quote states for %s", async (source, label) => {
+  it("shows no-match, unavailable quote and readable Schwab source", async () => {
+    const source = "schwab_market_data";
+    const label = "Schwab market data";
     api.searchInstruments
       .mockResolvedValueOnce({ instruments: [] })
       .mockResolvedValueOnce({
@@ -1172,4 +1181,11 @@ describe("App", () => {
     expect(screen.getByText("2 of 2 accounts")).toBeTruthy();
     expect(screen.getByText(/Gap in recorded history/)).toBeTruthy();
   });
+  it("reports an unavailable safeguard read instead of permanent loading", async () => {
+    api.getTradingSettings.mockRejectedValue(new Error("Service unavailable"));
+    renderApp();
+    expect(await screen.findByText("Trading safeguards are unavailable. Reload to try again.")).toBeTruthy();
+    expect(screen.queryByText("Loading trading safeguards…")).toBeNull();
+  });
+
 });

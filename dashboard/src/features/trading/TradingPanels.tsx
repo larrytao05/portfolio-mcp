@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
+  ApiError,
   confirmOrderDraft,
   createOrderDraft,
   deleteSchwabMapping,
@@ -88,8 +89,9 @@ export function SchwabAccountMappingItem({ accountId }: { accountId: string }) {
       try {
         const res = await getSchwabMapping(accountId);
         return res.mapping;
-      } catch {
-        return null;
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) return null;
+        throw error;
       }
     },
   });
@@ -97,12 +99,8 @@ export function SchwabAccountMappingItem({ accountId }: { accountId: string }) {
   const readinessQuery = useQuery({
     queryKey: ["schwab", "readiness", accountId],
     queryFn: async () => {
-      try {
-        const res = await getSchwabReadiness(accountId);
-        return res.readiness;
-      } catch {
-        return null;
-      }
+      const res = await getSchwabReadiness(accountId);
+      return res.readiness;
     },
   });
 
@@ -167,12 +165,17 @@ export function SchwabAccountMappingItem({ accountId }: { accountId: string }) {
   return (
     <div className="schwab-mapping-container" style={{ marginTop: "1rem", paddingTop: "0.75rem", borderTop: "1px solid var(--border-subtle, #e2e8f0)" }}>
       <h4>Schwab Execution Readiness & Mapping</h4>
+      {readinessQuery.isError && <p className="inline-alert" role="alert">{readinessQuery.error.message}</p>}
       {readiness && (
         <p>
           Status: <strong>{readiness.state.replace("_", " ").toUpperCase()}</strong> · {readiness.message}
         </p>
       )}
-      {mapping ? (
+      {mappingQuery.isLoading ? (
+        <p className="state">Loading Schwab account mapping…</p>
+      ) : mappingQuery.isError ? (
+        <p className="inline-alert" role="alert">{mappingQuery.error.message}</p>
+      ) : mapping ? (
         <div className="mapped-details">
           <p>
             Mapped to Schwab account: <strong>{mapping.masked_account_number}</strong>
@@ -202,7 +205,7 @@ export function SchwabAccountMappingItem({ accountId }: { accountId: string }) {
               {candidatesQuery.isLoading && <p className="state">Loading Schwab candidate accounts…</p>}
               {candidatesQuery.isError && (
                 <p className="inline-alert" role="alert">
-                  {(candidatesQuery.error as Error).message || "Failed to load candidate accounts"}
+                  {candidatesQuery.error.message || "Failed to load candidate accounts"}
                 </p>
               )}
               {candidatesQuery.data && candidatesQuery.data.length === 0 && (
@@ -295,6 +298,9 @@ export function TradingSettingsPanel() {
       ]);
     },
   });
+  if (!form && settingsQuery.isError) {
+    return <p className="state state-error" role="alert">Trading safeguards are unavailable. Reload to try again.</p>;
+  }
   if (!form) return <p className="state">Loading trading safeguards…</p>;
   const submittedForm = form;
   const requiresConfirmation =

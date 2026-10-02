@@ -114,8 +114,6 @@ describe("OrdersSection", () => {
     api.getOrders.mockResolvedValue(page);
 
     renderOrdersSection();
-
-    // Advance time by 10 seconds
     await act(async () => {
       vi.advanceTimersByTime(10000);
     });
@@ -159,8 +157,6 @@ describe("OrdersSection", () => {
     });
 
     expect(screen.getByText("VTI")).toBeTruthy();
-
-    // Advance timer past the 5 second server delay
     await act(async () => {
       await vi.advanceTimersByTimeAsync(6000);
     });
@@ -188,8 +184,6 @@ describe("OrdersSection", () => {
     api.getOrders.mockResolvedValue(page);
 
     renderOrdersSection();
-
-    // Switch document visibility to hidden before timer fires
     act(() => {
       Object.defineProperty(document, "visibilityState", {
         configurable: true,
@@ -257,8 +251,6 @@ describe("OrdersSection", () => {
     });
 
     expect(screen.getByText("SUBMITTING")).toBeTruthy();
-
-    // Fast-forward saved list poll delay (2 seconds)
     await act(async () => {
       await vi.advanceTimersByTimeAsync(2500);
     });
@@ -820,8 +812,6 @@ describe("OrdersSection", () => {
     await waitFor(() => {
       expect(api.refreshOrder).toHaveBeenCalledWith("ord-page2", "manual");
     });
-
-    // Verify getOrders was called with page cursor intact, not reset
     expect(api.getOrders).toHaveBeenCalledWith(
       expect.objectContaining({ limit: 25 }),
     );
@@ -912,8 +902,6 @@ describe("OrdersSection", () => {
     expect(screen.getByText(/settled/)).toBeTruthy();
     expect(screen.getByText("impact_unavailable")).toBeTruthy();
     expect(screen.getByText(/Broker:/)).toBeTruthy();
-
-    // Check sparse order has explicit unavailable placeholders
     expect(screen.getAllByText("—").length).toBeGreaterThanOrEqual(1);
   });
 
@@ -960,11 +948,34 @@ describe("OrdersSection", () => {
       ).toBeTruthy();
       expect(screen.getByText("ID: cancel-req-999")).toBeTruthy();
     });
-
-    // Close button dismisses the review
     const closeBtn = screen.getByRole("button", { name: "Close review" });
     fireEvent.click(closeBtn);
 
     expect(screen.queryByText("Owner Review: MCP Order Cancellation")).toBeNull();
   });
+  it("refreshes an off-page target when displayed orders are terminal", async () => {
+    vi.useFakeTimers();
+    window.location.hash = "#orders";
+    api.getOrders.mockResolvedValue({
+      orders: [{ ...sampleOrder, state: "FILLED" }],
+      next_cursor: null,
+      refresh_groups: [{
+        provider: "schwab",
+        account_id: "schwab-taxable-demo",
+        target_order_id: "off-page-order-99",
+        next_refresh_at: "2026-09-12T20:00:05Z",
+      }],
+      server_time: "2026-09-12T20:00:00Z",
+    });
+    api.refreshOrder.mockResolvedValue({
+      order: sampleOrder,
+      refresh: { status: "attempted", provider_read_started: true },
+    });
+    renderOrdersSection();
+    await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+    expect(screen.getByText(/off-page in this account group/i)).toBeTruthy();
+    await act(async () => { await vi.advanceTimersByTimeAsync(6000); });
+    expect(api.refreshOrder).toHaveBeenCalledWith("off-page-order-99", "scheduled");
+  });
+
 });
