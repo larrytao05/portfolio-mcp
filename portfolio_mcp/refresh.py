@@ -3,7 +3,7 @@ from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
 from portfolio_mcp.database import PortfolioRepository, RefreshResult
-from portfolio_mcp.models import Account, AccountCapabilities, CapabilityBlock
+from portfolio_mcp.models import Account, AccountCapabilities
 from portfolio_mcp.provider import (
     CapabilityProvider,
     PortfolioProvider,
@@ -80,7 +80,7 @@ class PortfolioRefreshService:
     ) -> tuple[list[AccountCapabilities], list[Account]]:
         provider = self._provider
         if not isinstance(provider, CapabilityProvider):
-            return [self._unknown_capability(account) for account in accounts], []
+            return [AccountCapabilities.unknown(account) for account in accounts], []
         try:
             capabilities = await provider.get_account_capabilities(
                 [account.id for account in accounts]
@@ -94,26 +94,6 @@ class PortfolioRefreshService:
             return capabilities, []
         except Exception:
             return [], accounts
-
-    def _unknown_capability(self, account: Account) -> AccountCapabilities:
-        return AccountCapabilities(
-            account_id=account.id,
-            provider=account.provider,
-            asset_classes=(),
-            supported_sides=(),
-            order_types=(),
-            time_in_force=(),
-            sizing_modes=(),
-            preview_supported=False,
-            cancellation_supported=False,
-            observed_at=None,
-            last_success_at=None,
-            source="not_observed",
-            blocks=(
-                CapabilityBlock("capability_unknown", "Trading capability is unknown."),
-            ),
-            is_stale=True,
-        )
 
     def _refresh_error_code(self, error: ProviderError) -> str:
         if isinstance(error, ProviderAuthenticationError):

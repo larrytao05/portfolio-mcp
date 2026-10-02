@@ -29,6 +29,7 @@ uv run python main.py
 - `models.py` — domain dataclasses such as `Account`, `Position`,
   `Transaction`, `Instrument`, and `Quote`. Decimal financial values are
   serialized as strings at API boundaries.
+- `schema.py` contains SQLAlchemy table declarations and exact decimal and UTC storage types.
 - `database.py` — `PortfolioRepository`, the only layer that should directly
   read and write SQLite records.
 - `refresh.py` — obtains provider snapshots, persists them, and records fresh,

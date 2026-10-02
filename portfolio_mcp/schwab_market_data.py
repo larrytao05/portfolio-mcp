@@ -1,4 +1,4 @@
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
 from urllib.parse import quote, urlencode
@@ -12,17 +12,12 @@ from portfolio_mcp.provider import (
 from portfolio_mcp.schwab_transport import (
     SchwabHttpClient,
     SchwabOAuthTransport,
-    UrllibSchwabHttpClient,
-    decode_body,
     raise_for_status,
 )
-
-_decode_body = decode_body
 
 
 class SchwabMarketDataProvider:
     source = "schwab_market_data"
-    _token_url = "https://api.schwabapi.com/v1/oauth/token"
     _market_data_url = "https://api.schwabapi.com/marketdata/v1"
 
     def __init__(
@@ -30,19 +25,10 @@ class SchwabMarketDataProvider:
         settings: SchwabSettings,
         *,
         http_client: SchwabHttpClient | None = None,
-        clock: Callable[[], datetime] | None = None,
         transport: SchwabOAuthTransport | None = None,
     ) -> None:
-        self._settings = settings
-        self._http_client = http_client or UrllibSchwabHttpClient(
-            context="Schwab market data"
-        )
-        self._clock = clock or (lambda: datetime.now(UTC))
         self._transport = transport or SchwabOAuthTransport(
-            settings,
-            http_client=self._http_client,
-            token_url=self._token_url,
-            context="Schwab market data",
+            settings, http_client=http_client, context="Schwab market data"
         )
 
     def authorization_url(self) -> str:
@@ -59,7 +45,7 @@ class SchwabMarketDataProvider:
         if not normalized_query:
             return []
         parameters = urlencode({"symbol": normalized_query, "projection": "search"})
-        status, body = await self._request(
+        status, body = await self._transport.request(
             "GET",
             f"{self._market_data_url}/instruments?{parameters}",
         )
@@ -73,7 +59,7 @@ class SchwabMarketDataProvider:
 
     async def get_quote(self, instrument_id: str) -> Quote:
         asset_class, symbol = _instrument_id_parts(instrument_id)
-        status, body = await self._request(
+        status, body = await self._transport.request(
             "GET",
             f"{self._market_data_url}/{quote(symbol, safe='')}/quotes",
         )
@@ -83,7 +69,7 @@ class SchwabMarketDataProvider:
         source = _required_mapping(body, symbol)
         quote_data = _required_mapping(source.get("quote"))
         reference = _required_mapping(source.get("reference"))
-        observed_at = _observation_time(quote_data.get("quoteTime"), self._clock)
+        observed_at = _observation_time(quote_data.get("quoteTime"))
         symbol = _optional_string(source.get("symbol")) or _required_string(
             reference.get("symbol")
         )
@@ -104,29 +90,6 @@ class SchwabMarketDataProvider:
             ask_price=_optional_decimal(quote_data.get("askPrice")),
             currency=instrument.currency,
         )
-
-    async def _request(self, method: str, url: str) -> tuple[int, object]:
-        token = await self._access_token()
-        return await self._http_request(
-            method,
-            url,
-            {"Authorization": f"Bearer {token}", "Accept": "application/json"},
-        )
-
-    async def _access_token(self) -> str:
-        return await self._transport.access_token()
-
-    def _token_headers(self) -> dict[str, str]:
-        return self._transport.token_headers()
-
-    async def _http_request(
-        self,
-        method: str,
-        url: str,
-        headers: dict[str, str],
-        body: bytes | None = None,
-    ) -> tuple[int, object]:
-        return await self._transport.http_request(method, url, headers, body)
 
 
 def _raise_for_status(status: int) -> None:
@@ -157,28 +120,25 @@ def _optional_decimal(value: object) -> Decimal | None:
         return None
     if isinstance(value, (str, int, float)):
         try:
-            return Decimal(str(value))
+            result = Decimal(str(value))
+            if result.is_finite():
+                return result
         except ArithmeticError:
             pass
     raise ProviderResponseError("Schwab market data returned an unexpected response")
 
 
-def _observation_time(value: object, clock: Callable[[], datetime]) -> datetime:
-    if value is not None:
-        if not isinstance(value, (int, float)) or isinstance(value, bool):
-            raise ProviderResponseError(
-                "Schwab market data returned an unexpected response"
-            )
-        try:
-            return datetime.fromtimestamp(value / 1000, UTC)
-        except (OverflowError, OSError, ValueError):
-            raise ProviderResponseError(
-                "Schwab market data returned an unexpected response"
-            ) from None
-    now = clock()
-    if now.tzinfo is None:
-        raise ValueError("Clock must return a timezone-aware timestamp")
-    return now.astimezone(UTC)
+def _observation_time(value: object) -> datetime:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ProviderResponseError(
+            "Schwab market data returned an unexpected response"
+        )
+    try:
+        return datetime.fromtimestamp(value / 1000, UTC)
+    except (OverflowError, OSError, ValueError):
+        raise ProviderResponseError(
+            "Schwab market data returned an unexpected response"
+        ) from None
 
 
 def _asset_class(value: str) -> str:

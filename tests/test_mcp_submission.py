@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -11,79 +10,17 @@ from mcp import types
 from mcp.server.mcpserver.exceptions import ToolError
 
 from portfolio_mcp.api.app import create_app
-from portfolio_mcp.database import (
-    PortfolioRepository,
-)
 from portfolio_mcp.execution import (
     ExecutionCommand,
     ExecutionIndeterminateError,
-    FixtureExecutionProvider,
 )
-from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
+from portfolio_mcp.fixtures import FixturePortfolioProvider
 from portfolio_mcp.order_history import (
     OrderEventActor,
     OrderEventType,
 )
-from portfolio_mcp.refresh import PortfolioRefreshService
 from portfolio_mcp.server import create_server
-from portfolio_mcp.trading_safety import (
-    TradingGuard,
-    TradingSettingsService,
-)
-from portfolio_mcp.trading_service import (
-    McpAuthorizationService,
-    OrderDraftService,
-    OrderSubmissionService,
-    fixture_submission_validator,
-)
-
-
-@pytest.fixture
-def mock_clock() -> datetime:
-    return datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
-
-
-async def _setup_services(tmp_path: Any, now: datetime):
-    db_url = f"sqlite:///{tmp_path / 'test.db'}"
-    repo = PortfolioRepository(db_url, clock=lambda: now)
-    provider = FixturePortfolioProvider()
-    await PortfolioRefreshService(provider, repo, clock=lambda: now).refresh()
-
-    repo.replace_trading_settings(
-        live_trading_enabled=True,
-        kill_switch_active=False,
-        max_order_shares=Decimal("100"),
-        max_order_notional_usd=Decimal("50000"),
-        updated_at=now,
-        expected_version=0,
-    )
-
-    market_data = FixtureMarketDataProvider()
-    settings_service = TradingSettingsService(repo, lambda: now)
-    guard = TradingGuard(repo, settings_service)
-    draft_service = OrderDraftService(repo, market_data, lambda: now, guard)
-    mcp_auth_service = McpAuthorizationService(repo, clock=lambda: now, scrypt_n=1024)
-    execution_provider = FixtureExecutionProvider(clock=lambda: now)
-    validator = fixture_submission_validator(provider)
-    submission_service = OrderSubmissionService(
-        repository=repo,
-        execution_provider=execution_provider,
-        clock=lambda: now,
-        validator=validator,
-        trading_guard=guard,
-        mcp_auth_service=mcp_auth_service,
-    )
-
-    return (
-        repo,
-        provider,
-        market_data,
-        draft_service,
-        mcp_auth_service,
-        execution_provider,
-        submission_service,
-        db_url,
-    )
+from tests.mcp_support import setup_mcp_services as _setup_services
 
 
 @pytest.mark.asyncio
@@ -110,7 +47,6 @@ async def test_dashboard_issue_mcp_authorization(tmp_path) -> None:
         mcp_auth_service=mcp_auth_service,
     )
 
-    # 1. Create draft
     draft = await draft_service.create(
         account_id="schwab-taxable-demo",
         instrument_id="us-etf:VTI",
@@ -123,21 +59,18 @@ async def test_dashboard_issue_mcp_authorization(tmp_path) -> None:
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
-        # Require confirmation: confirmed=False fails
         resp_unconfirmed = await client.post(
             f"/api/order-drafts/{draft.id}/mcp-authorization",
             json={"expected_fingerprint": draft.fingerprint, "confirmed": False},
         )
         assert resp_unconfirmed.status_code in {400, 422}
 
-        # Fingerprint mismatch fails
         resp_mismatch = await client.post(
             f"/api/order-drafts/{draft.id}/mcp-authorization",
             json={"expected_fingerprint": "wrong-fingerprint", "confirmed": True},
         )
         assert resp_mismatch.status_code == 409
 
-        # Success issuance
         resp = await client.post(
             f"/api/order-drafts/{draft.id}/mcp-authorization",
             json={"expected_fingerprint": draft.fingerprint, "confirmed": True},
@@ -153,7 +86,6 @@ async def test_dashboard_issue_mcp_authorization(tmp_path) -> None:
         assert data["draft"]["symbol"] == "VTI"
         assert data["draft"]["quantity"] == "5"
 
-        # Verify audit event: AUTHORIZATION_CREATED
         events = repo.list_order_events(draft_id=draft.id)
         created_events = [
             e
@@ -190,7 +122,6 @@ async def test_mcp_submit_authorized_order_success(tmp_path) -> None:
         clock=lambda: now,
     )
 
-    # 1. Create draft
     draft = await draft_service.create(
         account_id="schwab-taxable-demo",
         instrument_id="us-etf:VTI",
@@ -200,13 +131,11 @@ async def test_mcp_submit_authorized_order_success(tmp_path) -> None:
         limit_price="220.00",
     )
 
-    # 2. Issue code
     created_auth = mcp_auth_service.create_authorization(
         action="submit", target_draft_id=draft.id
     )
     code = created_auth.plaintext_code
 
-    # 3. Call submit_authorized_order via MCP
     result = await server.call_tool(
         "submit_authorized_order",
         {"draft_id": draft.id, "code": code},
@@ -220,11 +149,9 @@ async def test_mcp_submit_authorized_order_success(tmp_path) -> None:
     assert order_dict["instrument"]["symbol"] == "VTI"
     assert order_dict["instruction"]["quantity"] == "5"
 
-    # 4. Verify code is marked consumed
     active = repo.active_mcp_authorization(action="submit", target_draft_id=draft.id)
     assert active is None
 
-    # 5. Verify audit events
     events = repo.list_order_events(draft_id=draft.id)
     event_types = [e.event_type for e in events.items]
     assert OrderEventType.DRAFT_CREATED in event_types
@@ -267,18 +194,15 @@ async def test_mcp_submit_authorized_order_wrong_or_expired_code(tmp_path) -> No
     )
     mcp_auth_service.create_authorization(action="submit", target_draft_id=draft.id)
 
-    # 1. Wrong code fails
     with pytest.raises(ToolError, match="invalid_or_expired_code"):
         await server.call_tool(
             "submit_authorized_order",
             {"draft_id": draft.id, "code": "99999999"},
         )
 
-    # Verify provider was NOT called and no order created
     orders = repo.list_orders(account_id="schwab-taxable-demo")
     assert len(orders.items) == 0
 
-    # Verify AUTHORIZATION_FAILED event
     events = repo.list_order_events(draft_id=draft.id)
     failed_events = [
         e for e in events.items if e.event_type == OrderEventType.AUTHORIZATION_FAILED
@@ -323,7 +247,6 @@ async def test_mcp_submit_authorized_order_replay_prevented(tmp_path) -> None:
         action="submit", target_draft_id=draft.id
     )
 
-    # First call succeeds
     result1 = await server.call_tool(
         "submit_authorized_order",
         {"draft_id": draft.id, "code": auth.plaintext_code},
@@ -331,8 +254,6 @@ async def test_mcp_submit_authorized_order_replay_prevented(tmp_path) -> None:
     assert isinstance(result1, types.CallToolResult)
     assert result1.is_error is False
 
-    # Second call (replay) fails immediately with invalid_or_expired_code
-    # or draft_already_submitted
     with pytest.raises(
         ToolError, match="(invalid_or_expired_code|draft_already_submitted)"
     ):
@@ -396,12 +317,10 @@ async def test_mcp_submit_authorized_order_concurrency(tmp_path) -> None:
         except ToolError:
             fail_count += 1
 
-    # Launch 10 concurrent requests
     await asyncio.gather(*(attempt() for _ in range(10)))
 
     assert success_count == 1
     assert fail_count == 9
-    # Exactly one order in the repository
     orders = repo.list_orders(account_id="schwab-taxable-demo")
     assert len(orders.items) == 1
 
@@ -432,7 +351,6 @@ async def test_mcp_submit_authorized_order_guard_blocks_changed_safety_state(
         clock=lambda: now,
     )
 
-    # 1. Create draft and issue code while system is safe
     draft = await draft_service.create(
         account_id="schwab-taxable-demo",
         instrument_id="us-etf:VTI",
@@ -446,7 +364,6 @@ async def test_mcp_submit_authorized_order_guard_blocks_changed_safety_state(
     )
     code = auth.plaintext_code
 
-    # 2. Safety state changes: Kill switch is engaged!
     repo.replace_trading_settings(
         live_trading_enabled=True,
         kill_switch_active=True,
@@ -456,24 +373,19 @@ async def test_mcp_submit_authorized_order_guard_blocks_changed_safety_state(
         expected_version=1,
     )
 
-    # 3. MCP submission attempt
     result = await server.call_tool(
         "submit_authorized_order",
         {"draft_id": draft.id, "code": code},
     )
     assert isinstance(result, types.CallToolResult)
-    # The order was rejected locally by TradingGuard
     order_data = result.structured_content
     assert isinstance(order_data, dict)
     assert order_data["order"]["state"] == "REJECTED"
     assert order_data["order"]["result"]["code"] == "kill_switch_active"
 
-    # 4. Code was consumed
     active = repo.active_mcp_authorization(action="submit", target_draft_id=draft.id)
     assert active is None
 
-    # 5. Replay fails immediately with invalid_or_expired_code
-    # or draft_already_submitted
     with pytest.raises(
         ToolError, match="(invalid_or_expired_code|draft_already_submitted)"
     ):
@@ -497,7 +409,6 @@ async def test_mcp_submit_authorized_order_indeterminate_fails_closed(tmp_path) 
         db_url,
     ) = await _setup_services(tmp_path, now)
 
-    # Mock provider submit_order to raise ExecutionIndeterminateError
     async def failing_submit(command: ExecutionCommand):
         raise ExecutionIndeterminateError("Network timeout during order submit")
 
@@ -534,7 +445,6 @@ async def test_mcp_submit_authorized_order_indeterminate_fails_closed(tmp_path) 
     assert isinstance(order_data, dict)
     assert order_data["order"]["state"] == "UNKNOWN"
 
-    # Code is consumed, retry is impossible
     with pytest.raises(
         ToolError, match="(invalid_or_expired_code|draft_already_submitted)"
     ):
@@ -550,10 +460,8 @@ async def test_mcp_cannot_create_or_retrieve_codes() -> None:
     server = create_server(provider)
     tool_names = [tool.name for tool in await server.list_tools()]
 
-    # submit_authorized_order should exist
     assert "submit_authorized_order" in tool_names
 
-    # Verification: MCP cannot create or retrieve codes
     for name in tool_names:
         assert "create_code" not in name
         assert "create_auth" not in name
@@ -624,14 +532,12 @@ async def test_dashboard_issue_mcp_authorization_boundary_errors(tmp_path) -> No
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
-        # 1. Non-existent draft returns 404
         resp_404 = await client.post(
             "/api/order-drafts/non-existent-id/mcp-authorization",
             json={"expected_fingerprint": "abc", "confirmed": True},
         )
         assert resp_404.status_code == 404
 
-        # 2. Expired draft returns 409
         expired_app = create_app(
             provider=provider,
             database_url=db_url,
@@ -651,15 +557,12 @@ async def test_dashboard_issue_mcp_authorization_boundary_errors(tmp_path) -> No
             assert resp_expired.status_code == 409
             assert "expired" in resp_expired.json()["detail"].lower()
 
-        # 3. Already submitted draft returns 409
-        # First submit the draft via dashboard confirm
         confirm_resp = await client.post(
             f"/api/order-drafts/{draft.id}/confirm",
             json={"expected_fingerprint": draft.fingerprint, "confirmed": True},
         )
         assert confirm_resp.status_code == 200
 
-        # Attempt to issue code for already submitted draft
         resp_conflict = await client.post(
             f"/api/order-drafts/{draft.id}/mcp-authorization",
             json={"expected_fingerprint": draft.fingerprint, "confirmed": True},

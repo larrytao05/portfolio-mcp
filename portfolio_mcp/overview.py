@@ -242,7 +242,8 @@ class OverviewService:
                     if raw_warnings
                     else ("Overview unavailable: provider refresh failed.",)
                 )
-                return self._error_overview(
+                return self._empty_overview(
+                    status="error",
                     warnings=warnings,
                     provider_coverage=self._build_provider_coverage(
                         latest_refresh, stored_accounts
@@ -339,17 +340,6 @@ class OverviewService:
             exclusions=(),
             warnings=warnings,
             history=RecordedHistory(points=(), currencies=()),
-            provider_coverage=provider_coverage,
-        )
-
-    def _error_overview(
-        self,
-        warnings: tuple[str, ...] = ("Overview unavailable: provider refresh failed.",),
-        provider_coverage: tuple[ProviderCoverage, ...] = (),
-    ) -> PortfolioOverview:
-        return self._empty_overview(
-            status="error",
-            warnings=warnings,
             provider_coverage=provider_coverage,
         )
 

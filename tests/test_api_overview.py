@@ -77,9 +77,12 @@ def test_fresh_overview_endpoint(tmp_path) -> None:
     assert overview["warnings"] == []
     assert overview["exclusions"] == []
 
-    # Accounts
     accounts = overview["accounts"]
     assert len(accounts) == 2
+    assert {a["account_id"]: a["percentage_of_total"] for a in accounts} == {
+        "schwab-taxable-demo": "0.4800",
+        "fidelity-roth-demo": "0.5200",
+    }
     for acc in accounts:
         assert isinstance(acc["account_id"], str)
         assert isinstance(acc["label"], str)
@@ -90,7 +93,6 @@ def test_fresh_overview_endpoint(tmp_path) -> None:
         assert acc["is_stale"] is False
         assert isinstance(acc["percentage_of_total"], str)
 
-    # Allocations
     allocations = overview["allocations"]
     assert "account" in allocations
     assert "asset_class" in allocations
@@ -121,14 +123,12 @@ def test_fresh_overview_endpoint(tmp_path) -> None:
     assert sec_alloc["excluded_count"] == 0
     assert len(sec_alloc["slices"]) > 0
 
-    # Provider coverage
     assert "provider_coverage" in overview
     assert len(overview["provider_coverage"]) == 2
     for pc in overview["provider_coverage"]:
         assert pc["status"] == "fresh"
         assert pc["is_included_in_totals"] is True
 
-    # Gain / loss
     gain_loss = overview["gain_loss"]
     assert gain_loss["unrealized_gain_loss"] == "758.95"
     assert gain_loss["cost_basis"] == "9241.00"
@@ -136,7 +136,6 @@ def test_fresh_overview_endpoint(tmp_path) -> None:
     assert gain_loss["included_count"] == 9
     assert gain_loss["excluded_count"] == 0
 
-    # History in overview
     history = overview["history"]
     assert len(history) == 1
     assert history[0]["date"] == "2026-08-29"
@@ -341,17 +340,14 @@ def test_overview_endpoints_make_zero_provider_calls(tmp_path) -> None:
     provider = TrackingPortfolioProvider()
     client, _ = create_client(provider=provider, tmp_path=tmp_path)
 
-    # Refresh will make provider calls
     client.post("/api/refresh")
     initial_calls = provider.call_count
     assert initial_calls > 0
 
-    # Calling /api/overview must make ZERO provider calls
     resp = client.get("/api/overview")
     assert resp.status_code == 200
     assert provider.call_count == initial_calls
 
-    # Calling /api/overview/history must make ZERO provider calls
     resp_hist = client.get("/api/overview/history")
     assert resp_hist.status_code == 200
     assert provider.call_count == initial_calls
@@ -402,15 +398,12 @@ def test_missing_market_value_and_cost_basis_exclusions(tmp_path) -> None:
     assert resp.status_code == 200
     overview = resp.json()["overview"]
 
-    # Total should only include NOBASIS (250.00)
     assert overview["total_known_usd_value"] == "250.00"
 
     reasons = {e["symbol"]: e["reason"] for e in overview["exclusions"]}
     assert reasons["UNVALUED"] == "missing_market_value"
     assert reasons["NOBASIS"] == "missing_cost_basis"
 
-    # Gain loss should have 0 included because neither has both market_value
-    # and cost_basis
     assert overview["gain_loss"]["included_count"] == 0
     assert overview["gain_loss"]["excluded_count"] == 2
     assert overview["gain_loss"]["unrealized_gain_loss"] is None
@@ -484,7 +477,6 @@ def test_provider_coverage_mixed_account_outcomes(tmp_path) -> None:
         )
     ]
 
-    # Save initial refresh with 2 accounts
     repo.save_refresh(
         snapshots=[
             HoldingsSnapshot(account=acc1, as_of=snap_date, positions=tuple(pos1)),
@@ -495,7 +487,6 @@ def test_provider_coverage_mixed_account_outcomes(tmp_path) -> None:
         snapshot_date=snap_date,
     )
 
-    # Second refresh: only acc1 is refreshed, acc2 fails (stale)
     repo.save_refresh(
         snapshots=[
             HoldingsSnapshot(account=acc1, as_of=snap_date, positions=tuple(pos1)),
@@ -511,7 +502,6 @@ def test_provider_coverage_mixed_account_outcomes(tmp_path) -> None:
     overview = resp.json()["overview"]
 
     assert overview["status"] == "partial"
-    # Fresh positions from acc1 remain in total
     assert overview["total_known_usd_value"] == "1000.00"
 
     coverages = {pc["provider"]: pc for pc in overview["provider_coverage"]}

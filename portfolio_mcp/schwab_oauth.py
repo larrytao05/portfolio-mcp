@@ -2,7 +2,7 @@ import asyncio
 import sys
 from collections.abc import Callable, Sequence
 
-from portfolio_mcp.config import SchwabMarketDataSettings
+from portfolio_mcp.config import SchwabSettings
 from portfolio_mcp.schwab_market_data import SchwabMarketDataProvider
 
 
@@ -24,7 +24,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if argv:
         raise SystemExit("This command does not accept arguments")
 
-    provider = SchwabMarketDataProvider(SchwabMarketDataSettings.from_environment())
+    provider = SchwabMarketDataProvider(SchwabSettings.from_environment())
     asyncio.run(
         run_authorization(
             provider,

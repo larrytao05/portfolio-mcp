@@ -1,25 +1,24 @@
+import sys
 from contextlib import AsyncExitStack
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 from mcp.server.mcpserver.exceptions import ToolError
 
-from portfolio_mcp.database import (
-    OrderDraftRecord,
-    OrderRecord,
-    PortfolioRepository,
-)
+from portfolio_mcp.database import PortfolioRepository
 from portfolio_mcp.execution import OrderState
 from portfolio_mcp.fixtures import FixturePortfolioProvider
 from portfolio_mcp.order_history import OrderStatusSource
 from portfolio_mcp.provider import AccountNotFoundError
 from portfolio_mcp.refresh import PortfolioRefreshService
+from portfolio_mcp.schema import OrderDraftRecord, OrderRecord
 from portfolio_mcp.server import create_server
 
-SERVER_PATH = "./main.py"
+SERVER_PATH = str(Path(__file__).resolve().parents[1] / "main.py")
 EXPECTED_TOOLS = [
     "list_accounts",
     "get_holdings",
@@ -38,10 +37,18 @@ EXPECTED_TOOLS = [
 
 
 @pytest.mark.asyncio
-async def test_mcp_server_connection() -> None:
+async def test_mcp_server_connection(tmp_path) -> None:
     async with AsyncExitStack() as exit_stack:
         server_params = StdioServerParameters(
-            command="python", args=[SERVER_PATH], env=None
+            command=sys.executable,
+            args=[SERVER_PATH],
+            env={
+                "PORTFOLIO_PROVIDER": "fixture",
+                "MARKET_DATA_PROVIDER": "fixture",
+                "EXECUTION_PROVIDER": "fixture",
+                "SCHWAB_EXECUTION_ENABLED": "false",
+                "PORTFOLIO_DATABASE_URL": f"sqlite:///{tmp_path / 'portfolio.db'}",
+            },
         )
         stdio, write = await exit_stack.enter_async_context(stdio_client(server_params))
         session = await exit_stack.enter_async_context(ClientSession(stdio, write))
@@ -53,10 +60,18 @@ async def test_mcp_server_connection() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tool_descriptions_conformance() -> None:
+async def test_tool_descriptions_conformance(tmp_path) -> None:
     async with AsyncExitStack() as exit_stack:
         server_params = StdioServerParameters(
-            command="python", args=[SERVER_PATH], env=None
+            command=sys.executable,
+            args=[SERVER_PATH],
+            env={
+                "PORTFOLIO_PROVIDER": "fixture",
+                "MARKET_DATA_PROVIDER": "fixture",
+                "EXECUTION_PROVIDER": "fixture",
+                "SCHWAB_EXECUTION_ENABLED": "false",
+                "PORTFOLIO_DATABASE_URL": f"sqlite:///{tmp_path / 'portfolio.db'}",
+            },
         )
         stdio, write = await exit_stack.enter_async_context(stdio_client(server_params))
         session = await exit_stack.enter_async_context(ClientSession(stdio, write))
@@ -66,7 +81,6 @@ async def test_tool_descriptions_conformance() -> None:
 
     tools_by_name = {tool.name: tool for tool in response.tools}
 
-    # Verify read-only claims and draft vs order disclaimers
     read_only_tools = [
         "list_accounts",
         "get_holdings",
@@ -86,7 +100,6 @@ async def test_tool_descriptions_conformance() -> None:
         assert "interrupted submission" in description
         assert "unknown" in description
 
-    # Draft tools must state drafts are not orders and require independent review
     for name in ["create_order_draft", "get_order_draft"]:
         description = (tools_by_name[name].description or "").lower()
         assert "not order" in description or "not place" in description, (
@@ -98,10 +111,18 @@ async def test_tool_descriptions_conformance() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mcp_tools_return_fixture_data() -> None:
+async def test_mcp_tools_return_fixture_data(tmp_path) -> None:
     async with AsyncExitStack() as exit_stack:
         server_params = StdioServerParameters(
-            command="python", args=[SERVER_PATH], env=None
+            command=sys.executable,
+            args=[SERVER_PATH],
+            env={
+                "PORTFOLIO_PROVIDER": "fixture",
+                "MARKET_DATA_PROVIDER": "fixture",
+                "EXECUTION_PROVIDER": "fixture",
+                "SCHWAB_EXECUTION_ENABLED": "false",
+                "PORTFOLIO_DATABASE_URL": f"sqlite:///{tmp_path / 'portfolio.db'}",
+            },
         )
         stdio, write = await exit_stack.enter_async_context(stdio_client(server_params))
         session = await exit_stack.enter_async_context(ClientSession(stdio, write))
@@ -136,7 +157,6 @@ async def test_get_trading_status_tool(tmp_path) -> None:
     assert isinstance(data, dict)
     assert "providers" in data
     assert "accounts" in data
-    # Ensure sensitive settings and limits are NOT leaked
     assert "settings" not in data
     assert "limits" not in data
     assert "max_order_notional_usd" not in str(data)
@@ -167,7 +187,6 @@ async def test_create_and_get_order_draft_tools(tmp_path) -> None:
     provider = FixturePortfolioProvider()
     repo = PortfolioRepository(f"sqlite:///{tmp_path / 'test.db'}", clock=lambda: now)
 
-    # Initialize account state and enable live trading
     await PortfolioRefreshService(provider, repo, clock=lambda: now).refresh()
     repo.replace_trading_settings(
         live_trading_enabled=True,
@@ -185,7 +204,6 @@ async def test_create_and_get_order_draft_tools(tmp_path) -> None:
         clock=lambda: now,
     )
 
-    # 1. Create order draft
     create_result = await server.call_tool(
         "create_order_draft",
         {
@@ -208,11 +226,9 @@ async def test_create_and_get_order_draft_tools(tmp_path) -> None:
     assert draft["instruction"]["quantity"] == "5"
     assert draft["fingerprint"]
 
-    # 2. Verify that creating a draft did NOT create an order
     order_page = repo.list_orders()
     assert len(order_page.items) == 0
 
-    # 3. Get order draft by ID
     get_result = await server.call_tool("get_order_draft", {"draft_id": draft_id})
     assert isinstance(get_result, types.CallToolResult)
     assert get_result.is_error is False
@@ -221,7 +237,6 @@ async def test_create_and_get_order_draft_tools(tmp_path) -> None:
     assert get_data["draft"]["id"] == draft_id
     assert get_data["draft"]["fingerprint"] == draft["fingerprint"]
 
-    # 4. Non-existent draft raises ToolError
     with pytest.raises(ToolError, match="draft_not_found"):
         await server.call_tool("get_order_draft", {"draft_id": "missing-draft"})
 
@@ -233,7 +248,6 @@ async def test_create_order_draft_guard_rejection(tmp_path) -> None:
     repo = PortfolioRepository(f"sqlite:///{tmp_path / 'test.db'}", clock=lambda: now)
 
     await PortfolioRefreshService(provider, repo, clock=lambda: now).refresh()
-    # Activate kill switch in settings
     repo.replace_trading_settings(
         live_trading_enabled=True,
         kill_switch_active=True,
@@ -279,7 +293,6 @@ async def test_list_orders_and_get_order_tools(tmp_path) -> None:
         clock=lambda: now,
     )
 
-    # Seed an interrupted submission after startup to exercise read recovery.
     with repo._sessions.begin() as session:
         session.add(
             OrderDraftRecord(
@@ -337,7 +350,6 @@ async def test_list_orders_and_get_order_tools(tmp_path) -> None:
             )
         )
 
-    # 1. List orders
     list_result = await server.call_tool(
         "list_orders",
         {"account_id": "schwab-taxable-demo", "limit": 10},
@@ -353,7 +365,6 @@ async def test_list_orders_and_get_order_tools(tmp_path) -> None:
     assert order_item["state"] == OrderState.UNKNOWN.value
     assert order_item["instrument"]["symbol"] == "VTI"
 
-    # 2. Get order by ID
     get_result = await server.call_tool("get_order", {"order_id": "order-test-1"})
     assert isinstance(get_result, types.CallToolResult)
     assert get_result.is_error is False
@@ -361,22 +372,28 @@ async def test_list_orders_and_get_order_tools(tmp_path) -> None:
     assert isinstance(get_data, dict)
     assert get_data["order"]["id"] == "order-test-1"
 
-    # 3. Missing order raises ToolError
     with pytest.raises(ToolError, match="order_not_found"):
         await server.call_tool("get_order", {"order_id": "missing-order"})
 
 
 @pytest.mark.asyncio
-async def test_stdio_error_returns_is_error() -> None:
+async def test_stdio_error_returns_is_error(tmp_path) -> None:
     async with AsyncExitStack() as exit_stack:
         server_params = StdioServerParameters(
-            command="python", args=[SERVER_PATH], env=None
+            command=sys.executable,
+            args=[SERVER_PATH],
+            env={
+                "PORTFOLIO_PROVIDER": "fixture",
+                "MARKET_DATA_PROVIDER": "fixture",
+                "EXECUTION_PROVIDER": "fixture",
+                "SCHWAB_EXECUTION_ENABLED": "false",
+                "PORTFOLIO_DATABASE_URL": f"sqlite:///{tmp_path / 'portfolio.db'}",
+            },
         )
         stdio, write = await exit_stack.enter_async_context(stdio_client(server_params))
         session = await exit_stack.enter_async_context(ClientSession(stdio, write))
 
         await session.initialize()
-        # Call with non-existent draft ID
         response = await session.call_tool(
             "get_order_draft", {"draft_id": "missing-draft-123"}
         )
@@ -387,40 +404,6 @@ async def test_stdio_error_returns_is_error() -> None:
         isinstance(block, types.TextContent) and "draft_not_found" in block.text
         for block in response.content
     )
-
-
-@pytest.mark.asyncio
-async def test_mcp_security_boundary_no_forbidden_tools() -> None:
-    async with AsyncExitStack() as exit_stack:
-        server_params = StdioServerParameters(
-            command="python", args=[SERVER_PATH], env=None
-        )
-        stdio, write = await exit_stack.enter_async_context(stdio_client(server_params))
-        session = await exit_stack.enter_async_context(ClientSession(stdio, write))
-
-        await session.initialize()
-        response = await session.list_tools()
-
-    tool_names = [tool.name for tool in response.tools]
-    assert "submit_authorized_order" in tool_names
-    assert "request_order_cancellation" in tool_names
-
-    forbidden_tool_patterns = [
-        "settings",
-        "limit",
-        "kill_switch",
-        "create_code",
-        "issue_code",
-        "get_code",
-        "list_codes",
-        "create_auth",
-        "cancel_order",
-    ]
-    for name in tool_names:
-        for pattern in forbidden_tool_patterns:
-            assert pattern not in name.lower(), (
-                f"Tool '{name}' violates security boundary by including '{pattern}'"
-            )
 
 
 @pytest.mark.asyncio

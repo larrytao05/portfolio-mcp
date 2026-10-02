@@ -11,6 +11,7 @@ from portfolio_mcp.provider import (
     ProviderAuthenticationError,
     ProviderAuthorizationError,
     ProviderRateLimitError,
+    ProviderResponseError,
     ProviderUnavailableError,
 )
 from portfolio_mcp.snaptrade import SnapTradeProvider
@@ -187,3 +188,14 @@ async def test_list_accounts_translates_snaptrade_errors(
 
     with pytest.raises(error_type):
         await provider.list_accounts()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+async def test_snaptrade_rejects_nonfinite_holdings(value, monkeypatch) -> None:
+    provider, info = _provider()
+    response = info.get_all_account_positions(account_id="roth-account")
+    response.body["results"][0]["units"] = value
+    monkeypatch.setattr(info, "get_all_account_positions", lambda **kwargs: response)
+    with pytest.raises(ProviderResponseError):
+        await provider.get_holdings("roth-account")
