@@ -3,7 +3,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import NamedTuple
 
-from portfolio_mcp.database import PortfolioRepository
+from portfolio_mcp.database import Database
 from portfolio_mcp.execution import FixtureExecutionProvider
 from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
 from portfolio_mcp.mcp_authorization import McpAuthorizationService
@@ -14,10 +14,11 @@ from portfolio_mcp.trading_service import (
     OrderSubmissionService,
     fixture_submission_validator,
 )
+from portfolio_mcp.trading_settings_store import replace_trading_settings
 
 
 class McpTradingContext(NamedTuple):
-    repository: PortfolioRepository
+    database: Database
     provider: FixturePortfolioProvider
     market_data: FixtureMarketDataProvider
     drafts: OrderDraftService
@@ -29,11 +30,12 @@ class McpTradingContext(NamedTuple):
 
 async def setup_mcp_services(tmp_path: Path, now: datetime) -> McpTradingContext:
     db_url = f"sqlite:///{tmp_path / 'test.db'}"
-    repo = PortfolioRepository(db_url, clock=lambda: now)
+    repo = Database(db_url, clock=lambda: now)
     provider = FixturePortfolioProvider()
     await PortfolioRefreshService(provider, repo, clock=lambda: now).refresh()
 
-    repo.replace_trading_settings(
+    replace_trading_settings(
+        repo,
         live_trading_enabled=True,
         kill_switch_active=False,
         max_order_shares=Decimal("100"),
@@ -50,7 +52,7 @@ async def setup_mcp_services(tmp_path: Path, now: datetime) -> McpTradingContext
     execution_provider = FixtureExecutionProvider(clock=lambda: now)
     validator = fixture_submission_validator(provider)
     submission_service = OrderSubmissionService(
-        repository=repo,
+        database=repo,
         execution_provider=execution_provider,
         clock=lambda: now,
         validator=validator,

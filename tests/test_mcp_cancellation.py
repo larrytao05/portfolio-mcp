@@ -14,10 +14,13 @@ from portfolio_mcp.execution import (
     ExecutionResult,
     OrderState,
 )
+from portfolio_mcp.order_cancellation_store import active_cancellation_request_for_order
 from portfolio_mcp.order_history import (
     OrderEventActor,
     OrderEventType,
 )
+from portfolio_mcp.order_query_store import list_order_events
+from portfolio_mcp.order_query_store import order as load_order
 from portfolio_mcp.server import create_server
 from portfolio_mcp.trading_service import (
     OrderCancellationRequestService,
@@ -29,13 +32,13 @@ from tests.mcp_support import setup_mcp_services
 async def _setup_services(tmp_path: Path, now: datetime):
     context = await setup_mcp_services(tmp_path, now)
     cancellation_service = OrderCancellationService(
-        repository=context.repository,
+        database=context.database,
         execution_provider=context.execution,
         clock=lambda: now,
         mcp_auth_service=context.authorization,
     )
     cancellation_request_service = OrderCancellationRequestService(
-        repository=context.repository,
+        database=context.database,
         clock=lambda: now,
         execution_provider=context.execution,
         mcp_auth_service=context.authorization,
@@ -96,7 +99,7 @@ async def test_mcp_cancel_authorized_order_success(tmp_path) -> None:
     )
     data = req_res.model_dump()
     assert "cancellation_request" in data["content"][0]["text"]
-    active_req = repo.active_cancellation_request_for_order(order_id)
+    active_req = active_cancellation_request_for_order(repo, order_id)
     assert active_req is not None
     req = cancellation_request_service.get_request(active_req.id)
     assert req is not None
@@ -120,11 +123,11 @@ async def test_mcp_cancel_authorized_order_success(tmp_path) -> None:
     text = order_data["content"][0]["text"]
     assert "canceled" in text.lower()
 
-    updated_order = repo.order(order_id)
+    updated_order = load_order(repo, order_id)
     assert updated_order is not None
     assert updated_order.state == OrderState.CANCELED
 
-    events = repo.list_order_events(order_id=order_id, limit=50).items
+    events = list_order_events(repo, order_id=order_id, limit=50).items
     consumed_events = [
         e
         for e in events
@@ -180,7 +183,7 @@ async def test_mcp_cancel_authorized_order_wrong_or_expired_code(tmp_path) -> No
             {"cancellation_request_id": req.id, "code": "WRONGCOD"},
         )
 
-    order = repo.order(order_id)
+    order = load_order(repo, order_id)
     assert order is not None
     assert order.state == OrderState.ACCEPTED
 
@@ -412,7 +415,7 @@ async def test_mcp_cancel_authorized_order_unknown_outcome_directs_to_reconcile(
     assert "unknown" in text.lower()
     assert "reconciliation" in text.lower()
 
-    order = repo.order(order_id)
+    order = load_order(repo, order_id)
     assert order is not None
     assert order.state == OrderState.UNKNOWN
 
@@ -432,7 +435,7 @@ async def test_mcp_cancel_authorized_order_unknown_outcome_directs_to_reconcile(
             },
         )
 
-    events = repo.list_order_events(order_id=order_id, limit=50).items
+    events = list_order_events(repo, order_id=order_id, limit=50).items
     consumed_events = [
         e
         for e in events
@@ -463,7 +466,7 @@ async def test_mcp_cancel_authorized_order_refusal_retry_prevented(
 
     order_id = await _create_active_order(draft_service, submission_service)
 
-    order_before = repo.order(order_id)
+    order_before = load_order(repo, order_id)
     assert order_before is not None
 
     execution_provider.cancel_order = AsyncMock(
@@ -504,7 +507,7 @@ async def test_mcp_cancel_authorized_order_refusal_retry_prevented(
     assert "cancel_rejected" in text.lower() or "rejected" in text.lower()
     assert "canceled" not in text.lower() or 'state": "accepted"' in text.lower()
 
-    order = repo.order(order_id)
+    order = load_order(repo, order_id)
     assert order is not None
     assert order.state == OrderState.ACCEPTED
     assert order.result_code == "cancel_rejected"
@@ -525,7 +528,7 @@ async def test_mcp_cancel_authorized_order_refusal_retry_prevented(
             },
         )
 
-    events = repo.list_order_events(order_id=order_id, limit=50).items
+    events = list_order_events(repo, order_id=order_id, limit=50).items
     consumed_events = [
         e
         for e in events
@@ -571,7 +574,7 @@ async def test_mcp_cancel_authorized_order_state_changed_fails(tmp_path) -> None
         req.id, expected_fingerprint=req.action_fingerprint
     )
 
-    with repo._sessions() as session:
+    with repo.sessions() as session:
         from portfolio_mcp.schema import OrderRecord
 
         rec = session.get(OrderRecord, order_id)

@@ -4,14 +4,17 @@ from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Callable, Iterable, Sequence
 
-from portfolio_mcp.database import (
+from portfolio_mcp.database import Database
+from portfolio_mcp.models import Position
+from portfolio_mcp.portfolio_records import (
     DailyAccountValue,
-    PortfolioRepository,
     RefreshResult,
     StoredAccount,
     StoredPosition,
 )
-from portfolio_mcp.models import Position
+from portfolio_mcp.portfolio_store import (
+    read_portfolio_view,
+)
 
 
 def _sum_decimals(values: Iterable[Decimal | None]) -> Decimal:
@@ -223,12 +226,13 @@ class PortfolioOverview:
 
 
 class OverviewService:
-    def __init__(self, repository: PortfolioRepository) -> None:
-        self._repository = repository
+    def __init__(self, database: Database) -> None:
+        self._database = database
 
     def get_overview(self) -> PortfolioOverview:
-        latest_refresh = self._repository.latest_refresh()
-        stored_accounts = self._repository.list_accounts()
+        view = read_portfolio_view(self._database)
+        latest_refresh = view.latest_refresh
+        stored_accounts = view.accounts
 
         if not stored_accounts:
             if latest_refresh and latest_refresh.status == "failed":
@@ -251,8 +255,8 @@ class OverviewService:
                 )
             return self._empty_overview()
 
-        stored_positions = self._repository.all_positions()
-        all_daily = self._repository.all_daily_values()
+        stored_positions = view.positions
+        all_daily = view.daily_values
 
         status = self._determine_status(stored_accounts, latest_refresh)
         as_of = max((p.as_of for p in stored_positions), default=None)
@@ -311,9 +315,8 @@ class OverviewService:
         )
 
     def get_history(self) -> RecordedHistory:
-        accounts = self._repository.list_accounts()
-        all_daily = self._repository.all_daily_values()
-        return self._build_history(all_daily, len(accounts))
+        view = read_portfolio_view(self._database)
+        return self._build_history(view.daily_values, len(view.accounts))
 
     def _empty_overview(
         self,
@@ -345,7 +348,7 @@ class OverviewService:
 
     def _determine_status(
         self,
-        stored_accounts: list[StoredAccount],
+        stored_accounts: Sequence[StoredAccount],
         latest_refresh: RefreshResult | None,
     ) -> str:
         if all(a.is_stale for a in stored_accounts) or (
@@ -360,8 +363,8 @@ class OverviewService:
 
     def _classify_positions(
         self,
-        stored_positions: list[StoredPosition],
-        stored_accounts: list[StoredAccount],
+        stored_positions: Sequence[StoredPosition],
+        stored_accounts: Sequence[StoredAccount],
     ) -> tuple[list[StoredPosition], list[OverviewExclusion], list[StoredPosition]]:
         stale_account_ids = {a.account.id for a in stored_accounts if a.is_stale}
         fresh_usd_positions: list[StoredPosition] = []
@@ -433,8 +436,8 @@ class OverviewService:
 
     def _calculate_contributions(
         self,
-        stored_accounts: list[StoredAccount],
-        stored_positions: list[StoredPosition],
+        stored_accounts: Sequence[StoredAccount],
+        stored_positions: Sequence[StoredPosition],
         fresh_usd_positions: list[StoredPosition],
         total_known_usd: Decimal | None,
     ) -> tuple[list[OverviewAccountContribution], list[AllocationSlice]]:
@@ -655,7 +658,7 @@ class OverviewService:
 
     def _collect_warnings(
         self,
-        stored_accounts: list[StoredAccount],
+        stored_accounts: Sequence[StoredAccount],
         latest_refresh: RefreshResult | None,
     ) -> tuple[str, ...]:
         warnings: list[str] = []
@@ -680,7 +683,7 @@ class OverviewService:
     def _build_provider_coverage(
         self,
         latest_refresh: RefreshResult | None,
-        stored_accounts: list[StoredAccount],
+        stored_accounts: Sequence[StoredAccount],
     ) -> tuple[ProviderCoverage, ...]:
         provider_coverages: list[ProviderCoverage] = []
         if latest_refresh and latest_refresh.provider_outcomes:
@@ -729,7 +732,7 @@ class OverviewService:
         return tuple(provider_coverages)
 
     def _build_history(
-        self, all_daily: list[DailyAccountValue], total_accounts: int
+        self, all_daily: Sequence[DailyAccountValue], total_accounts: int
     ) -> RecordedHistory:
         date_groups: dict[date, list[DailyAccountValue]] = defaultdict(list)
         all_currencies: set[str] = set()

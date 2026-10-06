@@ -11,6 +11,7 @@ import {
 export type OrderCancellationModalProps = {
   order: StoredOrder;
   isOpen: boolean;
+  isRefreshPending: boolean;
   onClose: () => void;
   onSuccess: (updatedOrder: StoredOrder) => void;
   onOrderUpdated?: (updatedOrder: StoredOrder) => void;
@@ -31,6 +32,7 @@ const CANCELLATION_DISPOSITION_MESSAGES: Partial<Record<string, string>> = {
 export function OrderCancellationModal({
   order,
   isOpen,
+  isRefreshPending,
   onClose,
   onSuccess,
   onOrderUpdated,
@@ -245,6 +247,7 @@ export function OrderCancellationModal({
                 type="button"
                 className="button-primary"
                 ref={initialFocusRef}
+                disabled={isRefreshPending}
                 onClick={() => {
                   onReconcileRequested?.(currentOrder.id);
                   onClose();

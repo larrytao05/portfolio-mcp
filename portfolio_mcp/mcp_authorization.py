@@ -8,11 +8,19 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from portfolio_mcp.database import (
+from portfolio_mcp.authorization_records import (
     McpAuthorizationError,
-    PortfolioRepository,
     StoredCancellationRequest,
 )
+from portfolio_mcp.database import Database
+from portfolio_mcp.order_authorization_store import (
+    active_mcp_authorization,
+    create_mcp_authorization,
+    mark_mcp_authorization_consumed,
+    record_mcp_authorization_failure,
+)
+from portfolio_mcp.order_cancellation_store import authorize_cancellation_request
+from portfolio_mcp.order_query_store import order_draft
 
 
 def _utc_now(dt: datetime) -> datetime:
@@ -51,12 +59,12 @@ class StoredMcpAuthorization:
 class McpAuthorizationService:
     def __init__(
         self,
-        repository: PortfolioRepository,
+        database: Database,
         clock: Callable[[], datetime] | None = None,
         code_generator: Callable[[], str] | None = None,
         scrypt_n: int = 16384,
     ) -> None:
-        self._repository = repository
+        self._database = database
         self._clock = clock or (lambda: datetime.now(UTC))
         self._code_generator = code_generator or self._default_code_generator
         self._scrypt_n = scrypt_n
@@ -81,7 +89,7 @@ class McpAuthorizationService:
                 raise McpAuthorizationError(
                     "draft_not_found", "Target draft ID required for submit"
                 )
-            draft = self._repository.order_draft(target_draft_id)
+            draft = order_draft(self._database, target_draft_id)
             if draft is None:
                 raise McpAuthorizationError("draft_not_found", "Order draft not found")
             if now > draft.expires_at:
@@ -116,7 +124,8 @@ class McpAuthorizationService:
             p=1,
         )
 
-        self._repository.create_mcp_authorization(
+        create_mcp_authorization(
+            self._database,
             authorization_id=auth_id,
             action=action,
             target_draft_id=target_draft_id,
@@ -161,7 +170,8 @@ class McpAuthorizationService:
             r=8,
             p=1,
         )
-        stored_req, order_id = self._repository.authorize_cancellation_request(
+        stored_req, order_id = authorize_cancellation_request(
+            self._database,
             request_id=request_id,
             expected_fingerprint=expected_fingerprint,
             authorization_id=auth_id,
@@ -194,13 +204,15 @@ class McpAuthorizationService:
         candidate_code: str,
     ) -> StoredMcpAuthorization:
         now = _utc_now(self._clock())
-        record = self._repository.active_mcp_authorization(
+        record = active_mcp_authorization(
+            self._database,
             action=action,
             target_draft_id=target_draft_id,
             target_cancellation_request_id=target_cancellation_request_id,
         )
         if record is None:
-            self._repository.record_mcp_authorization_failure(
+            record_mcp_authorization_failure(
+                self._database,
                 action=action,
                 reason="no_active_authorization",
                 target_draft_id=target_draft_id,
@@ -208,7 +220,8 @@ class McpAuthorizationService:
             )
             raise McpAuthorizationError("invalid_or_expired_code")
         if now > record.expires_at:
-            self._repository.record_mcp_authorization_failure(
+            record_mcp_authorization_failure(
+                self._database,
                 action=action,
                 reason="authorization_expired",
                 authorization_id=record.id,
@@ -235,7 +248,8 @@ class McpAuthorizationService:
                 matches = False
 
         if not matches:
-            self._repository.record_mcp_authorization_failure(
+            record_mcp_authorization_failure(
+                self._database,
                 action=action,
                 reason="verification_failed",
                 authorization_id=record.id,
@@ -243,10 +257,11 @@ class McpAuthorizationService:
             )
             raise McpAuthorizationError("invalid_or_expired_code")
 
-        if not self._repository.mark_mcp_authorization_consumed(
-            authorization_id=record.id, now=now
+        if not mark_mcp_authorization_consumed(
+            self._database, authorization_id=record.id, now=now
         ):
-            self._repository.record_mcp_authorization_failure(
+            record_mcp_authorization_failure(
+                self._database,
                 action=action,
                 reason="authorization_unavailable",
                 authorization_id=record.id,

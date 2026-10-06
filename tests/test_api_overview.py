@@ -6,9 +6,10 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from portfolio_mcp.api import create_app
-from portfolio_mcp.database import PortfolioRepository
+from portfolio_mcp.database import Database
 from portfolio_mcp.fixtures import FixturePortfolioProvider
 from portfolio_mcp.models import Account, HoldingsSnapshot, Position
+from portfolio_mcp.portfolio_store import save_refresh
 from portfolio_mcp.provider import ProviderUnavailableError
 
 
@@ -41,7 +42,7 @@ def create_client(
     provider: FixturePortfolioProvider | None = None,
     tmp_path: Path | None = None,
     clock: Callable[[], datetime] | None = None,
-) -> tuple[TestClient, PortfolioRepository]:
+) -> tuple[TestClient, Database]:
     assert tmp_path is not None
     if provider is None:
         provider = FixturePortfolioProvider()
@@ -51,7 +52,7 @@ def create_client(
         database_url=database_url,
         clock=clock,
     )
-    return TestClient(app), PortfolioRepository(database_url)
+    return TestClient(app), Database(database_url)
 
 
 def test_fresh_overview_endpoint(tmp_path) -> None:
@@ -258,7 +259,7 @@ def test_history_endpoint_preserves_gaps(tmp_path) -> None:
             ),
         ),
     )
-    repo.save_refresh([snap1], now, now, snapshot_date=date(2026, 8, 20))
+    save_refresh(repo, [snap1], now, now, snapshot_date=date(2026, 8, 20))
 
     now2 = datetime(2026, 8, 25, 10, 0, 0, tzinfo=UTC)
     snap2_1 = HoldingsSnapshot(
@@ -295,7 +296,7 @@ def test_history_endpoint_preserves_gaps(tmp_path) -> None:
             ),
         ),
     )
-    repo.save_refresh([snap2_1, snap2_2], now2, now2, snapshot_date=date(2026, 8, 25))
+    save_refresh(repo, [snap2_1, snap2_2], now2, now2, snapshot_date=date(2026, 8, 25))
 
     response = client.get("/api/overview/history")
     assert response.status_code == 200
@@ -392,7 +393,7 @@ def test_missing_market_value_and_cost_basis_exclusions(tmp_path) -> None:
             ),
         ),
     )
-    repo.save_refresh([snap], now, now, snapshot_date=date(2026, 8, 20))
+    save_refresh(repo, [snap], now, now, snapshot_date=date(2026, 8, 20))
 
     resp = client.get("/api/overview")
     assert resp.status_code == 200
@@ -477,7 +478,8 @@ def test_provider_coverage_mixed_account_outcomes(tmp_path) -> None:
         )
     ]
 
-    repo.save_refresh(
+    save_refresh(
+        repo,
         snapshots=[
             HoldingsSnapshot(account=acc1, as_of=snap_date, positions=tuple(pos1)),
             HoldingsSnapshot(account=acc2, as_of=snap_date, positions=tuple(pos2)),
@@ -487,7 +489,8 @@ def test_provider_coverage_mixed_account_outcomes(tmp_path) -> None:
         snapshot_date=snap_date,
     )
 
-    repo.save_refresh(
+    save_refresh(
+        repo,
         snapshots=[
             HoldingsSnapshot(account=acc1, as_of=snap_date, positions=tuple(pos1)),
         ],

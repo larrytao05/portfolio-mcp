@@ -1,7 +1,7 @@
 # Portfolio MCP backend
 
 `portfolio_mcp/` is the Python application layer behind the dashboard and the
-MCP server. It contains the domain model, SQLite repository, external-provider
+MCP server. It contains the domain model, SQLite stores, external-provider
 adapters, refresh and overview services, safe fake-execution workflow, and
 FastAPI routes.
 
@@ -10,7 +10,7 @@ FastAPI routes.
 - `../api_main.py` creates the FastAPI application for the browser dashboard.
 - `../main.py` creates the MCP server for stdio-based MCP clients.
 - `api/app.py` defines the HTTP routes and wires services together with the
-  repository and configured providers.
+  database and configured providers.
 
 Run the HTTP API during dashboard development:
 
@@ -30,8 +30,19 @@ uv run python main.py
   `Transaction`, `Instrument`, and `Quote`. Decimal financial values are
   serialized as strings at API boundaries.
 - `schema.py` contains SQLAlchemy table declarations and exact decimal and UTC storage types.
-- `database.py` — `PortfolioRepository`, the only layer that should directly
-  read and write SQLite records.
+- `database.py` creates the engine, session factory, clock and submission locks.
+- `portfolio_store.py` owns saved accounts, refresh coverage, capabilities,
+  provider health and coherent portfolio reads. `portfolio_records.py` contains
+  their returned records and serialization.
+- `order_submission_store.py`, `order_cancellation_store.py`,
+  `order_authorization_store.py` and `reconciliation_store.py` own complete
+  trading transactions. Each operation commits its state, authorization and audit
+  changes together. Committed cancellation refusals retain their invalidation.
+- `order_query_store.py` owns saved order and audit queries. `stored_orders.py`
+  and `authorization_records.py` contain the returned records. Shared record
+  operations in `order_record_ops.py` use the caller's transaction.
+- `trading_settings_store.py` and `schwab_mapping_store.py` own persisted trading
+  configuration and their returned records.
 - `refresh.py` — obtains provider snapshots, persists them, and records fresh,
   partial, or failed refresh outcomes.
 - `overview.py` — produces the authoritative cross-account overview read model:
@@ -53,19 +64,22 @@ uv run python main.py
 ```text
 FastAPI route
   -> service
-  -> PortfolioRepository
+  -> domain store function
   -> SQLite
 
 refresh route
   -> configured provider
   -> refresh service
-  -> PortfolioRepository
+  -> domain store function
   -> SQLite
 ```
 
-Routes should stay thin: validate HTTP input, call a service or repository, and
+Routes should stay thin: validate HTTP input, call a service or store operation, and
 serialize the result. Business rules belong in services. SQLAlchemy persistence
-details belong in `PortfolioRepository`.
+details belong in the store modules. Services receive a `Database` and import
+operations directly from the relevant store; they do not open sessions.
+Overview and history inputs are materialized in one explicit SQLite read
+transaction. Provider health uses the same read transaction boundary.
 
 ## Data and migrations
 

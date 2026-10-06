@@ -6,8 +6,9 @@ from datetime import UTC, date, datetime
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
+from portfolio_mcp.authorization_records import McpAuthorizationError
 from portfolio_mcp.bootstrap import resolve_submission_validator
-from portfolio_mcp.database import PortfolioRepository
+from portfolio_mcp.database import Database
 from portfolio_mcp.execution import (
     ExecutionProvider,
     FixtureExecutionProvider,
@@ -15,13 +16,23 @@ from portfolio_mcp.execution import (
     OrderState,
 )
 from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
+from portfolio_mcp.mcp_authorization import McpAuthorizationService
 from portfolio_mcp.order_history import (
     OrderListFilters,
     decode_order_cursor,
 )
+from portfolio_mcp.order_query_store import list_orders as query_orders
+from portfolio_mcp.order_query_store import order as load_order
+from portfolio_mcp.order_query_store import order_draft
 from portfolio_mcp.order_reconciliation import (
     OrderReconciliationService,
     format_order_page_response,
+)
+from portfolio_mcp.order_submission_store import recover_stranded_submissions
+from portfolio_mcp.portfolio_store import (
+    account_exists,
+    current_capabilities,
+    provider_health,
 )
 from portfolio_mcp.provider import (
     AccountNotFoundError,
@@ -35,8 +46,6 @@ from portfolio_mcp.trading_safety import (
     TradingSettingsService,
 )
 from portfolio_mcp.trading_service import (
-    McpAuthorizationError,
-    McpAuthorizationService,
     OrderCancellationRequestService,
     OrderCancellationService,
     OrderDraftService,
@@ -55,7 +64,7 @@ def create_server(
     submission_validator: SubmissionValidator | None = None,
     database_url: str = "sqlite:///portfolio.db",
     clock: Callable[[], datetime] | None = None,
-    repository: PortfolioRepository | None = None,
+    database: Database | None = None,
     draft_service: OrderDraftService | None = None,
     reconciliation_service: OrderReconciliationService | None = None,
     submission_service: OrderSubmissionService | None = None,
@@ -66,7 +75,7 @@ def create_server(
     mcp = MCPServer("portfolio-mcp")
 
     service_clock = clock or (lambda: datetime.now(UTC))
-    repo = repository or PortfolioRepository(database_url, service_clock)
+    repo = database or Database(database_url, service_clock)
     market_data = market_data_provider or FixtureMarketDataProvider()
     settings_service = TradingSettingsService(repo, service_clock)
     trading_guard = TradingGuard(repo, settings_service)
@@ -102,7 +111,7 @@ def create_server(
     recover_on_reads = active_submission_service is None
     if active_submission_service is None:
         active_submission_service = OrderSubmissionService(
-            repository=repo,
+            database=repo,
             execution_provider=execution,
             clock=service_clock,
             validator=validator,
@@ -111,13 +120,13 @@ def create_server(
         )
 
     if recover_on_reads:
-        repo.recover_stranded_submissions(service_clock())
+        recover_stranded_submissions(repo, service_clock())
 
     def recover_before_order_read() -> None:
         if not recover_on_reads:
             return
         try:
-            repo.recover_stranded_submissions(service_clock())
+            recover_stranded_submissions(repo, service_clock())
         except SubmissionLockError as error:
             raise ToolError("submission_recovery_unavailable") from error
 
@@ -169,9 +178,9 @@ def create_server(
         limits, settings, or authorization codes.
         """
         return {
-            "providers": [health.to_dict() for health in repo.provider_health()],
+            "providers": [health.to_dict() for health in provider_health(repo)],
             "accounts": [
-                capability.to_dict() for capability in repo.current_capabilities()
+                capability.to_dict() for capability in current_capabilities(repo)
             ],
         }
 
@@ -218,7 +227,7 @@ def create_server(
         Read-only. Drafts are not orders and do not execute or place trades
         until independently reviewed and confirmed on the dashboard.
         """
-        draft = repo.order_draft(draft_id)
+        draft = order_draft(repo, draft_id)
         if draft is None:
             raise ToolError(f"draft_not_found: Order draft '{draft_id}' not found")
         return {"draft": draft.to_dict()}
@@ -246,7 +255,7 @@ def create_server(
             raise ToolError(
                 "invalid_date_range: start_date must be on or before end_date"
             )
-        if account_id is not None and not repo.account_exists(account_id):
+        if account_id is not None and not account_exists(repo, account_id):
             raise ToolError(f"account_not_found: Account '{account_id}' not found")
         if limit < 1 or limit > 100:
             raise ToolError("invalid_limit: limit must be between 1 and 100")
@@ -274,7 +283,8 @@ def create_server(
             raise ToolError("invalid_cursor: Invalid order cursor") from error
 
         recover_before_order_read()
-        page = repo.list_orders(
+        page = query_orders(
+            repo,
             limit=limit,
             after=after,
             account_id=account_id,
@@ -296,7 +306,7 @@ def create_server(
         that its owner has exited.
         """
         recover_before_order_read()
-        order = repo.order(order_id)
+        order = load_order(repo, order_id)
         if order is None:
             raise ToolError(f"order_not_found: Order '{order_id}' not found")
         return {"order": order.to_dict()}

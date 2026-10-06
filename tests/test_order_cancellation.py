@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from portfolio_mcp.api import create_app
-from portfolio_mcp.database import CancellationObservation, PortfolioRepository
+from portfolio_mcp.database import Database
 from portfolio_mcp.execution import (
     ExecutionResult,
     FillSummary,
@@ -18,6 +18,11 @@ from portfolio_mcp.execution import (
     OrderState,
 )
 from portfolio_mcp.fixtures import FixturePortfolioProvider
+from portfolio_mcp.order_cancellation_store import (
+    CancellationObservation,
+    begin_order_cancellation,
+    finish_order_cancellation,
+)
 from portfolio_mcp.trading_service import allow_fixture_submission
 
 
@@ -577,9 +582,10 @@ def test_cancellation_late_obsolete_attempt_rejected(tmp_path) -> None:
     order_id = cast(str, order["id"])
     version = cast(int, order["version"])
     state = OrderState(cast(str, order["state"]))
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'cancellation.db'}")
+    database = Database(f"sqlite:///{tmp_path / 'cancellation.db'}")
     now = datetime.now(UTC)
-    stored, attempt_id, started = repository.begin_order_cancellation(
+    stored, attempt_id, started = begin_order_cancellation(
+        database,
         order_id,
         expected_version=version,
         expected_state=state,
@@ -589,7 +595,8 @@ def test_cancellation_late_obsolete_attempt_rejected(tmp_path) -> None:
     assert attempt_id is not None
 
     fake_attempt = uuid4()
-    res_obsolete = repository.finish_order_cancellation(
+    res_obsolete = finish_order_cancellation(
+        database,
         order_id,
         attempt_id=fake_attempt,
         observation=CancellationObservation(kind="canceled"),
@@ -597,7 +604,8 @@ def test_cancellation_late_obsolete_attempt_rejected(tmp_path) -> None:
     )
     assert res_obsolete.state == OrderState.CANCEL_PENDING
 
-    res_legit = repository.finish_order_cancellation(
+    res_legit = finish_order_cancellation(
+        database,
         order_id,
         attempt_id=attempt_id,
         observation=CancellationObservation(kind="canceled"),
@@ -613,10 +621,11 @@ def test_repository_begin_order_cancellation_claim_race_safety(tmp_path) -> None
     order_id = cast(str, order["id"])
     version = cast(int, order["version"])
     state = OrderState(cast(str, order["state"]))
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'cancellation.db'}")
+    database = Database(f"sqlite:///{tmp_path / 'cancellation.db'}")
     now = datetime.now(UTC)
 
-    stored1, attempt1, started1 = repository.begin_order_cancellation(
+    stored1, attempt1, started1 = begin_order_cancellation(
+        database,
         order_id,
         expected_version=version,
         expected_state=state,
@@ -626,7 +635,8 @@ def test_repository_begin_order_cancellation_claim_race_safety(tmp_path) -> None
     assert stored1.state == OrderState.CANCEL_PENDING
     assert attempt1 is not None
 
-    stored2, attempt2, started2 = repository.begin_order_cancellation(
+    stored2, attempt2, started2 = begin_order_cancellation(
+        database,
         order_id,
         expected_version=stored1.version,
         expected_state=OrderState.CANCEL_PENDING,

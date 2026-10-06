@@ -9,18 +9,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
+from portfolio_mcp.authorization_records import McpAuthorizationError
 from portfolio_mcp.bootstrap import (
     create_execution_settings,
     create_schwab_settings,
     resolve_submission_validator,
 )
 from portfolio_mcp.config import ExecutionSettings, SchwabSettings
-from portfolio_mcp.database import (
-    AccountNotFoundError,
-    CorruptedAuditRecordError,
-    PortfolioRepository,
-    SchwabAccountMappingConflictError,
-)
+from portfolio_mcp.database import Database
 from portfolio_mcp.execution import (
     ExecutionProvider,
     FixtureExecutionProvider,
@@ -28,6 +24,7 @@ from portfolio_mcp.execution import (
     OrderState,
 )
 from portfolio_mcp.fixtures import FixtureMarketDataProvider
+from portfolio_mcp.mcp_authorization import McpAuthorizationService
 from portfolio_mcp.order_history import (
     OrderAuditFilters,
     OrderListFilters,
@@ -35,11 +32,34 @@ from portfolio_mcp.order_history import (
     decode_order_event_cursor,
     encode_order_event_cursor,
 )
+from portfolio_mcp.order_query_store import (
+    CorruptedAuditRecordError,
+    list_order_events,
+    order_draft,
+    order_draft_exists,
+    order_exists,
+    order_for_draft,
+)
+from portfolio_mcp.order_query_store import list_orders as query_orders
+from portfolio_mcp.order_query_store import order as load_order
 from portfolio_mcp.order_reconciliation import (
     OrderReconciliationService,
     format_order_page_response,
 )
+from portfolio_mcp.order_submission_store import recover_stranded_submissions
 from portfolio_mcp.overview import OverviewService
+from portfolio_mcp.portfolio_store import (
+    account_capability,
+    account_detail,
+    account_exists,
+    current_capabilities,
+    daily_values,
+    list_activities,
+    provider_health,
+)
+from portfolio_mcp.portfolio_store import latest_refresh as load_latest_refresh
+from portfolio_mcp.portfolio_store import list_accounts as load_accounts
+from portfolio_mcp.portfolio_store import list_positions as load_positions
 from portfolio_mcp.provider import (
     InstrumentNotFoundError,
     MarketDataProvider,
@@ -52,6 +72,13 @@ from portfolio_mcp.provider import (
     ProviderUnavailableError,
 )
 from portfolio_mcp.refresh import PortfolioRefreshService
+from portfolio_mcp.schwab_mapping_store import (
+    AccountNotFoundError,
+    SchwabAccountMappingConflictError,
+    delete_schwab_account_mapping,
+    get_schwab_account_mapping,
+    list_schwab_account_mappings,
+)
 from portfolio_mcp.schwab_readiness import SchwabReadinessService
 from portfolio_mcp.schwab_transport import SchwabOAuthTransport
 from portfolio_mcp.submission_locks import SubmissionLockError
@@ -62,8 +89,6 @@ from portfolio_mcp.trading_safety import (
     settings_dict,
 )
 from portfolio_mcp.trading_service import (
-    McpAuthorizationError,
-    McpAuthorizationService,
     OrderCancellationRequestService,
     OrderCancellationService,
     OrderDraftService,
@@ -165,7 +190,7 @@ def create_app(
     schwab_settings: SchwabSettings | None = None,
 ) -> FastAPI:
     service_clock = clock or (lambda: datetime.now(UTC))
-    repository = PortfolioRepository(database_url, service_clock)
+    database = Database(database_url, service_clock)
     exec_settings = (
         execution_settings
         if execution_settings is not None
@@ -184,13 +209,13 @@ def create_app(
         schwab_readiness_service
         if schwab_readiness_service is not None
         else SchwabReadinessService(
-            repository,
+            database,
             schwab_transport,
             exec_settings,
             schwab_conf,
         )
     )
-    refresh_service = PortfolioRefreshService(provider, repository, service_clock)
+    refresh_service = PortfolioRefreshService(provider, database, service_clock)
     market_data = market_data_provider or FixtureMarketDataProvider()
     execution = (
         execution_provider
@@ -198,24 +223,24 @@ def create_app(
         else FixtureExecutionProvider(clock=service_clock)
     )
     validator = resolve_submission_validator(provider, execution, submission_validator)
-    settings_service = TradingSettingsService(repository, service_clock)
-    trading_guard = TradingGuard(repository, settings_service)
+    settings_service = TradingSettingsService(database, service_clock)
+    trading_guard = TradingGuard(database, settings_service)
     active_mcp_auth = (
         mcp_auth_service
         if mcp_auth_service is not None
-        else McpAuthorizationService(repository, clock=service_clock)
+        else McpAuthorizationService(database, clock=service_clock)
     )
     draft_service = (
         draft_service
         if draft_service is not None
-        else OrderDraftService(repository, market_data, service_clock, trading_guard)
+        else OrderDraftService(database, market_data, service_clock, trading_guard)
     )
     recover_on_reads = submission_service is None
     submission_service = (
         submission_service
         if submission_service is not None
         else OrderSubmissionService(
-            repository,
+            database,
             execution,
             service_clock,
             validator,
@@ -226,35 +251,35 @@ def create_app(
     active_cancellation_service = (
         cancellation_service
         if cancellation_service is not None
-        else OrderCancellationService(repository, execution, service_clock)
+        else OrderCancellationService(database, execution, service_clock)
     )
     active_cancellation_request_service = (
         cancellation_request_service
         if cancellation_request_service is not None
-        else OrderCancellationRequestService(repository, execution, service_clock)
+        else OrderCancellationRequestService(database, execution, service_clock)
     )
     order_reader = order_read_provider
     if order_reader is None and type(execution) is FixtureExecutionProvider:
         order_reader = execution
     reconciliation = (
-        OrderReconciliationService(repository, order_reader, service_clock)
+        OrderReconciliationService(database, order_reader, service_clock)
         if order_reader is not None
         else None
     )
     if recover_on_reads:
-        repository.recover_stranded_submissions(service_clock())
+        recover_stranded_submissions(database, service_clock())
 
     def recover_before_order_read() -> None:
         if not recover_on_reads:
             return
         try:
-            repository.recover_stranded_submissions(service_clock())
+            recover_stranded_submissions(database, service_clock())
         except SubmissionLockError as error:
             raise HTTPException(
                 status_code=503, detail="Order recovery is unavailable"
             ) from error
 
-    overview_service = OverviewService(repository)
+    overview_service = OverviewService(database)
     app = FastAPI(title="Portfolio Dashboard API")
     app.add_middleware(
         CORSMiddleware,
@@ -279,26 +304,26 @@ def create_app(
 
     @app.get("/api/accounts")
     async def list_accounts() -> dict[str, list[dict[str, str | bool]]]:
-        accounts = repository.list_accounts()
+        accounts = load_accounts(database)
         return {"accounts": [account.to_dict() for account in accounts]}
 
     @app.get("/api/accounts/{account_id}/positions")
     async def list_positions(account_id: str) -> dict[str, object]:
-        positions = repository.list_positions(account_id)
+        positions = load_positions(database, account_id)
         if positions is None:
             raise HTTPException(status_code=404, detail="Account not found")
         return {"positions": [position.to_dict() for position in positions]}
 
     @app.get("/api/accounts/{account_id}")
     async def get_account(account_id: str) -> dict[str, object]:
-        account = repository.account_detail(account_id)
+        account = account_detail(database, account_id)
         if account is None:
             raise HTTPException(status_code=404, detail="Account not found")
         return {"account": account.to_dict()}
 
     @app.get("/api/accounts/{account_id}/daily-values")
     async def list_daily_values(account_id: str) -> dict[str, object]:
-        values = repository.daily_values(account_id)
+        values = daily_values(database, account_id)
         if values is None:
             raise HTTPException(status_code=404, detail="Account not found")
         return {"daily_values": [value.to_dict() for value in values]}
@@ -306,9 +331,9 @@ def create_app(
     @app.get("/api/trading/status")
     async def trading_status() -> dict[str, object]:
         return {
-            "providers": [health.to_dict() for health in repository.provider_health()],
+            "providers": [health.to_dict() for health in provider_health(database)],
             "accounts": [
-                capability.to_dict() for capability in repository.current_capabilities()
+                capability.to_dict() for capability in current_capabilities(database)
             ],
         }
 
@@ -325,7 +350,7 @@ def create_app(
 
     @app.get("/api/accounts/{account_id}/capabilities")
     async def account_capabilities(account_id: str) -> dict[str, object]:
-        capability = repository.account_capability(account_id)
+        capability = account_capability(database, account_id)
         if capability is None:
             raise HTTPException(
                 status_code=404,
@@ -337,8 +362,7 @@ def create_app(
     async def list_schwab_mappings() -> dict[str, object]:
         return {
             "mappings": [
-                mapping.to_dict()
-                for mapping in repository.list_schwab_account_mappings()
+                mapping.to_dict() for mapping in list_schwab_account_mappings(database)
             ]
         }
 
@@ -357,7 +381,7 @@ def create_app(
 
     @app.get("/api/schwab/mapping/{account_id}")
     async def get_schwab_mapping(account_id: str) -> dict[str, object]:
-        mapping = repository.get_schwab_account_mapping(account_id)
+        mapping = get_schwab_account_mapping(database, account_id)
         if mapping is None:
             raise HTTPException(
                 status_code=404,
@@ -381,7 +405,7 @@ def create_app(
 
     @app.delete("/api/schwab/mapping/{account_id}")
     async def delete_schwab_mapping(account_id: str) -> dict[str, object]:
-        deleted = repository.delete_schwab_account_mapping(account_id)
+        deleted = delete_schwab_account_mapping(database, account_id)
         if not deleted:
             raise HTTPException(
                 status_code=404,
@@ -401,7 +425,7 @@ def create_app(
 
     @app.get("/api/refreshes/latest")
     async def latest_refresh() -> dict[str, object]:
-        result = repository.latest_refresh()
+        result = load_latest_refresh(database)
         return {"refresh": result.to_dict() if result is not None else None}
 
     @app.get("/api/activity")
@@ -419,7 +443,8 @@ def create_app(
             raise HTTPException(
                 status_code=422, detail="start_date must be on or before end_date"
             )
-        activities, total = repository.list_activities(
+        activities, total = list_activities(
+            database,
             account_id=account_id,
             provider=provider,
             transaction_type=transaction_type,
@@ -451,7 +476,7 @@ def create_app(
 
     @app.get("/api/order-drafts/{draft_id}")
     async def get_order_draft(draft_id: str) -> dict[str, object]:
-        draft = repository.order_draft(draft_id)
+        draft = order_draft(database, draft_id)
         if draft is None:
             raise HTTPException(status_code=404, detail="Order draft not found")
         return {"draft": draft.to_dict()}
@@ -474,7 +499,7 @@ def create_app(
                 status_code=422,
                 detail="Explicit confirmation is required",
             )
-        draft = repository.order_draft(draft_id)
+        draft = order_draft(database, draft_id)
         if draft is None:
             raise HTTPException(status_code=404, detail="Order draft not found")
         if draft.fingerprint != request.expected_fingerprint:
@@ -485,7 +510,7 @@ def create_app(
         now = service_clock()
         if now > draft.expires_at:
             raise HTTPException(status_code=409, detail="Order draft has expired")
-        existing = repository.order_for_draft(draft_id)
+        existing = order_for_draft(database, draft_id)
         if existing is not None:
             raise HTTPException(
                 status_code=409,
@@ -567,7 +592,7 @@ def create_app(
             raise HTTPException(
                 status_code=422, detail="start_date must be on or before end_date"
             )
-        if account_id is not None and not repository.account_exists(account_id):
+        if account_id is not None and not account_exists(database, account_id):
             raise HTTPException(status_code=404, detail="Account not found")
         normalized_provider = provider.strip() if provider is not None else None
         normalized_symbol = symbol.strip().upper() if symbol is not None else None
@@ -585,7 +610,8 @@ def create_app(
             raise HTTPException(
                 status_code=422, detail="Invalid order cursor"
             ) from error
-        page = repository.list_orders(
+        page = query_orders(
+            database,
             limit=limit,
             after=after,
             account_id=account_id,
@@ -616,11 +642,11 @@ def create_app(
             raise HTTPException(
                 status_code=422, detail="start_date must be on or before end_date"
             )
-        if order_id is not None and not repository.order_exists(order_id):
+        if order_id is not None and not order_exists(database, order_id):
             raise HTTPException(status_code=404, detail="Order not found")
-        if draft_id is not None and not repository.order_draft_exists(draft_id):
+        if draft_id is not None and not order_draft_exists(database, draft_id):
             raise HTTPException(status_code=404, detail="Order draft not found")
-        if account_id is not None and not repository.account_exists(account_id):
+        if account_id is not None and not account_exists(database, account_id):
             raise HTTPException(status_code=404, detail="Account not found")
         normalized_provider = provider.strip() if provider is not None else None
         normalized_symbol = symbol.strip().upper() if symbol is not None else None
@@ -641,7 +667,8 @@ def create_app(
                 status_code=422, detail="Invalid order-audit cursor"
             ) from error
         try:
-            page = repository.list_order_events(
+            page = list_order_events(
+                database,
                 limit=limit,
                 after=after,
                 order_id=order_id,
@@ -671,7 +698,7 @@ def create_app(
     ) -> dict[str, object]:
         recover_before_order_read()
         if reconciliation is None:
-            if repository.order(order_id) is None:
+            if load_order(database, order_id) is None:
                 raise HTTPException(status_code=404, detail="Order not found")
             raise HTTPException(
                 status_code=503, detail="Order reconciliation is unavailable"
@@ -714,7 +741,7 @@ def create_app(
     @app.get("/api/orders/{order_id}")
     async def get_order(order_id: str) -> dict[str, object]:
         recover_before_order_read()
-        order = repository.order(order_id)
+        order = load_order(database, order_id)
         if order is None:
             raise HTTPException(status_code=404, detail="Order not found")
         return {"order": order.to_dict()}

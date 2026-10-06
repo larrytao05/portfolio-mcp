@@ -1,7 +1,7 @@
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
-from portfolio_mcp.database import PortfolioRepository
+from portfolio_mcp.database import Database
 from portfolio_mcp.models import Account, HoldingsSnapshot, Position
 from portfolio_mcp.overview import (
     AllocationGroup,
@@ -10,12 +10,13 @@ from portfolio_mcp.overview import (
     PortfolioOverview,
     RecordedHistory,
 )
+from portfolio_mcp.portfolio_store import save_failed_refresh, save_refresh
 
 
 def test_empty_portfolio(tmp_path) -> None:
     database_url = f"sqlite:///{tmp_path / 'empty.db'}"
-    repository = PortfolioRepository(database_url)
-    service = OverviewService(repository)
+    database = Database(database_url)
+    service = OverviewService(database)
 
     overview = service.get_overview()
 
@@ -73,7 +74,7 @@ def test_multi_account_usd_portfolio(tmp_path) -> None:
     from portfolio_mcp.models import Account, HoldingsSnapshot, Position
 
     database_url = f"sqlite:///{tmp_path / 'multi.db'}"
-    repository = PortfolioRepository(database_url)
+    database = Database(database_url)
 
     now = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
     snap_date = date(2026, 8, 29)
@@ -142,7 +143,8 @@ def test_multi_account_usd_portfolio(tmp_path) -> None:
         ),
     ]
 
-    repository.save_refresh(
+    save_refresh(
+        database,
         snapshots=[
             HoldingsSnapshot(account=acc1, as_of=snap_date, positions=tuple(pos1)),
             HoldingsSnapshot(account=acc2, as_of=snap_date, positions=tuple(pos2)),
@@ -152,7 +154,7 @@ def test_multi_account_usd_portfolio(tmp_path) -> None:
         snapshot_date=snap_date,
     )
 
-    service = OverviewService(repository)
+    service = OverviewService(database)
     overview = service.get_overview()
 
     assert overview.status == "fresh"
@@ -228,7 +230,7 @@ def test_duplicate_symbols_across_accounts_preserve_identities(tmp_path) -> None
     from portfolio_mcp.models import Account, HoldingsSnapshot, Position
 
     database_url = f"sqlite:///{tmp_path / 'dup.db'}"
-    repository = PortfolioRepository(database_url)
+    database = Database(database_url)
 
     now = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
     snap_date = date(2026, 8, 29)
@@ -275,7 +277,8 @@ def test_duplicate_symbols_across_accounts_preserve_identities(tmp_path) -> None
         ),
     ]
 
-    repository.save_refresh(
+    save_refresh(
+        database,
         snapshots=[
             HoldingsSnapshot(account=acc1, as_of=snap_date, positions=tuple(pos1)),
             HoldingsSnapshot(account=acc2, as_of=snap_date, positions=tuple(pos2)),
@@ -285,7 +288,7 @@ def test_duplicate_symbols_across_accounts_preserve_identities(tmp_path) -> None
         snapshot_date=snap_date,
     )
 
-    service = OverviewService(repository)
+    service = OverviewService(database)
     overview = service.get_overview()
 
     assert overview.total_known_usd_value == Decimal("5000.00")
@@ -315,7 +318,7 @@ def test_missing_market_value_and_cost_basis(tmp_path) -> None:
     from portfolio_mcp.models import Account, HoldingsSnapshot, Position
 
     database_url = f"sqlite:///{tmp_path / 'missing.db'}"
-    repository = PortfolioRepository(database_url)
+    database = Database(database_url)
 
     now = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
     snap_date = date(2026, 8, 29)
@@ -363,7 +366,8 @@ def test_missing_market_value_and_cost_basis(tmp_path) -> None:
         ),
     ]
 
-    repository.save_refresh(
+    save_refresh(
+        database,
         snapshots=[
             HoldingsSnapshot(account=acc, as_of=snap_date, positions=tuple(positions)),
         ],
@@ -372,7 +376,7 @@ def test_missing_market_value_and_cost_basis(tmp_path) -> None:
         snapshot_date=snap_date,
     )
 
-    service = OverviewService(repository)
+    service = OverviewService(database)
     overview = service.get_overview()
 
     assert overview.total_known_usd_value == Decimal("1500.00")
@@ -406,7 +410,7 @@ def test_non_usd_holdings_excluded_and_reported(tmp_path) -> None:
     from portfolio_mcp.models import Account, HoldingsSnapshot, Position
 
     database_url = f"sqlite:///{tmp_path / 'non_usd.db'}"
-    repository = PortfolioRepository(database_url)
+    database = Database(database_url)
 
     now = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
     snap_date = date(2026, 8, 29)
@@ -454,7 +458,8 @@ def test_non_usd_holdings_excluded_and_reported(tmp_path) -> None:
         ),
     ]
 
-    repository.save_refresh(
+    save_refresh(
+        database,
         snapshots=[
             HoldingsSnapshot(account=acc, as_of=snap_date, positions=tuple(positions)),
         ],
@@ -463,7 +468,7 @@ def test_non_usd_holdings_excluded_and_reported(tmp_path) -> None:
         snapshot_date=snap_date,
     )
 
-    service = OverviewService(repository)
+    service = OverviewService(database)
     overview = service.get_overview()
 
     assert overview.total_known_usd_value == Decimal("3000.00")
@@ -497,7 +502,7 @@ def test_partial_refresh_and_stale_accounts(tmp_path) -> None:
     from portfolio_mcp.models import Account, HoldingsSnapshot, Position
 
     database_url = f"sqlite:///{tmp_path / 'stale.db'}"
-    repository = PortfolioRepository(database_url)
+    database = Database(database_url)
 
     t1 = datetime(2026, 8, 29, 10, 0, tzinfo=UTC)
     t2 = datetime(2026, 8, 29, 14, 0, tzinfo=UTC)
@@ -545,7 +550,8 @@ def test_partial_refresh_and_stale_accounts(tmp_path) -> None:
         ),
     ]
 
-    repository.save_refresh(
+    save_refresh(
+        database,
         snapshots=[
             HoldingsSnapshot(account=acc1, as_of=d, positions=tuple(pos1)),
             HoldingsSnapshot(account=acc2, as_of=d, positions=tuple(pos2)),
@@ -555,7 +561,8 @@ def test_partial_refresh_and_stale_accounts(tmp_path) -> None:
         snapshot_date=d,
     )
 
-    repository.save_refresh(
+    save_refresh(
+        database,
         snapshots=[
             HoldingsSnapshot(account=acc1, as_of=d, positions=tuple(pos1)),
         ],
@@ -565,7 +572,7 @@ def test_partial_refresh_and_stale_accounts(tmp_path) -> None:
         failed_accounts=[acc2],
     )
 
-    service = OverviewService(repository)
+    service = OverviewService(database)
     overview = service.get_overview()
 
     assert overview.status == "partial"
@@ -592,7 +599,7 @@ def test_failed_refresh_all_accounts_stale(tmp_path) -> None:
     from portfolio_mcp.models import Account, HoldingsSnapshot, Position
 
     database_url = f"sqlite:///{tmp_path / 'all_stale.db'}"
-    repository = PortfolioRepository(database_url)
+    database = Database(database_url)
 
     t1 = datetime(2026, 8, 29, 10, 0, tzinfo=UTC)
     t2 = datetime(2026, 8, 29, 14, 0, tzinfo=UTC)
@@ -619,7 +626,8 @@ def test_failed_refresh_all_accounts_stale(tmp_path) -> None:
         ),
     ]
 
-    repository.save_refresh(
+    save_refresh(
+        database,
         snapshots=[
             HoldingsSnapshot(account=acc, as_of=d, positions=tuple(pos)),
         ],
@@ -628,14 +636,15 @@ def test_failed_refresh_all_accounts_stale(tmp_path) -> None:
         snapshot_date=d,
     )
 
-    repository.save_failed_refresh(
+    save_failed_refresh(
+        database,
         started_at=t2,
         completed_at=t2,
         error_code="provider_error",
         error_message="Schwab API unavailable",
     )
 
-    service = OverviewService(repository)
+    service = OverviewService(database)
     overview = service.get_overview()
 
     assert overview.status == "stale"
@@ -655,7 +664,7 @@ def test_daily_value_history_aggregation_and_gap_preservation(tmp_path) -> None:
     from portfolio_mcp.schema import DailyAccountValueRecord
 
     database_url = f"sqlite:///{tmp_path / 'history.db'}"
-    repository = PortfolioRepository(database_url)
+    database = Database(database_url)
 
     now = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
     snap_date = date(2026, 8, 29)
@@ -696,7 +705,8 @@ def test_daily_value_history_aggregation_and_gap_preservation(tmp_path) -> None:
         )
     ]
 
-    repository.save_refresh(
+    save_refresh(
+        database,
         snapshots=[
             HoldingsSnapshot(account=acc1, as_of=snap_date, positions=tuple(pos)),
             HoldingsSnapshot(account=acc2, as_of=snap_date, positions=()),
@@ -707,7 +717,7 @@ def test_daily_value_history_aggregation_and_gap_preservation(tmp_path) -> None:
         snapshot_date=snap_date,
     )
 
-    with repository._sessions.begin() as session:
+    with database.sessions.begin() as session:
         session.add(
             DailyAccountValueRecord(
                 account_id="acc-1",
@@ -784,7 +794,7 @@ def test_daily_value_history_aggregation_and_gap_preservation(tmp_path) -> None:
             )
         )
 
-    service = OverviewService(repository)
+    service = OverviewService(database)
     overview = service.get_overview()
 
     history = overview.history
@@ -823,7 +833,7 @@ def test_mixed_currency_account_daily_history_excludes_non_usd_from_usd_snapshot
     tmp_path,
 ) -> None:
     database_url = f"sqlite:///{tmp_path / 'mixed.db'}"
-    repository = PortfolioRepository(database_url)
+    database = Database(database_url)
 
     now = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
     snap_date = date(2026, 8, 29)
@@ -860,7 +870,8 @@ def test_mixed_currency_account_daily_history_excludes_non_usd_from_usd_snapshot
         ),
     ]
 
-    repository.save_refresh(
+    save_refresh(
+        database,
         snapshots=[
             HoldingsSnapshot(account=acc, as_of=snap_date, positions=tuple(positions))
         ],
@@ -869,7 +880,7 @@ def test_mixed_currency_account_daily_history_excludes_non_usd_from_usd_snapshot
         snapshot_date=snap_date,
     )
 
-    service = OverviewService(repository)
+    service = OverviewService(database)
     overview = service.get_overview()
 
     assert len(overview.history.points) == 1

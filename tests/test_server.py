@@ -9,14 +9,16 @@ from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 from mcp.server.mcpserver.exceptions import ToolError
 
-from portfolio_mcp.database import PortfolioRepository
+from portfolio_mcp.database import Database
 from portfolio_mcp.execution import OrderState
 from portfolio_mcp.fixtures import FixturePortfolioProvider
 from portfolio_mcp.order_history import OrderStatusSource
+from portfolio_mcp.order_query_store import list_orders as query_orders
 from portfolio_mcp.provider import AccountNotFoundError
 from portfolio_mcp.refresh import PortfolioRefreshService
 from portfolio_mcp.schema import OrderDraftRecord, OrderRecord
 from portfolio_mcp.server import create_server
+from portfolio_mcp.trading_settings_store import replace_trading_settings
 
 SERVER_PATH = str(Path(__file__).resolve().parents[1] / "main.py")
 EXPECTED_TOOLS = [
@@ -142,11 +144,11 @@ async def test_mcp_tools_return_fixture_data(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_get_trading_status_tool(tmp_path) -> None:
     now = datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'test.db'}", clock=lambda: now)
+    repo = Database(f"sqlite:///{tmp_path / 'test.db'}", clock=lambda: now)
     server = create_server(
         FixturePortfolioProvider(),
         database_url=f"sqlite:///{tmp_path / 'test.db'}",
-        repository=repo,
+        database=repo,
         clock=lambda: now,
     )
 
@@ -185,10 +187,11 @@ async def test_search_instruments_tool(tmp_path) -> None:
 async def test_create_and_get_order_draft_tools(tmp_path) -> None:
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
     provider = FixturePortfolioProvider()
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'test.db'}", clock=lambda: now)
+    repo = Database(f"sqlite:///{tmp_path / 'test.db'}", clock=lambda: now)
 
     await PortfolioRefreshService(provider, repo, clock=lambda: now).refresh()
-    repo.replace_trading_settings(
+    replace_trading_settings(
+        repo,
         live_trading_enabled=True,
         kill_switch_active=False,
         max_order_shares=Decimal("100"),
@@ -200,7 +203,7 @@ async def test_create_and_get_order_draft_tools(tmp_path) -> None:
     server = create_server(
         provider,
         database_url=f"sqlite:///{tmp_path / 'test.db'}",
-        repository=repo,
+        database=repo,
         clock=lambda: now,
     )
 
@@ -226,7 +229,7 @@ async def test_create_and_get_order_draft_tools(tmp_path) -> None:
     assert draft["instruction"]["quantity"] == "5"
     assert draft["fingerprint"]
 
-    order_page = repo.list_orders()
+    order_page = query_orders(repo)
     assert len(order_page.items) == 0
 
     get_result = await server.call_tool("get_order_draft", {"draft_id": draft_id})
@@ -245,10 +248,11 @@ async def test_create_and_get_order_draft_tools(tmp_path) -> None:
 async def test_create_order_draft_guard_rejection(tmp_path) -> None:
     now = datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
     provider = FixturePortfolioProvider()
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'test.db'}", clock=lambda: now)
+    repo = Database(f"sqlite:///{tmp_path / 'test.db'}", clock=lambda: now)
 
     await PortfolioRefreshService(provider, repo, clock=lambda: now).refresh()
-    repo.replace_trading_settings(
+    replace_trading_settings(
+        repo,
         live_trading_enabled=True,
         kill_switch_active=True,
         max_order_shares=Decimal("100"),
@@ -260,7 +264,7 @@ async def test_create_order_draft_guard_rejection(tmp_path) -> None:
     server = create_server(
         provider,
         database_url=f"sqlite:///{tmp_path / 'test.db'}",
-        repository=repo,
+        database=repo,
         clock=lambda: now,
     )
 
@@ -282,18 +286,18 @@ async def test_create_order_draft_guard_rejection(tmp_path) -> None:
 async def test_list_orders_and_get_order_tools(tmp_path) -> None:
     now = datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
     provider = FixturePortfolioProvider()
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'test.db'}", clock=lambda: now)
+    repo = Database(f"sqlite:///{tmp_path / 'test.db'}", clock=lambda: now)
 
     await PortfolioRefreshService(provider, repo, clock=lambda: now).refresh()
 
     server = create_server(
         provider,
         database_url=f"sqlite:///{tmp_path / 'test.db'}",
-        repository=repo,
+        database=repo,
         clock=lambda: now,
     )
 
-    with repo._sessions.begin() as session:
+    with repo.sessions.begin() as session:
         session.add(
             OrderDraftRecord(
                 id="draft-order-1",

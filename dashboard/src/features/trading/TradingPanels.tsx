@@ -80,7 +80,8 @@ export function SchwabAccountMappingItem({ accountId }: { accountId: string }) {
   const queryClient = useQueryClient();
   const [showMappingFlow, setShowMappingFlow] = useState(false);
   const [selectedCandidateId, setSelectedCandidateId] = useState<string>("");
-  const [confirmed, setConfirmed] = useState(false);
+  const [confirmedCandidateId, setConfirmedCandidateId] = useState<string>("");
+  const confirmed = selectedCandidateId !== "" && confirmedCandidateId === selectedCandidateId;
   const [actionError, setActionError] = useState<string | null>(null);
 
   const mappingQuery = useQuery({
@@ -125,7 +126,7 @@ export function SchwabAccountMappingItem({ accountId }: { accountId: string }) {
     },
     onSuccess: async () => {
       setShowMappingFlow(false);
-      setConfirmed(false);
+      setConfirmedCandidateId("");
       setSelectedCandidateId("");
       setActionError(null);
       await Promise.all([
@@ -166,7 +167,7 @@ export function SchwabAccountMappingItem({ accountId }: { accountId: string }) {
     <div className="schwab-mapping-container" style={{ marginTop: "1rem", paddingTop: "0.75rem", borderTop: "1px solid var(--border-subtle, #e2e8f0)" }}>
       <h4>Schwab Execution Readiness & Mapping</h4>
       {readinessQuery.isError && <p className="inline-alert" role="alert">{readinessQuery.error.message}</p>}
-      {readiness && (
+      {readiness && !readinessQuery.isError && (
         <p>
           Status: <strong>{readiness.state.replace("_", " ").toUpperCase()}</strong> · {readiness.message}
         </p>
@@ -239,7 +240,7 @@ export function SchwabAccountMappingItem({ accountId }: { accountId: string }) {
                   <input
                     type="checkbox"
                     checked={confirmed}
-                    onChange={(e) => setConfirmed(e.target.checked)}
+                    onChange={(e) => setConfirmedCandidateId(e.target.checked ? selectedCandidateId : "")}
                   />
                   <span>I confirm this is the correct Schwab trading account</span>
                 </label>
@@ -260,7 +261,7 @@ export function SchwabAccountMappingItem({ accountId }: { accountId: string }) {
                   onClick={() => {
                     setShowMappingFlow(false);
                     setSelectedCandidateId("");
-                    setConfirmed(false);
+                    setConfirmedCandidateId("");
                     setActionError(null);
                   }}
                 >

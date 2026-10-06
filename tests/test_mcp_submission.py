@@ -15,11 +15,15 @@ from portfolio_mcp.execution import (
     ExecutionIndeterminateError,
 )
 from portfolio_mcp.fixtures import FixturePortfolioProvider
+from portfolio_mcp.order_authorization_store import active_mcp_authorization
 from portfolio_mcp.order_history import (
     OrderEventActor,
     OrderEventType,
 )
+from portfolio_mcp.order_query_store import list_order_events
+from portfolio_mcp.order_query_store import list_orders as query_orders
 from portfolio_mcp.server import create_server
+from portfolio_mcp.trading_settings_store import replace_trading_settings
 from tests.mcp_support import setup_mcp_services as _setup_services
 
 
@@ -86,7 +90,7 @@ async def test_dashboard_issue_mcp_authorization(tmp_path) -> None:
         assert data["draft"]["symbol"] == "VTI"
         assert data["draft"]["quantity"] == "5"
 
-        events = repo.list_order_events(draft_id=draft.id)
+        events = list_order_events(repo, draft_id=draft.id)
         created_events = [
             e
             for e in events.items
@@ -115,7 +119,7 @@ async def test_mcp_submit_authorized_order_success(tmp_path) -> None:
     server = create_server(
         provider,
         database_url=db_url,
-        repository=repo,
+        database=repo,
         draft_service=draft_service,
         submission_service=submission_service,
         mcp_auth_service=mcp_auth_service,
@@ -149,10 +153,10 @@ async def test_mcp_submit_authorized_order_success(tmp_path) -> None:
     assert order_dict["instrument"]["symbol"] == "VTI"
     assert order_dict["instruction"]["quantity"] == "5"
 
-    active = repo.active_mcp_authorization(action="submit", target_draft_id=draft.id)
+    active = active_mcp_authorization(repo, action="submit", target_draft_id=draft.id)
     assert active is None
 
-    events = repo.list_order_events(draft_id=draft.id)
+    events = list_order_events(repo, draft_id=draft.id)
     event_types = [e.event_type for e in events.items]
     assert OrderEventType.DRAFT_CREATED in event_types
     assert OrderEventType.AUTHORIZATION_CREATED in event_types
@@ -177,7 +181,7 @@ async def test_mcp_submit_authorized_order_wrong_or_expired_code(tmp_path) -> No
     server = create_server(
         provider,
         database_url=db_url,
-        repository=repo,
+        database=repo,
         draft_service=draft_service,
         submission_service=submission_service,
         mcp_auth_service=mcp_auth_service,
@@ -200,10 +204,10 @@ async def test_mcp_submit_authorized_order_wrong_or_expired_code(tmp_path) -> No
             {"draft_id": draft.id, "code": "99999999"},
         )
 
-    orders = repo.list_orders(account_id="schwab-taxable-demo")
+    orders = query_orders(repo, account_id="schwab-taxable-demo")
     assert len(orders.items) == 0
 
-    events = repo.list_order_events(draft_id=draft.id)
+    events = list_order_events(repo, draft_id=draft.id)
     failed_events = [
         e for e in events.items if e.event_type == OrderEventType.AUTHORIZATION_FAILED
     ]
@@ -228,7 +232,7 @@ async def test_mcp_submit_authorized_order_replay_prevented(tmp_path) -> None:
     server = create_server(
         provider,
         database_url=db_url,
-        repository=repo,
+        database=repo,
         draft_service=draft_service,
         submission_service=submission_service,
         mcp_auth_service=mcp_auth_service,
@@ -280,7 +284,7 @@ async def test_mcp_submit_authorized_order_concurrency(tmp_path) -> None:
     server = create_server(
         provider,
         database_url=db_url,
-        repository=repo,
+        database=repo,
         draft_service=draft_service,
         submission_service=submission_service,
         mcp_auth_service=mcp_auth_service,
@@ -321,7 +325,7 @@ async def test_mcp_submit_authorized_order_concurrency(tmp_path) -> None:
 
     assert success_count == 1
     assert fail_count == 9
-    orders = repo.list_orders(account_id="schwab-taxable-demo")
+    orders = query_orders(repo, account_id="schwab-taxable-demo")
     assert len(orders.items) == 1
 
 
@@ -344,7 +348,7 @@ async def test_mcp_submit_authorized_order_guard_blocks_changed_safety_state(
     server = create_server(
         provider,
         database_url=db_url,
-        repository=repo,
+        database=repo,
         draft_service=draft_service,
         submission_service=submission_service,
         mcp_auth_service=mcp_auth_service,
@@ -364,7 +368,8 @@ async def test_mcp_submit_authorized_order_guard_blocks_changed_safety_state(
     )
     code = auth.plaintext_code
 
-    repo.replace_trading_settings(
+    replace_trading_settings(
+        repo,
         live_trading_enabled=True,
         kill_switch_active=True,
         max_order_shares=Decimal("100"),
@@ -383,7 +388,7 @@ async def test_mcp_submit_authorized_order_guard_blocks_changed_safety_state(
     assert order_data["order"]["state"] == "REJECTED"
     assert order_data["order"]["result"]["code"] == "kill_switch_active"
 
-    active = repo.active_mcp_authorization(action="submit", target_draft_id=draft.id)
+    active = active_mcp_authorization(repo, action="submit", target_draft_id=draft.id)
     assert active is None
 
     with pytest.raises(
@@ -417,7 +422,7 @@ async def test_mcp_submit_authorized_order_indeterminate_fails_closed(tmp_path) 
     server = create_server(
         provider,
         database_url=db_url,
-        repository=repo,
+        database=repo,
         draft_service=draft_service,
         submission_service=submission_service,
         mcp_auth_service=mcp_auth_service,

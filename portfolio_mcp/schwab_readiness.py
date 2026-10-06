@@ -9,21 +9,26 @@ from enum import StrEnum
 from typing import Any
 
 from portfolio_mcp.config import ExecutionSettings, SchwabSettings
-from portfolio_mcp.database import (
-    AccountNotFoundError,
-    PortfolioRepository,
-    StoredSchwabAccountMapping,
-)
+from portfolio_mcp.database import Database
 from portfolio_mcp.models import (
     Account,
     is_schwab_account_eligible,
     is_schwab_account_masked,
 )
+from portfolio_mcp.portfolio_store import list_accounts as load_accounts
+from portfolio_mcp.portfolio_store import stored_account as load_stored_account
 from portfolio_mcp.provider import (
     ProviderAuthenticationError,
     ProviderAuthorizationError,
     ProviderResponseError,
     ProviderUnavailableError,
+)
+from portfolio_mcp.schwab_mapping_store import (
+    AccountNotFoundError,
+    StoredSchwabAccountMapping,
+    get_schwab_account_mapping,
+    list_schwab_account_mappings,
+    save_schwab_account_mapping,
 )
 from portfolio_mcp.schwab_transport import (
     SchwabOAuthTransport,
@@ -101,14 +106,14 @@ class SchwabReadinessService:
 
     def __init__(
         self,
-        repository: PortfolioRepository,
+        database: Database,
         transport: SchwabOAuthTransport | None = None,
         execution_settings: ExecutionSettings | None = None,
         schwab_settings: SchwabSettings | None = None,
         trader_api_url: str = DEFAULT_TRADER_API_URL,
         hmac_key: bytes | None = None,
     ) -> None:
-        self._repository = repository
+        self._database = database
         self._transport = transport
         self._execution_settings = execution_settings or ExecutionSettings()
         self._schwab_settings = schwab_settings
@@ -129,7 +134,7 @@ class SchwabReadinessService:
     async def list_candidates_for_account(
         self, account_id: str
     ) -> list[SchwabAccountCandidate]:
-        stored_acc = self._repository.stored_account(account_id)
+        stored_acc = load_stored_account(self._database, account_id)
         if stored_acc is None:
             raise AccountNotFoundError(f"Account '{account_id}' does not exist")
 
@@ -151,7 +156,7 @@ class SchwabReadinessService:
                 "Schwab Trader API returned an unexpected account numbers payload"
             )
 
-        mappings = self._repository.list_schwab_account_mappings()
+        mappings = list_schwab_account_mappings(self._database)
         mappings_by_hash = {m.schwab_account_hash: m for m in mappings}
 
         label_digits = "".join(c for c in stored_acc.account.label if c.isdigit())
@@ -220,14 +225,15 @@ class SchwabReadinessService:
                 "among active Schwab accounts"
             )
 
-        return self._repository.save_schwab_account_mapping(
+        return save_schwab_account_mapping(
+            self._database,
             account_id=normalized_account_id,
             schwab_account_hash=matched.schwab_account_hash,
             masked_account_number=matched.masked_account_number,
         )
 
     async def check_account_readiness(self, account_id: str) -> SchwabAccountReadiness:
-        account_detail = self._repository.stored_account(account_id)
+        account_detail = load_stored_account(self._database, account_id)
         if account_detail is None:
             return SchwabAccountReadiness(
                 account_id=account_id,
@@ -237,7 +243,7 @@ class SchwabReadinessService:
                 message=f"Local account '{account_id}' was not found",
             )
 
-        mapping = self._repository.get_schwab_account_mapping(account_id)
+        mapping = get_schwab_account_mapping(self._database, account_id)
 
         if mapping is not None and not is_schwab_account_masked(
             mapping.masked_account_number
@@ -422,7 +428,7 @@ class SchwabReadinessService:
         )
 
     async def check_all_readiness(self) -> list[SchwabAccountReadiness]:
-        accounts = self._repository.list_accounts()
+        accounts = load_accounts(self._database)
         if not accounts:
             return []
         return list(

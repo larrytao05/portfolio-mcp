@@ -11,20 +11,28 @@ from mcp import types
 from mcp.server.mcpserver.exceptions import ToolError
 
 from portfolio_mcp.api.app import create_app
-from portfolio_mcp.database import (
-    CancellationObservation,
-    ConcurrentOrderUpdate,
-)
 from portfolio_mcp.execution import (
     OrderState,
 )
 from portfolio_mcp.fixtures import FixturePortfolioProvider
+from portfolio_mcp.order_cancellation_store import (
+    CancellationObservation,
+    active_cancellation_request_for_order,
+    begin_order_cancellation,
+    create_cancellation_request,
+    finish_order_cancellation,
+    get_cancellation_request,
+)
 from portfolio_mcp.order_history import (
     OrderEventActor,
     OrderEventType,
 )
+from portfolio_mcp.order_query_store import list_order_events
+from portfolio_mcp.order_query_store import order as load_order
+from portfolio_mcp.reconciliation_store import finish_order_reconciliation
 from portfolio_mcp.schema import CancellationRequestRecord
 from portfolio_mcp.server import create_server
+from portfolio_mcp.stored_orders import ConcurrentOrderUpdate
 from portfolio_mcp.trading_service import (
     OrderCancellationRequestService,
     OrderCancellationService,
@@ -35,12 +43,12 @@ from tests.mcp_support import setup_mcp_services
 async def _setup_services(tmp_path: Path, now: datetime):
     context = await setup_mcp_services(tmp_path, now)
     cancellation_service = OrderCancellationService(
-        repository=context.repository,
+        database=context.database,
         execution_provider=context.execution,
         clock=lambda: now,
     )
     cancellation_request_service = OrderCancellationRequestService(
-        repository=context.repository,
+        database=context.database,
         clock=lambda: now,
     )
     return (
@@ -90,7 +98,7 @@ async def test_mcp_request_order_cancellation_success_zero_provider_writes(
     server = create_server(
         provider,
         database_url=db_url,
-        repository=repo,
+        database=repo,
         draft_service=draft_service,
         submission_service=submission_service,
         cancellation_service=cancellation_service,
@@ -139,7 +147,7 @@ async def test_mcp_request_order_cancellation_non_cancelable_orders(tmp_path) ->
     server = create_server(
         provider,
         database_url=db_url,
-        repository=repo,
+        database=repo,
         draft_service=draft_service,
         submission_service=submission_service,
         cancellation_service=cancellation_service,
@@ -155,7 +163,7 @@ async def test_mcp_request_order_cancellation_non_cancelable_orders(tmp_path) ->
         )
 
     order_id = await _create_active_order(draft_service, submission_service)
-    with repo._sessions() as session:
+    with repo.sessions() as session:
         from portfolio_mcp.schema import OrderRecord
 
         rec = session.get(OrderRecord, order_id)
@@ -233,7 +241,7 @@ async def test_dashboard_issue_cancellation_mcp_authorization_success(
         assert data["cancellation_request"]["id"] == req.id
         assert data["cancellation_request"]["order_id"] == order_id
 
-        events = repo.list_order_events(order_id=order_id)
+        events = list_order_events(repo, order_id=order_id)
         cancel_auth_events = [
             e
             for e in events.items
@@ -292,7 +300,7 @@ async def test_action_bound_isolation_submit_cannot_cancel_and_vice_versa(
     server = create_server(
         provider,
         database_url=db_url,
-        repository=repo,
+        database=repo,
         draft_service=draft_service,
         submission_service=submission_service,
         cancellation_service=cancellation_service,
@@ -350,7 +358,7 @@ async def test_cancellation_request_invalidated_on_order_version_or_state_change
         mcp_auth_service=mcp_auth_service,
     )
 
-    with repo._sessions() as session:
+    with repo.sessions() as session:
         from portfolio_mcp.schema import OrderRecord
 
         rec = session.get(OrderRecord, order_id)
@@ -417,12 +425,12 @@ async def test_cancellation_request_expired(tmp_path) -> None:
         assert resp.status_code == 409
         assert "expired" in resp.json()["detail"].lower()
 
-    expired_req = repo.get_cancellation_request(req.id)
+    expired_req = get_cancellation_request(repo, req.id)
     assert expired_req is not None
     assert expired_req.status == "expired"
     invalidation_events = [
         event
-        for event in repo.list_order_events(order_id=order_id).items
+        for event in list_order_events(repo, order_id=order_id).items
         if event.event_type == OrderEventType.CANCELLATION_REQUEST_INVALIDATED
     ]
     assert len(invalidation_events) == 1
@@ -517,7 +525,7 @@ async def test_order_terminal_state_invalidates_cancellation_requests(
     req = cancellation_request_service.create_request(order_id)
     creation_events = [
         event
-        for event in repo.list_order_events(order_id=order_id).items
+        for event in list_order_events(repo, order_id=order_id).items
         if event.event_type == OrderEventType.CANCELLATION_REQUEST_CREATED
     ]
     assert len(creation_events) == 1
@@ -531,9 +539,10 @@ async def test_order_terminal_state_invalidates_cancellation_requests(
     )
     assert stored_req.status == "authorized"
 
-    order = repo.order(order_id)
+    order = load_order(repo, order_id)
     assert order is not None
-    repo.finish_order_reconciliation(
+    finish_order_reconciliation(
+        repo,
         order_id,
         attempt_id=uuid4(),
         expected_version=order.version,
@@ -545,11 +554,11 @@ async def test_order_terminal_state_invalidates_cancellation_requests(
         result_message="Canceled by broker",
     )
 
-    reloaded_req = repo.get_cancellation_request(req.id)
+    reloaded_req = get_cancellation_request(repo, req.id)
     assert reloaded_req is not None
     assert reloaded_req.status == "invalidated"
     assert reloaded_req.invalidation_reason == "order_canceled"
-    events = repo.list_order_events(order_id=order_id).items
+    events = list_order_events(repo, order_id=order_id).items
     invalidation_events = [
         event
         for event in events
@@ -590,9 +599,10 @@ async def test_stale_order_snapshot_cannot_create_cancellation_request(
     ) = await _setup_services(tmp_path, now)
 
     order_id = await _create_active_order(_draft_service, submission_service)
-    stale_order = repo.order(order_id)
+    stale_order = load_order(repo, order_id)
     assert stale_order is not None
-    repo.finish_order_reconciliation(
+    finish_order_reconciliation(
+        repo,
         order_id,
         attempt_id=uuid4(),
         expected_version=stale_order.version,
@@ -605,14 +615,15 @@ async def test_stale_order_snapshot_cannot_create_cancellation_request(
     )
 
     with pytest.raises(ConcurrentOrderUpdate):
-        repo.create_cancellation_request(
+        create_cancellation_request(
+            repo,
             order=stale_order,
             now=now + timedelta(seconds=2),
             expires_at=now + timedelta(minutes=5),
         )
 
-    assert repo.active_cancellation_request_for_order(order_id) is None
-    events = repo.list_order_events(order_id=order_id).items
+    assert active_cancellation_request_for_order(repo, order_id) is None
+    events = list_order_events(repo, order_id=order_id).items
     assert (
         sum(
             event.event_type == OrderEventType.CANCELLATION_REQUEST_CREATED
@@ -651,7 +662,7 @@ async def test_new_cancellation_request_supersedes_previously_authorized_request
     req2 = cancellation_request_service.create_request(order_id)
     assert req2.id != req1.id
 
-    reloaded_req1 = repo.get_cancellation_request(req1.id)
+    reloaded_req1 = get_cancellation_request(repo, req1.id)
     assert reloaded_req1 is not None
     assert reloaded_req1.status == "invalidated"
     assert reloaded_req1.invalidation_reason == "superseded"
@@ -685,13 +696,14 @@ async def test_finish_order_cancellation_invalidates_active_cancellation_request
     ) = await _setup_services(tmp_path, now)
 
     order_id = await _create_active_order(draft_service, submission_service)
-    order = repo.order(order_id)
+    order = load_order(repo, order_id)
     assert order is not None
 
     req = cancellation_request_service.create_request(order_id)
     assert req.status == "pending"
 
-    stored_order, attempt_id, started = repo.begin_order_cancellation(
+    stored_order, attempt_id, started = begin_order_cancellation(
+        repo,
         order_id,
         expected_version=order.version,
         expected_state=order.state,
@@ -700,13 +712,13 @@ async def test_finish_order_cancellation_invalidates_active_cancellation_request
     assert started is True
     assert attempt_id is not None
 
-    reloaded_req1 = repo.get_cancellation_request(req.id)
+    reloaded_req1 = get_cancellation_request(repo, req.id)
     assert reloaded_req1 is not None
     assert reloaded_req1.status == "invalidated"
     assert reloaded_req1.invalidation_reason == "cancellation_started"
 
     req2_id = str(uuid4())
-    with repo._sessions.begin() as session:
+    with repo.sessions.begin() as session:
         session.add(
             CancellationRequestRecord(
                 id=req2_id,
@@ -726,7 +738,8 @@ async def test_finish_order_cancellation_invalidates_active_cancellation_request
             )
         )
 
-    canceled_order = repo.finish_order_cancellation(
+    canceled_order = finish_order_cancellation(
+        repo,
         order_id,
         attempt_id=attempt_id,
         observation=CancellationObservation(kind="canceled"),
@@ -734,7 +747,7 @@ async def test_finish_order_cancellation_invalidates_active_cancellation_request
     )
     assert canceled_order.state == OrderState.CANCELED
 
-    reloaded_req2 = repo.get_cancellation_request(req2_id)
+    reloaded_req2 = get_cancellation_request(repo, req2_id)
     assert reloaded_req2 is not None
     assert reloaded_req2.status == "invalidated"
     assert reloaded_req2.invalidation_reason == "order_canceled"

@@ -2,8 +2,10 @@ from collections.abc import Callable
 from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
-from portfolio_mcp.database import PortfolioRepository, RefreshResult
+from portfolio_mcp.database import Database
 from portfolio_mcp.models import Account, AccountCapabilities
+from portfolio_mcp.portfolio_records import RefreshResult
+from portfolio_mcp.portfolio_store import save_failed_refresh, save_refresh
 from portfolio_mcp.provider import (
     CapabilityProvider,
     PortfolioProvider,
@@ -17,11 +19,11 @@ class PortfolioRefreshService:
     def __init__(
         self,
         provider: PortfolioProvider,
-        repository: PortfolioRepository,
+        database: Database,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._provider = provider
-        self._repository = repository
+        self._database = database
         self._clock = clock or (lambda: datetime.now(UTC))
 
     async def refresh(self) -> RefreshResult:
@@ -29,14 +31,16 @@ class PortfolioRefreshService:
         try:
             accounts = await self._provider.list_accounts()
         except ProviderError as error:
-            return self._repository.save_failed_refresh(
+            return save_failed_refresh(
+                self._database,
                 started_at,
                 self._as_utc(self._clock()),
                 self._refresh_error_code(error),
                 str(error),
             )
         except Exception:
-            return self._repository.save_failed_refresh(
+            return save_failed_refresh(
+                self._database,
                 started_at,
                 self._as_utc(self._clock()),
                 "unexpected_error",
@@ -63,7 +67,8 @@ class PortfolioRefreshService:
         capabilities, failed_capability_accounts = await self._capabilities_for(
             accounts
         )
-        return self._repository.save_refresh(
+        return save_refresh(
+            self._database,
             snapshots,
             started_at,
             completed_at,

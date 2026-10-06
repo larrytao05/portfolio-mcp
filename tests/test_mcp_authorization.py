@@ -5,19 +5,21 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select
 
-from portfolio_mcp.database import PortfolioRepository
-from portfolio_mcp.order_history import OrderEventType
-from portfolio_mcp.schema import McpAuthorizationRecord, OrderDraftRecord
-from portfolio_mcp.trading_service import (
+from portfolio_mcp.authorization_records import McpAuthorizationError
+from portfolio_mcp.database import Database
+from portfolio_mcp.mcp_authorization import (
     CreatedMcpAuthorization,
-    McpAuthorizationError,
     McpAuthorizationService,
     StoredMcpAuthorization,
 )
+from portfolio_mcp.order_authorization_store import active_mcp_authorization
+from portfolio_mcp.order_history import OrderEventType
+from portfolio_mcp.order_query_store import list_order_events
+from portfolio_mcp.schema import McpAuthorizationRecord, OrderDraftRecord
 
 
 def _seed_draft(
-    repository: PortfolioRepository,
+    database: Database,
     draft_id: str = "draft-123",
     account_id: str = "schwab-taxable-demo",
     fingerprint: str = "fp-test-123",
@@ -48,14 +50,14 @@ def _seed_draft(
         created_at=created_at or now,
         expires_at=expires_at or (now + timedelta(minutes=10)),
     )
-    with repository._sessions.begin() as session:
+    with database.sessions.begin() as session:
         session.add(draft)
     return draft
 
 
 def test_create_mcp_authorization_generates_and_stores_hashed_code(tmp_path) -> None:
     now = datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
+    repo = Database(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
     _seed_draft(repo, draft_id="draft-1")
     service = McpAuthorizationService(repo, clock=lambda: now, scrypt_n=1024)
 
@@ -66,7 +68,7 @@ def test_create_mcp_authorization_generates_and_stores_hashed_code(tmp_path) -> 
     assert created.plaintext_code.isdigit()
     assert created.expires_at == now + timedelta(minutes=5)
 
-    with repo._sessions() as session:
+    with repo.sessions() as session:
         records = list(
             session.scalars(
                 select(McpAuthorizationRecord).where(
@@ -96,7 +98,7 @@ def test_create_authorization_supersedes_previous_active_code_for_same_draft(
     tmp_path,
 ) -> None:
     now = datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
+    repo = Database(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
     _seed_draft(repo, draft_id="draft-1")
     service = McpAuthorizationService(
         repo,
@@ -111,7 +113,7 @@ def test_create_authorization_supersedes_previous_active_code_for_same_draft(
     assert first.plaintext_code == "11111111"
     assert second.plaintext_code == "22222222"
 
-    with repo._sessions() as session:
+    with repo.sessions() as session:
         first_rec = session.get(McpAuthorizationRecord, first.id)
         assert first_rec is not None
         assert first_rec.invalidation_reason == "superseded"
@@ -129,7 +131,7 @@ def test_create_authorization_supersedes_previous_active_code_for_same_draft(
 
 def test_consume_mcp_authorization_success(tmp_path) -> None:
     now = datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
+    repo = Database(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
     _seed_draft(repo, draft_id="draft-1", fingerprint="fp-abc", account_id="acc-1")
     service = McpAuthorizationService(
         repo,
@@ -161,7 +163,7 @@ def test_consume_mcp_authorization_success(tmp_path) -> None:
     assert not hasattr(consumed, "salt")
     assert not hasattr(consumed, "digest")
 
-    with repo._sessions() as session:
+    with repo.sessions() as session:
         rec = session.get(McpAuthorizationRecord, created.id)
         assert rec is not None
         assert rec.consumed_at == consume_time
@@ -170,7 +172,7 @@ def test_consume_mcp_authorization_success(tmp_path) -> None:
 
 def test_consume_mcp_authorization_cannot_be_replayed(tmp_path) -> None:
     now = datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
+    repo = Database(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
     _seed_draft(repo, draft_id="draft-1", fingerprint="fp-abc", account_id="acc-1")
     service = McpAuthorizationService(
         repo,
@@ -202,7 +204,7 @@ def test_consume_mcp_authorization_cannot_be_replayed(tmp_path) -> None:
 
 def test_consume_fails_with_generic_error_and_increments_attempts(tmp_path) -> None:
     now = datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
+    repo = Database(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
     _seed_draft(repo, draft_id="draft-1", fingerprint="fp-abc", account_id="acc-1")
     service = McpAuthorizationService(
         repo,
@@ -223,7 +225,7 @@ def test_consume_fails_with_generic_error_and_increments_attempts(tmp_path) -> N
         )
     assert exc_info.value.code == "invalid_or_expired_code"
 
-    with repo._sessions() as session:
+    with repo.sessions() as session:
         rec = session.get(McpAuthorizationRecord, created.id)
         assert rec is not None
         assert rec.failed_attempts == 1
@@ -231,7 +233,7 @@ def test_consume_fails_with_generic_error_and_increments_attempts(tmp_path) -> N
 
     failed_events = [
         event
-        for event in repo.list_order_events(draft_id="draft-1").items
+        for event in list_order_events(repo, draft_id="draft-1").items
         if event.event_type == OrderEventType.AUTHORIZATION_FAILED
     ]
     assert len(failed_events) == 1
@@ -241,7 +243,7 @@ def test_consume_fails_with_generic_error_and_increments_attempts(tmp_path) -> N
 
 def test_consume_locks_out_after_five_failed_attempts(tmp_path) -> None:
     now = datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
+    repo = Database(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
     _seed_draft(repo, draft_id="draft-1", fingerprint="fp-abc", account_id="acc-1")
     service = McpAuthorizationService(
         repo,
@@ -263,7 +265,7 @@ def test_consume_locks_out_after_five_failed_attempts(tmp_path) -> None:
             )
         assert exc_info.value.code == "invalid_or_expired_code"
 
-    with repo._sessions() as session:
+    with repo.sessions() as session:
         rec = session.get(McpAuthorizationRecord, created.id)
         assert rec is not None
         assert rec.failed_attempts == 5
@@ -282,7 +284,7 @@ def test_consume_locks_out_after_five_failed_attempts(tmp_path) -> None:
 
 def test_consume_fails_on_expired_code(tmp_path) -> None:
     now = datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
+    repo = Database(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
     _seed_draft(repo, draft_id="draft-1", fingerprint="fp-abc", account_id="acc-1")
     service = McpAuthorizationService(
         repo,
@@ -310,14 +312,14 @@ def test_consume_fails_on_expired_code(tmp_path) -> None:
         )
     assert exc_info.value.code == "invalid_or_expired_code"
 
-    with repo._sessions() as session:
+    with repo.sessions() as session:
         rec = session.get(McpAuthorizationRecord, created.id)
         assert rec is not None
         assert rec.invalidation_reason == "expired"
         assert rec.consumed_at is None
     failed_events = [
         event
-        for event in repo.list_order_events(draft_id="draft-1").items
+        for event in list_order_events(repo, draft_id="draft-1").items
         if event.event_type == OrderEventType.AUTHORIZATION_FAILED
     ]
     assert failed_events[-1].details["reason"] == "authorization_expired"
@@ -327,7 +329,7 @@ def test_consume_fails_on_mismatched_target_or_fingerprint_or_account(
     tmp_path,
 ) -> None:
     now = datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
+    repo = Database(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
     _seed_draft(repo, draft_id="draft-1", fingerprint="fp-abc", account_id="acc-1")
     service = McpAuthorizationService(
         repo,
@@ -349,7 +351,7 @@ def test_consume_fails_on_mismatched_target_or_fingerprint_or_account(
     assert exc_info.value.code == "invalid_or_expired_code"
     failed_events = [
         event
-        for event in repo.list_order_events(limit=100).items
+        for event in list_order_events(repo, limit=100).items
         if event.event_type == OrderEventType.AUTHORIZATION_FAILED
     ]
     assert failed_events[-1].details["reason"] == "no_active_authorization"
@@ -388,7 +390,7 @@ def test_consume_fails_on_mismatched_target_or_fingerprint_or_account(
 
 def test_expiry_caps_at_draft_expiry(tmp_path) -> None:
     now = datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
+    repo = Database(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
     _seed_draft(repo, draft_id="draft-1", expires_at=now + timedelta(minutes=2))
     service = McpAuthorizationService(repo, clock=lambda: now, scrypt_n=1024)
 
@@ -398,7 +400,7 @@ def test_expiry_caps_at_draft_expiry(tmp_path) -> None:
 
 def test_create_authorization_fails_if_draft_not_found_or_expired(tmp_path) -> None:
     now = datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
+    repo = Database(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
     service = McpAuthorizationService(repo, clock=lambda: now, scrypt_n=1024)
 
     with pytest.raises(McpAuthorizationError) as exc_info:
@@ -419,7 +421,7 @@ def test_concurrent_consumption_allows_at_most_one_winner(tmp_path) -> None:
     from concurrent.futures import ThreadPoolExecutor
 
     now = datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
+    repo = Database(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
     _seed_draft(
         repo, draft_id="draft-race", fingerprint="fp-race", account_id="acc-race"
     )
@@ -462,7 +464,7 @@ def test_concurrent_consumption_allows_at_most_one_winner(tmp_path) -> None:
 
 def test_created_authorization_repr_does_not_leak_plaintext_code(tmp_path) -> None:
     now = datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
+    repo = Database(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
     _seed_draft(
         repo, draft_id="draft-repr", fingerprint="fp-repr", account_id="acc-repr"
     )
@@ -476,8 +478,8 @@ def test_created_authorization_repr_does_not_leak_plaintext_code(tmp_path) -> No
         action="submit", target_draft_id="draft-repr"
     )
     assert "88776655" not in repr(created)
-    active = repo.active_mcp_authorization(
-        action="submit", target_draft_id="draft-repr"
+    active = active_mcp_authorization(
+        repo, action="submit", target_draft_id="draft-repr"
     )
     assert active is not None
     assert active.salt not in repr(active)
@@ -488,7 +490,7 @@ def test_concurrent_failed_attempts_lock_out_safely(tmp_path) -> None:
     from concurrent.futures import ThreadPoolExecutor
 
     now = datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
+    repo = Database(f"sqlite:///{tmp_path / 'auth.db'}", clock=lambda: now)
     _seed_draft(
         repo, draft_id="draft-fail-race", fingerprint="fp-fail", account_id="acc-fail"
     )
@@ -518,13 +520,13 @@ def test_concurrent_failed_attempts_lock_out_safely(tmp_path) -> None:
             f.result()
 
     assert (
-        repo.active_mcp_authorization(
-            action="submit", target_draft_id="draft-fail-race"
+        active_mcp_authorization(
+            repo, action="submit", target_draft_id="draft-fail-race"
         )
         is None
     )
 
-    with repo._sessions() as session:
+    with repo.sessions() as session:
         rec = session.scalars(
             select(McpAuthorizationRecord).where(
                 McpAuthorizationRecord.action == "submit",

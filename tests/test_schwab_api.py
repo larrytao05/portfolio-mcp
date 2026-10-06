@@ -6,10 +6,11 @@ from fastapi.testclient import TestClient
 
 from portfolio_mcp.api.app import create_app
 from portfolio_mcp.config import ExecutionSettings, SchwabSettings
-from portfolio_mcp.database import PortfolioRepository
+from portfolio_mcp.database import Database
 from portfolio_mcp.fixtures import FixturePortfolioProvider
 from portfolio_mcp.provider import ProviderRateLimitError, ProviderResponseError
 from portfolio_mcp.schema import AccountRecord
+from portfolio_mcp.schwab_mapping_store import save_schwab_account_mapping
 from portfolio_mcp.schwab_readiness import SchwabReadinessService
 from portfolio_mcp.schwab_transport import SchwabOAuthTransport
 
@@ -35,9 +36,9 @@ class RoutingFakeHttpClient:
         raise RuntimeError(f"No route for {method} {url}")
 
 
-def _seed_accounts(repo: PortfolioRepository) -> None:
+def _seed_accounts(repo: Database) -> None:
     now = datetime.now(UTC)
-    with repo._sessions() as s:
+    with repo.sessions() as s:
         s.add(
             AccountRecord(
                 id="schwab-taxable-1",
@@ -67,7 +68,7 @@ def test_api_schwab_mapping_crud_flow(tmp_path: Path) -> None:
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
     db_file = tmp_path / "api_test.db"
-    repo = PortfolioRepository(f"sqlite:///{db_file}")
+    repo = Database(f"sqlite:///{db_file}")
     _seed_accounts(repo)
 
     http_client = RoutingFakeHttpClient(
@@ -180,9 +181,9 @@ def test_api_schwab_readiness_endpoints(tmp_path: Path) -> None:
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
     db_file = tmp_path / "api_test2.db"
-    repo = PortfolioRepository(f"sqlite:///{db_file}")
+    repo = Database(f"sqlite:///{db_file}")
     _seed_accounts(repo)
-    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1234", "*1234")
+    save_schwab_account_mapping(repo, "schwab-taxable-1", "hash-1234", "*1234")
 
     http_client = RoutingFakeHttpClient(
         {
@@ -232,7 +233,7 @@ def test_api_schwab_mapping_candidate_validation(tmp_path: Path) -> None:
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
     db_file = tmp_path / "cand_val.db"
-    repo = PortfolioRepository(f"sqlite:///{db_file}")
+    repo = Database(f"sqlite:///{db_file}")
     _seed_accounts(repo)
 
     http_client = RoutingFakeHttpClient(
@@ -290,7 +291,7 @@ def test_api_schwab_candidates_error_handling(tmp_path: Path) -> None:
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
     db_file = tmp_path / "cand_err.db"
-    repo = PortfolioRepository(f"sqlite:///{db_file}")
+    repo = Database(f"sqlite:///{db_file}")
     _seed_accounts(repo)
 
     http_client = RoutingFakeHttpClient(
@@ -332,7 +333,7 @@ def test_json_responses_contain_no_full_account_numbers_or_hashes(
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
     db_file = tmp_path / "redact_json.db"
-    repo = PortfolioRepository(f"sqlite:///{db_file}")
+    repo = Database(f"sqlite:///{db_file}")
     _seed_accounts(repo)
 
     http_client = RoutingFakeHttpClient(
@@ -410,7 +411,7 @@ def test_schwab_mapping_api_redacts_provider_errors_and_maps_rate_limits(
 ) -> None:
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     database_url = f"sqlite:///{tmp_path / 'api-errors.db'}"
-    repo = PortfolioRepository(database_url)
+    repo = Database(database_url)
     _seed_accounts(repo)
     provider_secret = "private-provider-payload-marker"
 

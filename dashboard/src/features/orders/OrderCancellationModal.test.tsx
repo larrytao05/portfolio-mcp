@@ -55,6 +55,7 @@ function renderModal(props: Partial<Parameters<typeof OrderCancellationModal>[0]
   const defaultProps = {
     order: sampleCancelableOrder,
     isOpen: true,
+    isRefreshPending: false,
     onClose: vi.fn(),
     onSuccess: vi.fn(),
     onReconcileRequested: vi.fn(),

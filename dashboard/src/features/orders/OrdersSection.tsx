@@ -1,19 +1,23 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 
 import {
   type Account,
   type OrderListFilters,
+  type RefreshOrderResult,
   type StoredOrder,
   getOrderAudit,
   getOrders,
   refreshOrder,
 } from "../../api/client";
 import { OrderCancellationModal } from "./OrderCancellationModal";
+import { startOrderRefreshLoop, type RefreshAttempt } from "./orderRefreshLoop";
 import { OwnerReview } from "../../components/OwnerReview";
 
 export function OrdersSection({ accounts }: { accounts: Account[] }) {
   const queryClient = useQueryClient();
+  const refreshLoop = useRef<ReturnType<typeof startOrderRefreshLoop> | null>(null);
+  const pendingRefresh = useRef<Promise<RefreshOrderResult> | null>(null);
   const [hash, setHash] = useState(window.location.hash || "#overview");
   const [visibility, setVisibility] = useState(
     typeof document !== "undefined" ? document.visibilityState : "visible",
@@ -80,90 +84,67 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
       orderId: string;
       mode: "scheduled" | "manual";
     }) => refreshOrder(orderId, mode),
-    onError: () => {
+    onError: (_error, { mode }) => {
+      if (mode === "scheduled") return;
       setLastRefreshMessage("Order refresh failed. Retry the refresh to check its status.");
     },
-    onSuccess: (data) => {
-      if (data.refresh.status === "throttled") {
-        const at = data.refresh.next_refresh_at
-          ? new Date(data.refresh.next_refresh_at).toLocaleTimeString()
-          : "later";
-        setLastRefreshMessage(`Refresh throttled. Next allowed at ${at}.`);
-      } else if (data.refresh.status === "target_changed") {
-        setLastRefreshMessage(
-          "The scheduled refresh target changed. Reloaded fair order plan.",
-        );
-      } else {
-        setLastRefreshMessage(null);
-      }
+    onSuccess: (data, { mode }) => {
+      if (mode === "scheduled") return;
+      setLastRefreshMessage(refreshMessage(data));
       void queryClient.invalidateQueries({ queryKey: ["orders"] });
       void queryClient.invalidateQueries({ queryKey: ["order-audit"] });
     },
   });
 
   const { refetch: refetchOrders } = ordersQuery;
-  const { mutate: mutateRefresh } = refreshMutation;
+  const { mutateAsync: refreshAsync } = refreshMutation;
+  const requestRefresh = useCallback(async (
+    orderId: string,
+    mode: "scheduled" | "manual",
+  ): Promise<RefreshAttempt> => {
+    if (pendingRefresh.current) {
+      await pendingRefresh.current.catch(() => undefined);
+      return { kind: "busy" };
+    }
+    const pending = refreshAsync({ orderId, mode });
+    pendingRefresh.current = pending;
+    try {
+      return { kind: "observed", result: await pending };
+    } finally {
+      if (pendingRefresh.current === pending) pendingRefresh.current = null;
+    }
+  }, [refreshAsync]);
+
+  function refreshManually(orderId: string) {
+    void requestRefresh(orderId, "manual").catch(() => undefined);
+  }
+
   useEffect(() => {
-    const ordersData = ordersQuery.data;
-    if (!isViewActive || !ordersData) return;
+    if (!isViewActive) return;
+    const loop = startOrderRefreshLoop({
+      isActive: () => window.location.hash === "#orders" && document.visibilityState === "visible",
+      loadPlan: async () => {
+        const result = await refetchOrders({ throwOnError: true });
+        if (!result.data) throw new Error("Missing saved order plan");
+        return result.data;
+      },
+      refresh: (orderId) => requestRefresh(orderId, "scheduled"),
+      onRefresh: (result) => {
+        setLastRefreshMessage(refreshMessage(result));
+        void queryClient.invalidateQueries({ queryKey: ["order-audit"] });
+      },
+      onError: () => setLastRefreshMessage("Order refresh failed. Retrying shortly."),
+    });
+    refreshLoop.current = loop;
+    return () => {
+      loop.stop();
+      refreshLoop.current = null;
+    };
+  }, [isViewActive, filters, cursor, refetchOrders, requestRefresh, queryClient]);
 
-    const orders = ordersData.orders;
-    const hasSubmitting = orders.some((o) => o.state === "SUBMITTING");
-    const groupsWithTarget = ordersData.refresh_groups.filter(
-      (g) => g.target_order_id,
-    );
-
-    let delay: number | null = null;
-    let action: (() => void) | null = null;
-
-    if (groupsWithTarget.length > 0) {
-      const primaryGroup = groupsWithTarget.reduce((earliest, g) =>
-        new Date(g.next_refresh_at).getTime() <
-        new Date(earliest.next_refresh_at).getTime()
-          ? g
-          : earliest,
-      );
-      const serverMs = new Date(ordersData.server_time).getTime();
-      const nextMs = new Date(primaryGroup.next_refresh_at).getTime();
-      const remainingMs = Math.max(0, nextMs - serverMs);
-      const scheduledDelay = Math.max(1000, remainingMs);
-
-      if (hasSubmitting && scheduledDelay > 2000) {
-        delay = 2000;
-        action = () => void refetchOrders();
-      } else {
-        delay = scheduledDelay;
-        action = () => {
-          if (primaryGroup.target_order_id) {
-            mutateRefresh({
-              orderId: primaryGroup.target_order_id,
-              mode: "scheduled",
-            });
-          }
-        };
-      }
-    } else if (hasSubmitting) {
-      delay = 2000;
-      action = () => void refetchOrders();
-    }
-
-    if (delay !== null && action !== null) {
-      const timer = setTimeout(() => {
-        if (
-          window.location.hash === "#orders" &&
-          document.visibilityState === "visible"
-        ) {
-          action!();
-        }
-      }, delay);
-      return () => clearTimeout(timer);
-    }
-  }, [
-    isViewActive,
-    ordersQuery.data,
-    refetchOrders,
-    mutateRefresh,
-  ]);
+  useEffect(() => {
+    if (ordersQuery.data) refreshLoop.current?.wake(ordersQuery.data);
+  }, [ordersQuery.data]);
 
   function submitFilters(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -472,10 +453,7 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
                             type="button"
                             disabled={refreshMutation.isPending}
                             onClick={() =>
-                              refreshMutation.mutate({
-                                orderId: order.id,
-                                mode: "manual",
-                              })
+                              refreshManually(order.id)
                             }
                           >
                             Reconcile
@@ -486,10 +464,7 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
                             type="button"
                             disabled={refreshMutation.isPending}
                             onClick={() =>
-                              refreshMutation.mutate({
-                                orderId: order.id,
-                                mode: "manual",
-                              })
+                              refreshManually(order.id)
                             }
                           >
                             Refresh
@@ -660,11 +635,24 @@ export function OrdersSection({ accounts }: { accounts: Account[] }) {
             void queryClient.invalidateQueries({ queryKey: ["orders"] });
             void queryClient.invalidateQueries({ queryKey: ["order-audit"] });
           }}
-          onReconcileRequested={(orderId) => {
-            mutateRefresh({ orderId, mode: "manual" });
-          }}
+          isRefreshPending={refreshMutation.isPending}
+          onReconcileRequested={refreshManually}
         />
       )}
     </section>
   );
+}
+
+
+function refreshMessage(data: RefreshOrderResult): string | null {
+  if (data.refresh.status === "throttled") {
+    const at = data.refresh.next_refresh_at
+      ? new Date(data.refresh.next_refresh_at).toLocaleTimeString()
+      : "later";
+    return `Refresh throttled. Next allowed at ${at}.`;
+  }
+  if (data.refresh.status === "target_changed") {
+    return "The scheduled refresh target changed. Reloaded fair order plan.";
+  }
+  return null;
 }
