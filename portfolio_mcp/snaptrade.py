@@ -260,7 +260,9 @@ def _optional_decimal(value: object) -> Decimal | None:
         return None
     if isinstance(value, (str, int, float)):
         try:
-            return Decimal(str(value))
+            result = Decimal(str(value))
+            if result.is_finite():
+                return result
         except ArithmeticError:
             pass
     raise ProviderResponseError("SnapTrade returned an unexpected response")

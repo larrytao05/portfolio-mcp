@@ -2,8 +2,10 @@ from collections.abc import Callable
 from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
-from portfolio_mcp.database import PortfolioRepository, RefreshResult
-from portfolio_mcp.models import Account, AccountCapabilities, CapabilityBlock
+from portfolio_mcp.database import Database
+from portfolio_mcp.models import Account, AccountCapabilities
+from portfolio_mcp.portfolio_records import RefreshResult
+from portfolio_mcp.portfolio_store import save_failed_refresh, save_refresh
 from portfolio_mcp.provider import (
     CapabilityProvider,
     PortfolioProvider,
@@ -17,11 +19,11 @@ class PortfolioRefreshService:
     def __init__(
         self,
         provider: PortfolioProvider,
-        repository: PortfolioRepository,
+        database: Database,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._provider = provider
-        self._repository = repository
+        self._database = database
         self._clock = clock or (lambda: datetime.now(UTC))
 
     async def refresh(self) -> RefreshResult:
@@ -29,14 +31,16 @@ class PortfolioRefreshService:
         try:
             accounts = await self._provider.list_accounts()
         except ProviderError as error:
-            return self._repository.save_failed_refresh(
+            return save_failed_refresh(
+                self._database,
                 started_at,
                 self._as_utc(self._clock()),
                 self._refresh_error_code(error),
                 str(error),
             )
         except Exception:
-            return self._repository.save_failed_refresh(
+            return save_failed_refresh(
+                self._database,
                 started_at,
                 self._as_utc(self._clock()),
                 "unexpected_error",
@@ -63,7 +67,8 @@ class PortfolioRefreshService:
         capabilities, failed_capability_accounts = await self._capabilities_for(
             accounts
         )
-        return self._repository.save_refresh(
+        return save_refresh(
+            self._database,
             snapshots,
             started_at,
             completed_at,
@@ -80,7 +85,7 @@ class PortfolioRefreshService:
     ) -> tuple[list[AccountCapabilities], list[Account]]:
         provider = self._provider
         if not isinstance(provider, CapabilityProvider):
-            return [self._unknown_capability(account) for account in accounts], []
+            return [AccountCapabilities.unknown(account) for account in accounts], []
         try:
             capabilities = await provider.get_account_capabilities(
                 [account.id for account in accounts]
@@ -94,26 +99,6 @@ class PortfolioRefreshService:
             return capabilities, []
         except Exception:
             return [], accounts
-
-    def _unknown_capability(self, account: Account) -> AccountCapabilities:
-        return AccountCapabilities(
-            account_id=account.id,
-            provider=account.provider,
-            asset_classes=(),
-            supported_sides=(),
-            order_types=(),
-            time_in_force=(),
-            sizing_modes=(),
-            preview_supported=False,
-            cancellation_supported=False,
-            observed_at=None,
-            last_success_at=None,
-            source="not_observed",
-            blocks=(
-                CapabilityBlock("capability_unknown", "Trading capability is unknown."),
-            ),
-            is_stale=True,
-        )
 
     def _refresh_error_code(self, error: ProviderError) -> str:
         if isinstance(error, ProviderAuthenticationError):

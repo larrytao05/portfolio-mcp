@@ -1,6 +1,6 @@
 import pytest
 
-from portfolio_mcp.config import SchwabMarketDataSettings, SnapTradeSettings
+from portfolio_mcp.config import SchwabSettings, SnapTradeSettings
 from portfolio_mcp.provider import ProviderConfigurationError
 
 
@@ -32,12 +32,12 @@ def test_schwab_settings_use_the_default_callback_url_and_read_an_override() -> 
         "SCHWAB_REFRESH_TOKEN": "refresh-token",
     }
 
-    settings = SchwabMarketDataSettings.from_environment(environment)
+    settings = SchwabSettings.from_environment(environment)
 
     assert settings.callback_url == "https://127.0.0.1:8182"
 
-    overridden_settings = SchwabMarketDataSettings.from_environment(
-        {**environment, "SCHWAB_CALLBACK_URL": "https://127.0.0.1:8182"}
+    overridden_settings = SchwabSettings.from_environment(
+        {**environment, "SCHWAB_CALLBACK_URL": "https://127.0.0.1:9443/callback"}
     )
 
-    assert overridden_settings.callback_url == "https://127.0.0.1:8182"
+    assert overridden_settings.callback_url == "https://127.0.0.1:9443/callback"

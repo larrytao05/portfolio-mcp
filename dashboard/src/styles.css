@@ -540,6 +540,7 @@ td.identity-column span {
 }
 .overview-card,
 .allocation-card {
+  min-width: 0;
   background: var(--paper);
   border: 1px solid var(--line);
   padding: 20px;
@@ -856,6 +857,9 @@ select {
     padding: 9px 7px;
     font-size: 12px;
   }
+  .side-rail nav a:focus-visible {
+    outline-offset: -2px;
+  }
   .side-rail nav span,
   .rail-footer {
     display: none;
@@ -972,6 +976,8 @@ select {
     gap: 8px;
   }
   .side-rail nav {
+    min-width: 0;
+    overflow-x: auto;
     flex: 1 1 100%;
     margin: 0;
     justify-content: space-between;

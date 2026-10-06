@@ -61,11 +61,6 @@ class SchwabSettings:
 
 
 @dataclass(frozen=True)
-class SchwabMarketDataSettings(SchwabSettings):
-    pass
-
-
-@dataclass(frozen=True)
 class ExecutionSettings:
     provider: str = "fixture"
     schwab_execution_enabled: bool = False

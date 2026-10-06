@@ -10,7 +10,7 @@ from alembic.config import Config
 from sqlalchemy.exc import IntegrityError
 
 from alembic import command
-from portfolio_mcp.database import ConcurrentOrderUpdate, PortfolioRepository
+from portfolio_mcp.database import Database
 from portfolio_mcp.execution import FixtureExecutionProvider, OrderState
 from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
 from portfolio_mcp.order_history import (
@@ -20,6 +20,17 @@ from portfolio_mcp.order_history import (
     OrderStatusSource,
     encode_event_details,
 )
+from portfolio_mcp.order_query_store import (
+    list_order_events,
+)
+from portfolio_mcp.order_query_store import list_orders as query_orders
+from portfolio_mcp.order_query_store import order as load_order
+from portfolio_mcp.order_submission_store import (
+    begin_order_submission,
+    finish_order_submission,
+    recover_stranded_submissions,
+)
+from portfolio_mcp.stored_orders import ConcurrentOrderUpdate
 from portfolio_mcp.trading_service import (
     OrderSubmissionService,
     TradingValidationError,
@@ -32,10 +43,10 @@ from tests.test_execution import create_limit_draft, enabled_order_draft_service
 async def test_draft_created_event_survives_repository_reopen(tmp_path) -> None:
     now = datetime(2026, 9, 25, 14, 0, tzinfo=UTC)
     database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
-    repository = PortfolioRepository(database_url, lambda: now)
-    draft = await create_limit_draft(repository, now)
+    database = Database(database_url, lambda: now)
+    draft = await create_limit_draft(database, now)
 
-    first_page = repository.list_order_events(draft_id=draft.id, limit=50)
+    first_page = list_order_events(database, draft_id=draft.id, limit=50)
 
     assert len(first_page.items) == 1
     event = first_page.items[0]
@@ -48,17 +59,17 @@ async def test_draft_created_event_survives_repository_reopen(tmp_path) -> None:
     assert event.occurred_at == now
     assert first_page.next_cursor is None
 
-    reopened = PortfolioRepository(database_url, lambda: now)
-    persisted = reopened.list_order_events(draft_id=draft.id, limit=50)
+    reopened = Database(database_url, lambda: now)
+    persisted = list_order_events(reopened, draft_id=draft.id, limit=50)
 
     assert persisted.items == first_page.items
 
 
 def test_order_detail_has_a_compact_legacy_safe_draft_summary(tmp_path) -> None:
     now = datetime(2026, 9, 25, 14, 0, tzinfo=UTC)
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    draft = asyncio.run(create_limit_draft(repository, now))
-    order, created = repository.begin_order_submission(draft, now)
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    draft = asyncio.run(create_limit_draft(database, now))
+    order, created = begin_order_submission(database, draft, now)
 
     assert created
     summary = order.to_dict()["draft"]
@@ -83,17 +94,17 @@ def test_order_detail_has_a_compact_legacy_safe_draft_summary(tmp_path) -> None:
 async def test_submission_persists_authorization_and_fill_events(tmp_path) -> None:
     now = datetime(2026, 9, 25, 14, 0, tzinfo=UTC)
     database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
-    repository = PortfolioRepository(database_url, lambda: now)
-    draft = await create_limit_draft(repository, now)
+    database = Database(database_url, lambda: now)
+    draft = await create_limit_draft(database, now)
     service = OrderSubmissionService(
-        repository,
+        database,
         FixtureExecutionProvider("partial_fill"),
         lambda: now,
         allow_fixture_submission,
     )
 
     order = await service.confirm(draft.id, draft.fingerprint, True)
-    events = repository.list_order_events(draft_id=draft.id, limit=20).items
+    events = list_order_events(database, draft_id=draft.id, limit=20).items
 
     assert order.state == OrderState.PARTIALLY_FILLED
     assert order.filled_quantity == order.quantity / 2
@@ -126,11 +137,11 @@ async def test_expired_confirmation_records_one_expiry_and_auth_failure(
     tmp_path,
 ) -> None:
     now = datetime(2026, 9, 25, 14, 0, tzinfo=UTC)
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    draft = await create_limit_draft(repository, now)
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    draft = await create_limit_draft(database, now)
     expired_at = draft.expires_at + timedelta(seconds=1)
     service = OrderSubmissionService(
-        repository,
+        database,
         FixtureExecutionProvider(),
         lambda: expired_at,
         allow_fixture_submission,
@@ -140,7 +151,7 @@ async def test_expired_confirmation_records_one_expiry_and_auth_failure(
         with pytest.raises(TradingValidationError, match="expired"):
             await service.confirm(draft.id, draft.fingerprint, True)
 
-    events = repository.list_order_events(draft_id=draft.id, limit=20).items
+    events = list_order_events(database, draft_id=draft.id, limit=20).items
     assert (
         sum(event.event_type == OrderEventType.DRAFT_EXPIRED for event in events) == 1
     )
@@ -155,9 +166,9 @@ async def test_expired_confirmation_records_one_expiry_and_auth_failure(
 async def test_unknown_draft_failure_does_not_persist_the_supplied_identifier(
     tmp_path,
 ) -> None:
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
     service = OrderSubmissionService(
-        repository,
+        database,
         FixtureExecutionProvider(),
         lambda: datetime(2026, 9, 25, 14, 0, tzinfo=UTC),
         allow_fixture_submission,
@@ -166,7 +177,7 @@ async def test_unknown_draft_failure_does_not_persist_the_supplied_identifier(
     with pytest.raises(TradingValidationError, match="not found"):
         await service.confirm("attacker-controlled-id", "invalid", True)
 
-    event = repository.list_order_events(limit=20).items[0]
+    event = list_order_events(database, limit=20).items[0]
     assert event.event_type == OrderEventType.AUTHORIZATION_FAILED
     assert event.draft_id is None
     assert event.account_id is None
@@ -188,10 +199,10 @@ def test_event_details_reject_fields_outside_the_event_allowlist() -> None:
 @pytest.mark.asyncio
 async def test_event_and_order_pages_are_tie_safe_and_filter_bound(tmp_path) -> None:
     now = datetime(2026, 9, 25, 14, 0, tzinfo=UTC)
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
     orders = []
     draft_service = await enabled_order_draft_service(
-        repository,
+        database,
         FixturePortfolioProvider(),
         FixtureMarketDataProvider(),
         lambda: now,
@@ -205,12 +216,12 @@ async def test_event_and_order_pages_are_tie_safe_and_filter_bound(tmp_path) -> 
             quantity="1",
             limit_price="300.25",
         )
-        orders.append(repository.begin_order_submission(draft, now)[0])
+        orders.append(begin_order_submission(database, draft, now)[0])
 
     event_ids = []
     cursor = None
     while True:
-        page = repository.list_order_events(limit=1, after=cursor)
+        page = list_order_events(database, limit=1, after=cursor)
         event_ids.extend(event.event_id for event in page.items)
         cursor = page.next_cursor
         if cursor is None:
@@ -219,7 +230,7 @@ async def test_event_and_order_pages_are_tie_safe_and_filter_bound(tmp_path) -> 
     order_ids = []
     order_cursor = None
     while True:
-        page = repository.list_orders(limit=1, after=order_cursor)
+        page = query_orders(database, limit=1, after=order_cursor)
         order_ids.extend(order.id for order in page.items)
         order_cursor = page.next_cursor
         if order_cursor is None:
@@ -229,10 +240,10 @@ async def test_event_and_order_pages_are_tie_safe_and_filter_bound(tmp_path) -> 
     assert len(set(event_ids)) == 12
     assert set(order_ids) == {order.id for order in orders}
     assert len(order_ids) == len(set(order_ids)) == 3
-    first_page_cursor = repository.list_orders(limit=1).next_cursor
+    first_page_cursor = query_orders(database, limit=1).next_cursor
     assert first_page_cursor is not None
     with pytest.raises(ValueError, match="cursor does not match"):
-        repository.list_orders(limit=1, after=first_page_cursor, account_id="another")
+        query_orders(database, limit=1, after=first_page_cursor, account_id="another")
 
 
 @pytest.mark.asyncio
@@ -240,9 +251,9 @@ async def test_event_insert_failure_rolls_back_order_state_update(tmp_path) -> N
     now = datetime(2026, 9, 25, 14, 0, tzinfo=UTC)
     database_path = tmp_path / "portfolio.db"
     database_url = f"sqlite:///{database_path}"
-    repository = PortfolioRepository(database_url, lambda: now)
-    draft = await create_limit_draft(repository, now)
-    order, _ = repository.begin_order_submission(draft, now)
+    database = Database(database_url, lambda: now)
+    draft = await create_limit_draft(database, now)
+    order, _ = begin_order_submission(database, draft, now)
     with connect(database_path) as connection:
         connection.execute(
             "CREATE TRIGGER fail_submission_result BEFORE INSERT ON order_events "
@@ -251,7 +262,8 @@ async def test_event_insert_failure_rolls_back_order_state_update(tmp_path) -> N
         )
 
     with pytest.raises(IntegrityError, match="test event failure"):
-        repository.finish_order_submission(
+        finish_order_submission(
+            database,
             order.id,
             OrderState.ACCEPTED,
             now,
@@ -262,12 +274,12 @@ async def test_event_insert_failure_rolls_back_order_state_update(tmp_path) -> N
             actor=OrderEventActor.DASHBOARD,
         )
 
-    stored = repository.order(order.id)
+    stored = load_order(database, order.id)
     assert stored is not None
     assert stored.state == OrderState.SUBMITTING
     assert not any(
         event.event_type == OrderEventType.SUBMISSION_RESULT
-        for event in repository.list_order_events(draft_id=draft.id).items
+        for event in list_order_events(database, draft_id=draft.id).items
     )
 
 
@@ -275,9 +287,9 @@ async def test_event_insert_failure_rolls_back_order_state_update(tmp_path) -> N
 async def test_event_rows_reject_updates_and_deletes(tmp_path) -> None:
     now = datetime(2026, 9, 25, 14, 0, tzinfo=UTC)
     database_path = tmp_path / "portfolio.db"
-    repository = PortfolioRepository(f"sqlite:///{database_path}")
-    draft = await create_limit_draft(repository, now)
-    event_id = repository.list_order_events(draft_id=draft.id).items[0].event_id
+    database = Database(f"sqlite:///{database_path}")
+    draft = await create_limit_draft(database, now)
+    event_id = list_order_events(database, draft_id=draft.id).items[0].event_id
 
     with connect(database_path) as connection:
         with pytest.raises(SQLiteIntegrityError, match="append-only"):
@@ -295,8 +307,8 @@ async def test_event_rows_reject_updates_and_deletes(tmp_path) -> None:
 async def test_event_reference_triggers_reject_unknown_drafts(tmp_path) -> None:
     now = datetime(2026, 9, 25, 14, 0, tzinfo=UTC)
     database_path = tmp_path / "portfolio.db"
-    repository = PortfolioRepository(f"sqlite:///{database_path}")
-    draft = await create_limit_draft(repository, now)
+    database = Database(f"sqlite:///{database_path}")
+    draft = await create_limit_draft(database, now)
 
     with connect(database_path) as connection:
         with pytest.raises(SQLiteIntegrityError, match="invalid order event draft"):
@@ -320,13 +332,13 @@ async def test_event_reference_triggers_reject_unknown_drafts(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_recovery_event_is_atomic_and_recovery_is_idempotent(tmp_path) -> None:
     now = datetime(2026, 9, 25, 14, 0, tzinfo=UTC)
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    draft = await create_limit_draft(repository, now)
-    order, _ = repository.begin_order_submission(draft, now)
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    draft = await create_limit_draft(database, now)
+    order, _ = begin_order_submission(database, draft, now)
 
-    assert repository.recover_stranded_submissions(now) == 1
-    assert repository.recover_stranded_submissions(now) == 0
-    events = repository.list_order_events(order_id=order.id, limit=50).items
+    assert recover_stranded_submissions(database, now) == 1
+    assert recover_stranded_submissions(database, now) == 0
+    events = list_order_events(database, order_id=order.id, limit=50).items
 
     assert (
         sum(event.event_type == OrderEventType.STATUS_TRANSITION for event in events)
@@ -347,13 +359,14 @@ async def test_stale_submission_result_cannot_overwrite_recovered_unknown(
     tmp_path,
 ) -> None:
     now = datetime(2026, 9, 25, 14, 0, tzinfo=UTC)
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    draft = await create_limit_draft(repository, now)
-    order, _ = repository.begin_order_submission(draft, now)
-    repository.recover_stranded_submissions(now)
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    draft = await create_limit_draft(database, now)
+    order, _ = begin_order_submission(database, draft, now)
+    recover_stranded_submissions(database, now)
 
     with pytest.raises(ConcurrentOrderUpdate):
-        repository.finish_order_submission(
+        finish_order_submission(
+            database,
             order.id,
             OrderState.ACCEPTED,
             now,
@@ -362,7 +375,7 @@ async def test_stale_submission_result_cannot_overwrite_recovered_unknown(
             result_source=OrderStatusSource.PROVIDER,
         )
 
-    stored = repository.order(order.id)
+    stored = load_order(database, order.id)
     assert stored is not None
     assert stored.state == OrderState.UNKNOWN
 
@@ -440,8 +453,8 @@ def test_pre_migration_order_remains_readable_without_synthetic_history(
             ),
         )
 
-    repository = PortfolioRepository(database_url)
-    order = repository.order("order-legacy")
+    database = Database(database_url)
+    order = load_order(database, "order-legacy")
 
     assert order is not None
     assert order.state == OrderState.ACCEPTED
@@ -449,7 +462,7 @@ def test_pre_migration_order_remains_readable_without_synthetic_history(
     assert order.average_fill_price is None
     assert order.result_source is None
     assert order.draft.id == "draft-legacy"
-    assert repository.list_order_events(order_id=order.id).items == ()
+    assert list_order_events(database, order_id=order.id).items == ()
 
 
 def test_cancellation_audit_migration_preserves_events_and_append_only_triggers(

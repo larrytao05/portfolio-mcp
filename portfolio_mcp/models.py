@@ -105,6 +105,28 @@ class AccountCapabilities:
     is_stale: bool = False
     schwab_mapping_eligible: bool = False
 
+    @classmethod
+    def unknown(cls, account: Account) -> "AccountCapabilities":
+        return cls(
+            account_id=account.id,
+            provider=account.provider,
+            asset_classes=(),
+            supported_sides=(),
+            order_types=(),
+            time_in_force=(),
+            sizing_modes=(),
+            preview_supported=False,
+            cancellation_supported=False,
+            observed_at=None,
+            last_success_at=None,
+            source="not_observed",
+            blocks=(
+                CapabilityBlock("capability_unknown", "Trading capability is unknown."),
+            ),
+            is_stale=True,
+            schwab_mapping_eligible=account.schwab_mapping_eligible,
+        )
+
     @property
     def is_trade_capable(self) -> bool:
         return bool(

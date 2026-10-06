@@ -5,13 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from portfolio_mcp.database import (
-    OrderPage,
-    OrderRefreshPlan,
-    PortfolioRepository,
-    ReconciliationClaim,
-    StoredOrder,
-)
+from portfolio_mcp.database import Database
 from portfolio_mcp.execution import (
     BrokerOrderSearch,
     BrokerOrderSnapshot,
@@ -20,10 +14,22 @@ from portfolio_mcp.execution import (
     OrderState,
 )
 from portfolio_mcp.order_history import (
+    OrderPage,
     OrderStatusSource,
     encode_order_cursor,
     require_aware_utc,
 )
+from portfolio_mcp.order_query_store import order as load_order
+from portfolio_mcp.reconciliation_store import (
+    OrderRefreshPlan,
+    ReconciliationClaim,
+    claim_order_reconciliation,
+    claim_planned_order_reconciliation,
+    finish_order_reconciliation,
+    next_order_reconciliation_at,
+    order_refresh_plans,
+)
+from portfolio_mcp.stored_orders import StoredOrder
 
 _MATCH_BEFORE = timedelta(seconds=30)
 _MATCH_AFTER = timedelta(minutes=2)
@@ -69,14 +75,14 @@ class OrderRefreshResult:
 class OrderReconciliationService:
     def __init__(
         self,
-        repository: PortfolioRepository,
+        database: Database,
         provider: OrderReadProvider,
         clock: Callable[[], datetime],
         minimum_interval: timedelta = timedelta(seconds=30),
     ) -> None:
         if minimum_interval < timedelta(seconds=30):
             raise ValueError("Reconciliation interval must be at least 30 seconds")
-        self._repository = repository
+        self._database = database
         self._provider = provider
         self._clock = clock
         self._minimum_interval = minimum_interval
@@ -98,7 +104,8 @@ class OrderReconciliationService:
             for order in orders
             if order.state in _SYNCABLE_STATES
         )
-        return self._repository.order_refresh_plans(
+        return order_refresh_plans(
+            self._database,
             groups,
             now=self._now(),
             minimum_interval=self._minimum_interval,
@@ -117,7 +124,8 @@ class OrderReconciliationService:
         if order.state not in _SYNCABLE_STATES:
             return OrderRefreshResult(order, "not_refreshable", False, None, None, now)
         if mode == "scheduled":
-            decision = self._repository.claim_planned_order_reconciliation(
+            decision = claim_planned_order_reconciliation(
+                self._database,
                 order_id,
                 attempt_at=now,
                 minimum_interval=self._minimum_interval,
@@ -136,7 +144,8 @@ class OrderReconciliationService:
             next_refresh_at = decision.next_refresh_at
             target_order_id = decision.target_order_id
         else:
-            claim = self._repository.claim_order_reconciliation(
+            claim = claim_order_reconciliation(
+                self._database,
                 order_id,
                 attempt_at=now,
                 minimum_interval=self._minimum_interval,
@@ -147,7 +156,8 @@ class OrderReconciliationService:
                     current,
                     "throttled",
                     False,
-                    self._repository.next_order_reconciliation_at(
+                    next_order_reconciliation_at(
+                        self._database,
                         current.provider,
                         current.account_id,
                         now=self._now(),
@@ -169,25 +179,13 @@ class OrderReconciliationService:
         )
 
     def _require_order(self, order_id: str) -> StoredOrder:
-        order = self._repository.order(order_id)
+        order = load_order(self._database, order_id)
         if order is None:
             raise ValueError("Order not found")
         return order
 
     def _now(self) -> datetime:
         return require_aware_utc(self._clock())
-
-    async def _reconcile(self, order: StoredOrder) -> StoredOrder:
-        attempt_at = self._now()
-        claim = self._repository.claim_order_reconciliation(
-            order.id,
-            attempt_at=attempt_at,
-            minimum_interval=self._minimum_interval,
-        )
-        if claim is None:
-            return self._require_order(order.id)
-        updated, _ = await self._execute_claim(claim, attempt_at)
-        return updated
 
     async def _execute_claim(
         self, claim: ReconciliationClaim, attempt_at: datetime
@@ -306,7 +304,8 @@ class OrderReconciliationService:
         self, claim: ReconciliationClaim, now: datetime, outcome: str
     ) -> StoredOrder:
         state = claim.order.state
-        return self._repository.finish_order_reconciliation(
+        return finish_order_reconciliation(
+            self._database,
             claim.order.id,
             attempt_id=claim.attempt_id,
             expected_version=claim.order.version,
@@ -364,7 +363,8 @@ class OrderReconciliationService:
             if candidate_quantity != order.quantity:
                 return self._finish_without_match(claim, now, "mismatch")
         try:
-            return self._repository.finish_order_reconciliation(
+            return finish_order_reconciliation(
+                self._database,
                 order.id,
                 attempt_id=claim.attempt_id,
                 expected_version=order.version,

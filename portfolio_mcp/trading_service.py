@@ -10,15 +10,11 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 
-from portfolio_mcp.database import (
-    CancellationObservation,
-    ConcurrentOrderUpdate,
-    OrderDraft,
-    PortfolioRepository,
+from portfolio_mcp.authorization_records import (
+    McpAuthorizationError,
     StoredCancellationRequest,
-    StoredOrder,
-    StoredOrderAuthorization,
 )
+from portfolio_mcp.database import Database
 from portfolio_mcp.execution import (
     CapabilityState,
     ExecutionCapability,
@@ -28,24 +24,46 @@ from portfolio_mcp.execution import (
     ExecutionResult,
     OrderState,
 )
-from portfolio_mcp.mcp_authorization import (
-    CreatedMcpAuthorization as CreatedMcpAuthorization,
-)
-from portfolio_mcp.mcp_authorization import (
-    McpAuthorizationError as McpAuthorizationError,
-)
-from portfolio_mcp.mcp_authorization import (
-    McpAuthorizationService as McpAuthorizationService,
-)
-from portfolio_mcp.mcp_authorization import (
-    StoredMcpAuthorization as StoredMcpAuthorization,
+from portfolio_mcp.mcp_authorization import McpAuthorizationService
+from portfolio_mcp.order_authorization_store import authorization_for_draft
+from portfolio_mcp.order_cancellation_store import (
+    CancellationObservation,
+    begin_order_cancellation,
+    create_cancellation_request,
+    finish_order_cancellation,
+    get_cancellation_request,
+    invalidate_cancellation_requests_for_order,
+    update_cancellation_request_status,
 )
 from portfolio_mcp.order_history import (
     OrderEventActor,
     OrderEventCode,
     OrderStatusSource,
 )
+from portfolio_mcp.order_query_store import order as load_order
+from portfolio_mcp.order_query_store import (
+    order_draft,
+    order_for_draft,
+)
+from portfolio_mcp.order_submission_store import (
+    begin_order_submission,
+    finish_order_submission,
+    mark_provider_submission_started,
+    record_authorization_failure,
+    record_draft_expiry,
+    save_order_draft,
+)
+from portfolio_mcp.portfolio_store import (
+    account_capability,
+)
+from portfolio_mcp.portfolio_store import stored_account as load_stored_account
 from portfolio_mcp.provider import MarketDataProvider, PortfolioProvider
+from portfolio_mcp.stored_orders import (
+    ConcurrentOrderUpdate,
+    OrderDraft,
+    StoredOrder,
+    StoredOrderAuthorization,
+)
 from portfolio_mcp.submission_locks import SubmissionLockError
 from portfolio_mcp.trading_safety import (
     GuardDecision,
@@ -74,16 +92,16 @@ def _authorization_failure_code(value: str) -> OrderEventCode:
 class OrderDraftService:
     def __init__(
         self,
-        repository: PortfolioRepository,
+        database: Database,
         market_data_provider: MarketDataProvider,
         clock: Callable[[], datetime],
         trading_guard: TradingGuard | None = None,
     ) -> None:
-        self._repository = repository
+        self._database = database
         self._market_data_provider = market_data_provider
         self._clock = clock
         self._trading_guard = trading_guard or TradingGuard(
-            repository, TradingSettingsService(repository, clock)
+            database, TradingSettingsService(database, clock)
         )
 
     async def create(
@@ -139,11 +157,11 @@ class OrderDraftService:
                 last_price=quote.last_price,
             ),
         )
-        stored_account = self._repository.stored_account(account_id)
+        stored_account = load_stored_account(self._database, account_id)
         if stored_account is None:
             raise TradingValidationError("account_not_found", "Account not found")
         account = stored_account.account
-        capability = self._repository.account_capability(account.id)
+        capability = account_capability(self._database, account.id)
         assert capability is not None
         fingerprint = _fingerprint(
             account_id,
@@ -182,26 +200,26 @@ class OrderDraftService:
             created_at=now,
             expires_at=now + timedelta(minutes=5),
         )
-        self._repository.save_order_draft(draft)
+        save_order_draft(self._database, draft)
         return draft
 
 
 class OrderSubmissionService:
     def __init__(
         self,
-        repository: PortfolioRepository,
+        database: Database,
         execution_provider: ExecutionProvider,
         clock: Callable[[], datetime],
         validator: SubmissionValidator,
         trading_guard: TradingGuard | None = None,
         mcp_auth_service: McpAuthorizationService | None = None,
     ) -> None:
-        self._repository = repository
+        self._database = database
         self._execution_provider = execution_provider
         self._clock = clock
         self._validator = validator
         self._trading_guard = trading_guard or TradingGuard(
-            repository, TradingSettingsService(repository, clock)
+            database, TradingSettingsService(database, clock)
         )
         self._mcp_auth_service = mcp_auth_service
 
@@ -216,7 +234,8 @@ class OrderSubmissionService:
             if error.code in {"submission_in_progress", "submission_lock_unavailable"}:
                 raise
             now = _utc_now(self._clock())
-            self._repository.record_authorization_failure(
+            record_authorization_failure(
+                self._database,
                 attempt_id=attempt_id,
                 draft_id=draft_id,
                 action="submit",
@@ -225,7 +244,7 @@ class OrderSubmissionService:
                 occurred_at=now,
             )
             if error.code == OrderEventCode.DRAFT_EXPIRED.value:
-                self._repository.record_draft_expiry(draft_id, observed_at=now)
+                record_draft_expiry(self._database, draft_id, observed_at=now)
             raise
 
     async def _confirm(
@@ -235,16 +254,16 @@ class OrderSubmissionService:
             raise TradingValidationError(
                 "confirmation_required", "Explicit confirmation is required"
             )
-        draft = self._repository.order_draft(draft_id)
+        draft = order_draft(self._database, draft_id)
         if draft is None:
             raise TradingValidationError("draft_not_found", "Order draft not found")
         if draft.fingerprint != expected_fingerprint:
             raise TradingValidationError(
                 "draft_changed", "The reviewed draft no longer matches"
             )
-        existing = self._repository.order_for_draft(draft_id)
+        existing = order_for_draft(self._database, draft_id)
         if existing is not None:
-            authorization = self._repository.authorization_for_draft(draft_id)
+            authorization = authorization_for_draft(self._database, draft_id)
             if (
                 existing.draft_id != draft.id
                 or existing.fingerprint != draft.fingerprint
@@ -268,13 +287,13 @@ class OrderSubmissionService:
             raise TradingValidationError(
                 "mcp_auth_unavailable", "MCP authorization service is unavailable"
             )
-        draft = self._repository.order_draft(draft_id)
+        draft = order_draft(self._database, draft_id)
         if draft is None:
             raise TradingValidationError("draft_not_found", "Order draft not found")
         now = _utc_now(self._clock())
         if now > draft.expires_at:
             raise TradingValidationError("draft_expired", "Order draft has expired")
-        existing = self._repository.order_for_draft(draft_id)
+        existing = order_for_draft(self._database, draft_id)
         if existing is not None:
             raise TradingValidationError(
                 "draft_already_submitted",
@@ -298,7 +317,7 @@ class OrderSubmissionService:
     @contextmanager
     def _submission_claim(self, draft_id: str) -> Iterator[None]:
         try:
-            with self._repository.submission_claim(draft_id) as claimed:
+            with self._database.submission_locks.claim(draft_id) as claimed:
                 if not claimed:
                     raise TradingValidationError(
                         "submission_in_progress",
@@ -339,9 +358,7 @@ class OrderSubmissionService:
         if now > draft.expires_at:
             raise TradingValidationError("draft_expired", "Order draft has expired")
         self._require_fresh_market_quote(draft, now)
-        order, created = self._repository.begin_order_submission(
-            draft, now, actor=actor
-        )
+        order, created = begin_order_submission(self._database, draft, now, actor=actor)
         if not created:
             return order
         command = ExecutionCommand(
@@ -363,7 +380,8 @@ class OrderSubmissionService:
             await self._validator(draft, final_now)
             _require_guard(self._trading_guard, _trade_intent(draft))
         except TradingValidationError as error:
-            return self._repository.finish_order_submission(
+            return finish_order_submission(
+                self._database,
                 order.id,
                 OrderState.REJECTED,
                 final_now,
@@ -374,7 +392,8 @@ class OrderSubmissionService:
                 actor=actor,
             )
         try:
-            order = self._repository.mark_provider_submission_started(
+            order = mark_provider_submission_started(
+                self._database,
                 order.id,
                 expected_version=order.version,
                 started_at=_utc_now(self._clock()),
@@ -388,7 +407,7 @@ class OrderSubmissionService:
             self._unknown(order, _utc_now(self._clock()), actor=actor)
             raise
         except ConcurrentOrderUpdate:
-            latest = self._repository.order(order.id)
+            latest = load_order(self._database, order.id)
             if latest is None:
                 raise
             return latest
@@ -420,7 +439,8 @@ class OrderSubmissionService:
             not isinstance(broker_order_id, str) or not broker_order_id.strip()
         ):
             return self._unknown(order, now, actor=actor)
-        return self._repository.finish_order_submission(
+        return finish_order_submission(
+            self._database,
             order.id,
             result.state,
             now,
@@ -454,7 +474,8 @@ class OrderSubmissionService:
         now: datetime,
         actor: OrderEventActor = OrderEventActor.DASHBOARD,
     ) -> StoredOrder:
-        return self._repository.finish_order_submission(
+        return finish_order_submission(
+            self._database,
             order.id,
             OrderState.UNKNOWN,
             now,
@@ -700,12 +721,12 @@ def _classify_cancel_result(
 class OrderCancellationService:
     def __init__(
         self,
-        repository: PortfolioRepository,
+        database: Database,
         execution_provider: ExecutionProvider | None = None,
         clock: Callable[[], datetime] | None = None,
         mcp_auth_service: McpAuthorizationService | None = None,
     ) -> None:
-        self._repository = repository
+        self._database = database
         self._execution_provider = execution_provider
         self._clock = clock or (lambda: datetime.now(UTC))
         self._mcp_auth_service = mcp_auth_service
@@ -733,7 +754,7 @@ class OrderCancellationService:
             raise TradingValidationError(
                 "confirmation_required", "Order cancellation confirmation is required"
             )
-        order = self._repository.order(order_id)
+        order = load_order(self._database, order_id)
         if order is None:
             raise TradingValidationError("order_not_found", "Order not found")
         if self._execution_provider is None:
@@ -760,14 +781,13 @@ class OrderCancellationService:
         async with self._lock_for(order_id):
             now = _utc_now(self._clock())
             try:
-                order_pending, attempt_id, started = (
-                    self._repository.begin_order_cancellation(
-                        order_id,
-                        expected_version=expected_version,
-                        expected_state=expected_state,
-                        now=now,
-                        actor=actor,
-                    )
+                order_pending, attempt_id, started = begin_order_cancellation(
+                    self._database,
+                    order_id,
+                    expected_version=expected_version,
+                    expected_state=expected_state,
+                    now=now,
+                    actor=actor,
                 )
             except ConcurrentOrderUpdate:
                 raise TradingValidationError(
@@ -789,7 +809,8 @@ class OrderCancellationService:
                 )
                 observation = _classify_cancel_result(result, order_pending)
             except asyncio.CancelledError:
-                self._repository.finish_order_cancellation(
+                finish_order_cancellation(
+                    self._database,
                     order_id,
                     attempt_id=attempt_id,
                     observation=CancellationObservation(kind="unknown"),
@@ -800,7 +821,8 @@ class OrderCancellationService:
             except Exception:
                 observation = CancellationObservation(kind="unknown")
 
-            return self._repository.finish_order_cancellation(
+            return finish_order_cancellation(
+                self._database,
                 order_id,
                 attempt_id=attempt_id,
                 observation=observation,
@@ -810,7 +832,7 @@ class OrderCancellationService:
 
     def create_request(self, order_id: str) -> StoredCancellationRequest:
         now = _utc_now(self._clock())
-        order = self._repository.order(order_id)
+        order = load_order(self._database, order_id)
         if order is None:
             raise TradingValidationError("order_not_found", "Order not found")
         if not order.can_cancel:
@@ -819,12 +841,12 @@ class OrderCancellationService:
                 order.blocking_reason or "Order cannot be canceled",
             )
         expires_at = now + timedelta(minutes=5)
-        return self._repository.create_cancellation_request(
-            order=order, now=now, expires_at=expires_at
+        return create_cancellation_request(
+            self._database, order=order, now=now, expires_at=expires_at
         )
 
     def get_request(self, request_id: str) -> StoredCancellationRequest | None:
-        return self._repository.get_cancellation_request(request_id)
+        return get_cancellation_request(self._database, request_id)
 
     async def cancel_authorized(
         self,
@@ -846,7 +868,7 @@ class OrderCancellationService:
                 "mcp_auth_unavailable", "MCP authorization service is unavailable"
             )
 
-        req = self._repository.get_cancellation_request(cancellation_request_id.strip())
+        req = get_cancellation_request(self._database, cancellation_request_id.strip())
         if req is None:
             raise TradingValidationError(
                 "cancellation_request_not_found", "Cancellation request not found"
@@ -874,30 +896,28 @@ class OrderCancellationService:
 
         now = _utc_now(self._clock())
         if now > req.expires_at:
-            self._repository.update_cancellation_request_status(
-                req.id, status="expired"
-            )
+            update_cancellation_request_status(self._database, req.id, status="expired")
             raise TradingValidationError(
                 "cancellation_request_expired",
                 "Cancellation request has expired",
             )
 
-        order = self._repository.order(req.order_id)
+        order = load_order(self._database, req.order_id)
         if order is None:
             raise TradingValidationError("order_not_found", "Order not found")
         if (
             order.version != req.expected_order_version
             or order.state != req.expected_order_state
         ):
-            self._repository.invalidate_cancellation_requests_for_order(
-                req.order_id, reason="order_state_changed"
+            invalidate_cancellation_requests_for_order(
+                self._database, req.order_id, reason="order_state_changed"
             )
             raise TradingValidationError(
                 "order_conflict", "Order changed before cancellation"
             )
         if not order.can_cancel:
-            self._repository.invalidate_cancellation_requests_for_order(
-                req.order_id, reason="order_not_cancelable"
+            invalidate_cancellation_requests_for_order(
+                self._database, req.order_id, reason="order_not_cancelable"
             )
             raise TradingValidationError(
                 "order_not_cancelable",
@@ -917,7 +937,7 @@ class OrderCancellationService:
                 error.code, "Authorization code is invalid or expired"
             ) from error
 
-        self._repository.update_cancellation_request_status(req.id, status="attempted")
+        update_cancellation_request_status(self._database, req.id, status="attempted")
 
         return await self.cancel(
             order_id=req.order_id,

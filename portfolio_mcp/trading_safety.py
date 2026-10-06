@@ -3,8 +3,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
-from portfolio_mcp.database import PortfolioRepository, StoredTradingSettings
+from portfolio_mcp.database import Database
 from portfolio_mcp.models import AccountCapabilities
+from portfolio_mcp.portfolio_store import account_capability
+from portfolio_mcp.portfolio_store import list_positions as load_positions
+from portfolio_mcp.trading_settings_store import (
+    StoredTradingSettings,
+    replace_trading_settings,
+    trading_settings,
+)
 
 
 class TradingSettingsError(ValueError):
@@ -16,14 +23,14 @@ class TradingSettingsError(ValueError):
 class TradingSettingsService:
     def __init__(
         self,
-        repository: PortfolioRepository,
+        database: Database,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
-        self._repository = repository
+        self._database = database
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def get(self) -> StoredTradingSettings:
-        return self._repository.trading_settings()
+        return trading_settings(self._database)
 
     def replace(
         self,
@@ -41,7 +48,8 @@ class TradingSettingsService:
                 "validation_error",
                 "Positive share and USD-notional limits are required to enable trading",
             )
-        saved = self._repository.replace_trading_settings(
+        saved = replace_trading_settings(
+            self._database,
             live_trading_enabled=live_trading_enabled,
             kill_switch_active=kill_switch_active,
             max_order_shares=shares,
@@ -143,10 +151,10 @@ class GuardDecision:
 class TradingGuard:
     def __init__(
         self,
-        repository: PortfolioRepository,
+        database: Database,
         settings_service: TradingSettingsService,
     ) -> None:
-        self._repository = repository
+        self._database = database
         self._settings_service = settings_service
 
     def evaluate(self, intent: TradeIntent) -> GuardDecision:
@@ -182,7 +190,7 @@ class TradingGuard:
         return violations
 
     def _capability_violations(self, intent: TradeIntent) -> list[GuardViolation]:
-        capability = self._repository.account_capability(intent.account_id)
+        capability = account_capability(self._database, intent.account_id)
         if capability is None or not capability.is_trade_capable:
             return [
                 GuardViolation(
@@ -240,7 +248,7 @@ class TradingGuard:
     def _holdings_violations(self, intent: TradeIntent) -> list[GuardViolation]:
         if intent.side != "sell":
             return []
-        positions = self._repository.list_positions(intent.account_id)
+        positions = load_positions(self._database, intent.account_id)
         held = sum(
             (
                 position.position.quantity

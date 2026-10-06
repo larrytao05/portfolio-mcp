@@ -11,6 +11,7 @@ import {
 export type OrderCancellationModalProps = {
   order: StoredOrder;
   isOpen: boolean;
+  isRefreshPending: boolean;
   onClose: () => void;
   onSuccess: (updatedOrder: StoredOrder) => void;
   onOrderUpdated?: (updatedOrder: StoredOrder) => void;
@@ -31,6 +32,7 @@ const CANCELLATION_DISPOSITION_MESSAGES: Partial<Record<string, string>> = {
 export function OrderCancellationModal({
   order,
   isOpen,
+  isRefreshPending,
   onClose,
   onSuccess,
   onOrderUpdated,
@@ -105,8 +107,6 @@ export function OrderCancellationModal({
       }
     },
   });
-
-  // Focus management: capture active element on open, focus initial element, and restore on close
   useEffect(() => {
     if (!isOpen) return;
     triggerElementRef.current = document.activeElement as HTMLElement | null;
@@ -120,8 +120,6 @@ export function OrderCancellationModal({
       triggerElementRef.current?.focus();
     };
   }, [isOpen]);
-
-  // Keyboard navigation: Escape key listener and Tab focus trap
   useEffect(() => {
     if (!isOpen) return;
 
@@ -249,6 +247,7 @@ export function OrderCancellationModal({
                 type="button"
                 className="button-primary"
                 ref={initialFocusRef}
+                disabled={isRefreshPending}
                 onClick={() => {
                   onReconcileRequested?.(currentOrder.id);
                   onClose();

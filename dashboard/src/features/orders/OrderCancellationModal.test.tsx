@@ -55,6 +55,7 @@ function renderModal(props: Partial<Parameters<typeof OrderCancellationModal>[0]
   const defaultProps = {
     order: sampleCancelableOrder,
     isOpen: true,
+    isRefreshPending: false,
     onClose: vi.fn(),
     onSuccess: vi.fn(),
     onReconcileRequested: vi.fn(),
@@ -120,150 +121,34 @@ describe("OrderCancellationModal", () => {
     });
   });
 
-  it("handles refused cancellation by displaying rejection message without reporting success, preserving open-order warning", async () => {
+  it.each([
+    ["ACCEPTED", true, /Cancellation was rejected by the broker. The order remains open and may still fill./i],
+    ["PARTIALLY_FILLED", true, /Cancellation was rejected by the broker. The order remains open and may still fill./i],
+    ["FILLED", false, /Order was filled and could not be canceled./i],
+    ["EXPIRED", false, /Order expired and could not be canceled./i],
+    ["CANCEL_PENDING", false, /Cancellation is in progress./i],
+  ])("shows %s cancellation disposition without reporting success", async (state, canCancel, message) => {
     vi.mocked(client.confirmOrderCancellation).mockResolvedValueOnce({
       order: {
         ...sampleCancelableOrder,
-        state: "ACCEPTED",
+        state,
         version: 3,
-        can_cancel: true,
+        can_cancel: canCancel,
+        fill: state === "PARTIALLY_FILLED" ? { quantity: "5", average_price: "220.50" } : null,
+        remaining_quantity: state === "PARTIALLY_FILLED" ? "5" : "10",
       },
     });
-
     const { props } = renderModal();
-
-    fireEvent.click(
-      screen.getByRole("button", { name: /Confirm cancellation/i }),
-    );
-
-    await waitFor(() => {
-      expect(
-        screen.getByText(
-          /Cancellation was rejected by the broker\. The order remains open and may still fill\./i,
-        ),
-      ).toBeTruthy();
-      expect(props.onSuccess).not.toHaveBeenCalled();
-      expect(
-        screen.getByText(/Filled shares cannot be undone/i),
-      ).toBeTruthy();
-      expect(
-        screen.getByRole("button", { name: /Confirm cancellation/i }),
-      ).toBeTruthy();
-    });
-  });
-
-  it("handles refused cancellation on PARTIALLY_FILLED order displaying rejection message without reporting success", async () => {
-    vi.mocked(client.confirmOrderCancellation).mockResolvedValueOnce({
-      order: {
-        ...sampleCancelableOrder,
-        state: "PARTIALLY_FILLED",
-        version: 3,
-        can_cancel: true,
-        fill: { quantity: "5", average_price: "220.50" },
-        remaining_quantity: "5",
-      },
-    });
-
-    const { props } = renderModal();
-
-    fireEvent.click(
-      screen.getByRole("button", { name: /Confirm cancellation/i }),
-    );
-
-    await waitFor(() => {
-      expect(
-        screen.getByText(
-          /Cancellation was rejected by the broker\. The order remains open and may still fill\./i,
-        ),
-      ).toBeTruthy();
-      expect(props.onSuccess).not.toHaveBeenCalled();
-      expect(
-        screen.getByText(/Filled shares cannot be undone/i),
-      ).toBeTruthy();
-      expect(
-        screen.getByRole("button", { name: /Confirm cancellation/i }),
-      ).toBeTruthy();
-    });
-  });
-
-  it("handles cancellation returning final observed FILLED state without reporting success", async () => {
-    vi.mocked(client.confirmOrderCancellation).mockResolvedValueOnce({
-      order: {
-        ...sampleCancelableOrder,
-        state: "FILLED",
-        version: 3,
-        can_cancel: false,
-      },
-    });
-
-    const { props } = renderModal();
-
-    fireEvent.click(
-      screen.getByRole("button", { name: /Confirm cancellation/i }),
-    );
-
-    await waitFor(() => {
-      expect(
-        screen.getByText(/Order was filled and could not be canceled\./i),
-      ).toBeTruthy();
-      expect(props.onSuccess).not.toHaveBeenCalled();
-      expect(
-        screen.queryByRole("button", { name: /Confirm cancellation/i }),
-      ).toBeNull();
-      expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
-    });
-  });
-
-  it("handles cancellation returning final observed EXPIRED state without reporting success", async () => {
-    vi.mocked(client.confirmOrderCancellation).mockResolvedValueOnce({
-      order: {
-        ...sampleCancelableOrder,
-        state: "EXPIRED",
-        version: 3,
-        can_cancel: false,
-      },
-    });
-
-    const { props } = renderModal();
-
-    fireEvent.click(
-      screen.getByRole("button", { name: /Confirm cancellation/i }),
-    );
-
-    await waitFor(() => {
-      expect(
-        screen.getByText(/Order expired and could not be canceled\./i),
-      ).toBeTruthy();
-      expect(props.onSuccess).not.toHaveBeenCalled();
-      expect(
-        screen.queryByRole("button", { name: /Confirm cancellation/i }),
-      ).toBeNull();
-      expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
-    });
-  });
-
-  it("handles cancellation returning CANCEL_PENDING without reporting success", async () => {
-    vi.mocked(client.confirmOrderCancellation).mockResolvedValueOnce({
-      order: {
-        ...sampleCancelableOrder,
-        state: "CANCEL_PENDING",
-        version: 3,
-        can_cancel: false,
-      },
-    });
-
-    const { props } = renderModal();
-
-    fireEvent.click(
-      screen.getByRole("button", { name: /Confirm cancellation/i }),
-    );
-
-    await waitFor(() => {
-      expect(
-        screen.getByText(/Cancellation is in progress\./i),
-      ).toBeTruthy();
-      expect(props.onSuccess).not.toHaveBeenCalled();
-    });
+    fireEvent.click(screen.getByRole("button", { name: /Confirm cancellation/i }));
+    expect(await screen.findByText(message)).toBeTruthy();
+    expect(props.onSuccess).not.toHaveBeenCalled();
+    expect(screen.getByText(/Filled shares cannot be undone/i)).toBeTruthy();
+    expect(Boolean(screen.queryByRole("button", { name: /Confirm cancellation/i }))).toBe(canCancel);
+    if (!canCancel) expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
+    if (state === "PARTIALLY_FILLED") {
+      expect(screen.getByText("5 @ $220.50")).toBeTruthy();
+      expect(screen.getByText("5")).toBeTruthy();
+    }
   });
 
   it("disables buttons while cancellation mutation is pending to prevent double-click", async () => {
@@ -317,8 +202,6 @@ describe("OrderCancellationModal", () => {
       expect(screen.getByText("8 @ $220.50")).toBeTruthy();
       expect(screen.getByText("2")).toBeTruthy();
     });
-
-    // Subsequent confirm uses the new version (3)
     vi.mocked(client.confirmOrderCancellation).mockResolvedValueOnce({
       order: { ...updatedOrder, state: "CANCELED" },
     });
@@ -452,15 +335,11 @@ describe("OrderCancellationModal", () => {
     const dialog = screen.getByRole("dialog");
     const closeBtn = screen.getByRole("button", { name: "Close dialog" });
     const confirmBtn = screen.getByRole("button", { name: /Confirm cancellation/i });
-
-    // When focus is on the last button and Tab is pressed, it wraps to first
     confirmBtn.focus();
     expect(document.activeElement).toBe(confirmBtn);
 
     fireEvent.keyDown(dialog, { key: "Tab" });
     expect(document.activeElement).toBe(closeBtn);
-
-    // When focus is on the first button and Shift+Tab is pressed, it wraps to last
     closeBtn.focus();
     fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
     expect(document.activeElement).toBe(confirmBtn);

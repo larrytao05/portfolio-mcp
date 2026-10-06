@@ -5,17 +5,21 @@ import pytest
 from sqlalchemy import select
 
 from portfolio_mcp.config import ExecutionSettings, SchwabSettings
-from portfolio_mcp.database import (
-    AccountNotFoundError,
-    AccountRecord,
-    PortfolioRepository,
-    SchwabAccountMappingConflictError,
-    SchwabAccountMappingRecord,
-)
+from portfolio_mcp.database import Database
 from portfolio_mcp.models import is_schwab_account_eligible
 from portfolio_mcp.provider import (
     ProviderAuthenticationError,
     ProviderConfigurationError,
+)
+from portfolio_mcp.schema import AccountRecord, SchwabAccountMappingRecord
+from portfolio_mcp.schwab_mapping_store import (
+    AccountNotFoundError,
+    SchwabAccountMappingConflictError,
+    delete_schwab_account_mapping,
+    get_schwab_account_mapping,
+    get_schwab_account_mapping_by_hash,
+    list_schwab_account_mappings,
+    save_schwab_account_mapping,
 )
 from portfolio_mcp.schwab_readiness import (
     SchwabReadinessService,
@@ -64,14 +68,14 @@ class RoutingFakeHttpClient:
         raise RuntimeError(f"No route for {method} {url}")
 
 
-def _make_repo(tmp_path: Path) -> PortfolioRepository:
+def _make_repo(tmp_path: Path) -> Database:
     db_file = tmp_path / "test.db"
-    return PortfolioRepository(f"sqlite:///{db_file}")
+    return Database(f"sqlite:///{db_file}")
 
 
-def _seed_accounts(repo: PortfolioRepository) -> None:
+def _seed_accounts(repo: Database) -> None:
     now = datetime.now(UTC)
-    with repo._sessions() as s:
+    with repo.sessions() as s:
         s.add(
             AccountRecord(
                 id="schwab-taxable-1",
@@ -95,9 +99,6 @@ def _seed_accounts(repo: PortfolioRepository) -> None:
             )
         )
         s.commit()
-
-
-# --- 1. Config Tests ---
 
 
 def test_execution_settings_defaults() -> None:
@@ -126,9 +127,6 @@ def test_schwab_settings_missing_fields_raises() -> None:
         SchwabSettings.from_environment({})
 
 
-# --- 2. Shared Transport & Account Number Redaction Invariant ---
-
-
 @pytest.mark.asyncio
 async def test_transport_error_mapping() -> None:
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
@@ -153,17 +151,14 @@ async def test_schwab_transport_token_ttl_and_caching() -> None:
     )
     transport = SchwabOAuthTransport(settings, http_client=client)
 
-    # First fetch fetches token-1
     t1 = await transport.access_token()
     assert t1 == "token-1"
     assert len(client.invocations) == 1
 
-    # Second fetch within TTL reuses cached token without HTTP request
     t2 = await transport.access_token()
     assert t2 == "token-1"
     assert len(client.invocations) == 1
 
-    # Advancing expiry past monotonic time triggers a fresh fetch
     transport._token_expires_at = 0.0
     t3 = await transport.access_token()
     assert t3 == "token-2"
@@ -175,13 +170,9 @@ async def test_schwab_transport_401_retry_invalidation() -> None:
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     client = FakeHttpClient(
         [
-            # Initial token fetch
             (200, {"access_token": "expired-token", "expires_in": 1800}),
-            # First request call returns 401 Unauthorized
             (401, {"error": "unauthorized"}),
-            # Token refresh call after 401 invalidation
             (200, {"access_token": "fresh-token", "expires_in": 1800}),
-            # Retried request succeeds
             (200, {"status": "ok"}),
         ]
     )
@@ -201,7 +192,6 @@ async def test_schwab_readiness_redacts_full_account_numbers(tmp_path: Path) -> 
     _seed_accounts(repo)
 
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
-    # Return access token, then accountNumbers payload containing full numbers
     raw_secret_number = "123456789012"
     client = FakeHttpClient(
         [
@@ -226,56 +216,45 @@ async def test_schwab_readiness_redacts_full_account_numbers(tmp_path: Path) -> 
     assert len(candidates) == 1
     cand = candidates[0]
 
-    # Full secret number must NOT be present anywhere in candidate
-    # representation or dict
     assert cand.masked_account_number == "*9012"
     assert cand.schwab_account_hash == "hash-redact-test"
     assert raw_secret_number not in str(cand.to_dict())
     assert raw_secret_number not in repr(cand)
 
 
-# --- 3. Repository Mapping 1-to-1 Tests ---
-
-
 def test_repository_schwab_mapping_crud_and_uniqueness(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     _seed_accounts(repo)
 
-    # Save mapping
-    mapping = repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1", "*1234")
+    mapping = save_schwab_account_mapping(repo, "schwab-taxable-1", "hash-1", "*1234")
     assert mapping.account_id == "schwab-taxable-1"
     assert mapping.schwab_account_hash == "hash-1"
     assert mapping.masked_account_number == "*1234"
 
-    # Enforce 1-to-1: Duplicate hash to different account fails
     with pytest.raises(SchwabAccountMappingConflictError, match="already mapped"):
-        repo.save_schwab_account_mapping("schwab-roth-2", "hash-1", "*1234")
+        save_schwab_account_mapping(repo, "schwab-roth-2", "hash-1", "*1234")
 
-    # Non-existent account fails with AccountNotFoundError
     with pytest.raises(AccountNotFoundError, match="does not exist"):
-        repo.save_schwab_account_mapping("nonexistent-account", "hash-unique", "*1234")
+        save_schwab_account_mapping(repo, "nonexistent-account", "hash-unique", "*1234")
 
-    # Updating existing account mapping to new hash succeeds
-    updated = repo.save_schwab_account_mapping("schwab-taxable-1", "hash-new", "*9999")
+    updated = save_schwab_account_mapping(repo, "schwab-taxable-1", "hash-new", "*9999")
     assert updated.schwab_account_hash == "hash-new"
     assert updated.masked_account_number == "*9999"
 
-    # Lookup
-    found = repo.get_schwab_account_mapping("schwab-taxable-1")
+    found = get_schwab_account_mapping(repo, "schwab-taxable-1")
     assert found is not None
     assert found.schwab_account_hash == "hash-new"
 
-    found_by_hash = repo.get_schwab_account_mapping_by_hash("hash-new")
+    found_by_hash = get_schwab_account_mapping_by_hash(repo, "hash-new")
     assert found_by_hash is not None
     assert found_by_hash.account_id == "schwab-taxable-1"
 
-    all_mappings = repo.list_schwab_account_mappings()
+    all_mappings = list_schwab_account_mappings(repo)
     assert len(all_mappings) == 1
 
-    # Revocation / deletion
-    assert repo.delete_schwab_account_mapping("schwab-taxable-1") is True
-    assert repo.get_schwab_account_mapping("schwab-taxable-1") is None
-    assert repo.delete_schwab_account_mapping("schwab-taxable-1") is False
+    assert delete_schwab_account_mapping(repo, "schwab-taxable-1") is True
+    assert get_schwab_account_mapping(repo, "schwab-taxable-1") is None
+    assert delete_schwab_account_mapping(repo, "schwab-taxable-1") is False
 
 
 @pytest.mark.parametrize(
@@ -288,7 +267,7 @@ def test_repository_rejects_noncanonical_schwab_account_masks(
     _seed_accounts(repo)
 
     with pytest.raises(ValueError, match="masked account number"):
-        repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1", masked)
+        save_schwab_account_mapping(repo, "schwab-taxable-1", "hash-1", masked)
 
 
 @pytest.mark.parametrize(
@@ -333,7 +312,7 @@ async def test_readiness_fails_closed_on_malformed_broker_details(
 ) -> None:
     repo = _make_repo(tmp_path)
     _seed_accounts(repo)
-    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1234", "*1234")
+    save_schwab_account_mapping(repo, "schwab-taxable-1", "hash-1234", "*1234")
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     client = FakeHttpClient(
         [
@@ -399,7 +378,7 @@ async def test_readiness_does_not_expose_provider_exception_text(
 ) -> None:
     repo = _make_repo(tmp_path)
     _seed_accounts(repo)
-    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1234", "*1234")
+    save_schwab_account_mapping(repo, "schwab-taxable-1", "hash-1234", "*1234")
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     provider_secret = "private-provider-payload-marker"
     responses: list[tuple[int, object] | Exception] = []
@@ -436,8 +415,8 @@ def test_legacy_schwab_mapping_mask_is_unavailable_and_not_ready(
 ) -> None:
     repo = _make_repo(tmp_path)
     _seed_accounts(repo)
-    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1234", "*1234")
-    with repo._sessions() as session:
+    save_schwab_account_mapping(repo, "schwab-taxable-1", "hash-1234", "*1234")
+    with repo.sessions() as session:
         record = session.scalar(
             select(SchwabAccountMappingRecord).where(
                 SchwabAccountMappingRecord.account_id == "schwab-taxable-1"
@@ -447,7 +426,7 @@ def test_legacy_schwab_mapping_mask_is_unavailable_and_not_ready(
         record.masked_account_number = "123456789012"
         session.commit()
 
-    mapping = repo.get_schwab_account_mapping("schwab-taxable-1")
+    mapping = get_schwab_account_mapping(repo, "schwab-taxable-1")
     assert mapping is not None
     assert mapping.masked_account_number == "Unavailable"
 
@@ -458,8 +437,8 @@ async def test_legacy_schwab_mapping_requires_owner_reverification(
 ) -> None:
     repo = _make_repo(tmp_path)
     _seed_accounts(repo)
-    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1234", "*1234")
-    with repo._sessions() as session:
+    save_schwab_account_mapping(repo, "schwab-taxable-1", "hash-1234", "*1234")
+    with repo.sessions() as session:
         record = session.scalar(
             select(SchwabAccountMappingRecord).where(
                 SchwabAccountMappingRecord.account_id == "schwab-taxable-1"
@@ -567,9 +546,6 @@ def test_migration_0015_invalidates_existing_schwab_account_masks(
     ]
 
 
-# --- 4. Candidate Listing & Suggestions Tests ---
-
-
 @pytest.mark.asyncio
 async def test_candidates_suggestion_logic(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
@@ -593,7 +569,6 @@ async def test_candidates_suggestion_logic(tmp_path: Path) -> None:
         repo, transport=transport, schwab_settings=settings
     )
 
-    # schwab-taxable-1 label is "... ••••1234", matching *1234
     candidates = await service.list_candidates_for_account("schwab-taxable-1")
     assert len(candidates) == 2
 
@@ -603,9 +578,6 @@ async def test_candidates_suggestion_logic(tmp_path: Path) -> None:
 
     c2 = next(c for c in candidates if c.schwab_account_hash == "hash-9999")
     assert c2.suggested is False
-
-
-# --- 5. Readiness State Machine Tests ---
 
 
 @pytest.mark.asyncio
@@ -658,7 +630,7 @@ async def test_readiness_unmapped(tmp_path: Path) -> None:
 async def test_readiness_auth_failed(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     _seed_accounts(repo)
-    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1234", "*1234")
+    save_schwab_account_mapping(repo, "schwab-taxable-1", "hash-1234", "*1234")
 
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
@@ -678,11 +650,10 @@ async def test_readiness_auth_failed(tmp_path: Path) -> None:
 async def test_readiness_not_entitled(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     _seed_accounts(repo)
-    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1234", "*1234")
+    save_schwab_account_mapping(repo, "schwab-taxable-1", "hash-1234", "*1234")
 
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
-    # access token ok, but accountNumbers endpoint returns 403
     client = FakeHttpClient(
         [
             (200, {"access_token": "token"}),
@@ -706,7 +677,7 @@ async def test_readiness_account_unavailable_when_hash_not_in_list(
 ) -> None:
     repo = _make_repo(tmp_path)
     _seed_accounts(repo)
-    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-different", "*1234")
+    save_schwab_account_mapping(repo, "schwab-taxable-1", "hash-different", "*1234")
 
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
@@ -731,7 +702,7 @@ async def test_readiness_account_unavailable_when_hash_not_in_list(
 async def test_readiness_unsupported_account_restricted(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     _seed_accounts(repo)
-    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1234", "*1234")
+    save_schwab_account_mapping(repo, "schwab-taxable-1", "hash-1234", "*1234")
 
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
@@ -766,7 +737,7 @@ async def test_readiness_unsupported_account_restricted(tmp_path: Path) -> None:
 async def test_readiness_ready_when_all_valid(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     _seed_accounts(repo)
-    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1234", "*1234")
+    save_schwab_account_mapping(repo, "schwab-taxable-1", "hash-1234", "*1234")
 
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
@@ -805,8 +776,8 @@ async def test_readiness_ready_when_all_valid(tmp_path: Path) -> None:
 async def test_check_all_readiness_concurrent(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     _seed_accounts(repo)
-    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1", "*1234")
-    repo.save_schwab_account_mapping("schwab-roth-2", "hash-2", "*5678")
+    save_schwab_account_mapping(repo, "schwab-taxable-1", "hash-1", "*1234")
+    save_schwab_account_mapping(repo, "schwab-roth-2", "hash-2", "*5678")
 
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
@@ -874,7 +845,7 @@ def test_schwab_account_eligibility_predicate() -> None:
 async def test_readiness_foreign_eur_account_never_ready(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     now = datetime.now(UTC)
-    with repo._sessions() as s:
+    with repo.sessions() as s:
         s.add(
             AccountRecord(
                 id="schwab-eur-1",
@@ -888,8 +859,7 @@ async def test_readiness_foreign_eur_account_never_ready(tmp_path: Path) -> None
         )
         s.commit()
 
-    # Pre-existing mapping in DB remains saved, but readiness must be false
-    with repo._sessions() as s:
+    with repo.sessions() as s:
         s.add(
             SchwabAccountMappingRecord(
                 id="map-eur-1",
@@ -916,12 +886,10 @@ async def test_readiness_foreign_eur_account_never_ready(tmp_path: Path) -> None
     assert readiness.state == SchwabReadinessState.UNSUPPORTED_ACCOUNT
     assert readiness.ready is False
     assert "must be a Schwab USD account" in readiness.message
-    # Pre-existing mapping remains in database
-    mapping = repo.get_schwab_account_mapping("schwab-eur-1")
+    mapping = get_schwab_account_mapping(repo, "schwab-eur-1")
     assert mapping is not None
     assert mapping.schwab_account_hash == "hash-eur"
 
-    # Attempting to save mapping for ineligible account is rejected
     with pytest.raises(ValueError, match="not eligible"):
         await service.save_verified_mapping(
             account_id="schwab-eur-1",
@@ -934,7 +902,7 @@ async def test_readiness_foreign_eur_account_never_ready(tmp_path: Path) -> None
 async def test_readiness_broker_contradictory_currency_rejected(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     _seed_accounts(repo)
-    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1234", "*1234")
+    save_schwab_account_mapping(repo, "schwab-taxable-1", "hash-1234", "*1234")
 
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
@@ -947,7 +915,7 @@ async def test_readiness_broker_contradictory_currency_rejected(tmp_path: Path) 
                 {
                     "securitiesAccount": {
                         "type": "MARGIN",
-                        "currency": "EUR",  # contradictory currency
+                        "currency": "EUR",
                         "isClosingOnlyRestricted": False,
                     }
                 },
@@ -971,7 +939,7 @@ async def test_readiness_broker_contradictory_currency_rejected(tmp_path: Path) 
 async def test_readiness_broker_unsupported_type_rejected(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     _seed_accounts(repo)
-    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1234", "*1234")
+    save_schwab_account_mapping(repo, "schwab-taxable-1", "hash-1234", "*1234")
 
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
@@ -983,7 +951,7 @@ async def test_readiness_broker_unsupported_type_rejected(tmp_path: Path) -> Non
                 200,
                 {
                     "securitiesAccount": {
-                        "type": "FUTURES",  # unsupported type
+                        "type": "FUTURES",
                         "currency": "USD",
                         "isClosingOnlyRestricted": False,
                         "isDayTrader": False,
@@ -1010,7 +978,7 @@ async def test_save_verified_mapping_auth_failure_leaves_mapping_untouched(
 ) -> None:
     repo = _make_repo(tmp_path)
     _seed_accounts(repo)
-    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-orig", "*1111")
+    save_schwab_account_mapping(repo, "schwab-taxable-1", "hash-orig", "*1111")
 
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     client = FakeHttpClient([(401, {"error": "unauthorized"})])
@@ -1027,8 +995,7 @@ async def test_save_verified_mapping_auth_failure_leaves_mapping_untouched(
             confirmed=True,
         )
 
-    # Repository mapping remains untouched
-    mapping = repo.get_schwab_account_mapping("schwab-taxable-1")
+    mapping = get_schwab_account_mapping(repo, "schwab-taxable-1")
     assert mapping is not None
     assert mapping.schwab_account_hash == "hash-orig"
     assert mapping.masked_account_number == "*1111"
@@ -1058,7 +1025,7 @@ async def test_save_verified_mapping_unknown_selector_rejected(tmp_path: Path) -
             candidate_id="completely-bogus-selector",
             confirmed=True,
         )
-    assert repo.get_schwab_account_mapping("schwab-taxable-1") is None
+    assert get_schwab_account_mapping(repo, "schwab-taxable-1") is None
 
 
 @pytest.mark.asyncio
@@ -1078,7 +1045,6 @@ async def test_process_restart_invalidates_selector(tmp_path: Path) -> None:
     )
     transport = SchwabOAuthTransport(settings, http_client=http_client)
 
-    # Process 1
     service1 = SchwabReadinessService(
         repo,
         transport=transport,
@@ -1088,7 +1054,6 @@ async def test_process_restart_invalidates_selector(tmp_path: Path) -> None:
     candidates = await service1.list_candidates_for_account("schwab-taxable-1")
     cand_id_p1 = candidates[0].candidate_id
 
-    # Process 2 (simulated restart with fresh HMAC secret)
     service2 = SchwabReadinessService(
         repo,
         transport=transport,

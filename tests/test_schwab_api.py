@@ -6,12 +6,11 @@ from fastapi.testclient import TestClient
 
 from portfolio_mcp.api.app import create_app
 from portfolio_mcp.config import ExecutionSettings, SchwabSettings
-from portfolio_mcp.database import (
-    AccountRecord,
-    PortfolioRepository,
-)
+from portfolio_mcp.database import Database
 from portfolio_mcp.fixtures import FixturePortfolioProvider
 from portfolio_mcp.provider import ProviderRateLimitError, ProviderResponseError
+from portfolio_mcp.schema import AccountRecord
+from portfolio_mcp.schwab_mapping_store import save_schwab_account_mapping
 from portfolio_mcp.schwab_readiness import SchwabReadinessService
 from portfolio_mcp.schwab_transport import SchwabOAuthTransport
 
@@ -37,9 +36,9 @@ class RoutingFakeHttpClient:
         raise RuntimeError(f"No route for {method} {url}")
 
 
-def _seed_accounts(repo: PortfolioRepository) -> None:
+def _seed_accounts(repo: Database) -> None:
     now = datetime.now(UTC)
-    with repo._sessions() as s:
+    with repo.sessions() as s:
         s.add(
             AccountRecord(
                 id="schwab-taxable-1",
@@ -69,7 +68,7 @@ def test_api_schwab_mapping_crud_flow(tmp_path: Path) -> None:
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
     db_file = tmp_path / "api_test.db"
-    repo = PortfolioRepository(f"sqlite:///{db_file}")
+    repo = Database(f"sqlite:///{db_file}")
     _seed_accounts(repo)
 
     http_client = RoutingFakeHttpClient(
@@ -100,16 +99,13 @@ def test_api_schwab_mapping_crud_flow(tmp_path: Path) -> None:
     )
     client = TestClient(app)
 
-    # Initially empty mappings
     resp = client.get("/api/schwab/mapping")
     assert resp.status_code == 200
     assert resp.json() == {"mappings": []}
 
-    # Getting non-existent returns 404
     resp = client.get("/api/schwab/mapping/schwab-taxable-1")
     assert resp.status_code == 404
 
-    # Fetch candidates for schwab-taxable-1
     cands_resp = client.get(
         "/api/schwab/mapping/candidates?account_id=schwab-taxable-1"
     )
@@ -121,7 +117,6 @@ def test_api_schwab_mapping_crud_flow(tmp_path: Path) -> None:
     assert cand1["masked_account_number"] == "*1234"
     assert "schwab_account_hash" not in cand1
 
-    # Saving mapping without confirmation fails with 400
     resp = client.post(
         "/api/schwab/mapping/schwab-taxable-1",
         json={
@@ -132,7 +127,6 @@ def test_api_schwab_mapping_crud_flow(tmp_path: Path) -> None:
     assert resp.status_code == 400
     assert resp.json()["detail"] == "Invalid Schwab mapping request"
 
-    # Saving mapping with confirmation succeeds
     resp = client.post(
         "/api/schwab/mapping/schwab-taxable-1",
         json={
@@ -146,19 +140,16 @@ def test_api_schwab_mapping_crud_flow(tmp_path: Path) -> None:
     assert created["masked_account_number"] == "*1234"
     assert "schwab_account_hash" not in created
 
-    # Getting single mapping
     resp = client.get("/api/schwab/mapping/schwab-taxable-1")
     assert resp.status_code == 200
     assert resp.json()["mapping"]["account_id"] == "schwab-taxable-1"
     assert resp.json()["mapping"]["masked_account_number"] == "*1234"
     assert "schwab_account_hash" not in resp.json()["mapping"]
 
-    # 1-to-1 violation: saving same underlying hash to schwab-roth-2
-    # fails with 409 Conflict
     roth_cands = client.get(
         "/api/schwab/mapping/candidates?account_id=schwab-roth-2"
     ).json()["candidates"]
-    cand_roth_dup = roth_cands[0]  # maps to hash-abc
+    cand_roth_dup = roth_cands[0]
     resp = client.post(
         "/api/schwab/mapping/schwab-roth-2",
         json={
@@ -169,7 +160,6 @@ def test_api_schwab_mapping_crud_flow(tmp_path: Path) -> None:
     assert resp.status_code == 409
     assert "already mapped" in resp.json()["detail"]
 
-    # Non-existent account returns 404
     resp = client.post(
         "/api/schwab/mapping/nonexistent-acc",
         json={
@@ -179,12 +169,10 @@ def test_api_schwab_mapping_crud_flow(tmp_path: Path) -> None:
     )
     assert resp.status_code == 404
 
-    # Deleting mapping
     resp = client.delete("/api/schwab/mapping/schwab-taxable-1")
     assert resp.status_code == 200
     assert resp.json() == {"deleted": True, "account_id": "schwab-taxable-1"}
 
-    # Second delete returns 404
     resp = client.delete("/api/schwab/mapping/schwab-taxable-1")
     assert resp.status_code == 404
 
@@ -193,9 +181,9 @@ def test_api_schwab_readiness_endpoints(tmp_path: Path) -> None:
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
     db_file = tmp_path / "api_test2.db"
-    repo = PortfolioRepository(f"sqlite:///{db_file}")
+    repo = Database(f"sqlite:///{db_file}")
     _seed_accounts(repo)
-    repo.save_schwab_account_mapping("schwab-taxable-1", "hash-1234", "*1234")
+    save_schwab_account_mapping(repo, "schwab-taxable-1", "hash-1234", "*1234")
 
     http_client = RoutingFakeHttpClient(
         {
@@ -232,7 +220,6 @@ def test_api_schwab_readiness_endpoints(tmp_path: Path) -> None:
     )
     test_client = TestClient(app)
 
-    # Check single account readiness
     resp = test_client.get("/api/schwab/readiness/schwab-taxable-1")
     assert resp.status_code == 200
     readiness = resp.json()["readiness"]
@@ -246,7 +233,7 @@ def test_api_schwab_mapping_candidate_validation(tmp_path: Path) -> None:
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
     db_file = tmp_path / "cand_val.db"
-    repo = PortfolioRepository(f"sqlite:///{db_file}")
+    repo = Database(f"sqlite:///{db_file}")
     _seed_accounts(repo)
 
     http_client = RoutingFakeHttpClient(
@@ -278,7 +265,6 @@ def test_api_schwab_mapping_candidate_validation(tmp_path: Path) -> None:
     ).json()["candidates"]
     valid_candidate_id = candidates[0]["candidate_id"]
 
-    # Saving with recognized candidate hash succeeds
     resp = test_client.post(
         "/api/schwab/mapping/schwab-taxable-1",
         json={
@@ -290,7 +276,6 @@ def test_api_schwab_mapping_candidate_validation(tmp_path: Path) -> None:
     assert resp.json()["mapping"]["account_id"] == "schwab-taxable-1"
     assert "schwab_account_hash" not in resp.json()["mapping"]
 
-    # Saving with unrecognized candidate hash fails with 400
     resp = test_client.post(
         "/api/schwab/mapping/schwab-roth-2",
         json={
@@ -306,7 +291,7 @@ def test_api_schwab_candidates_error_handling(tmp_path: Path) -> None:
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
     db_file = tmp_path / "cand_err.db"
-    repo = PortfolioRepository(f"sqlite:///{db_file}")
+    repo = Database(f"sqlite:///{db_file}")
     _seed_accounts(repo)
 
     http_client = RoutingFakeHttpClient(
@@ -330,13 +315,11 @@ def test_api_schwab_candidates_error_handling(tmp_path: Path) -> None:
     )
     test_client = TestClient(app)
 
-    # 1. Non-existent account returns 404 (not 500)
     resp = test_client.get(
         "/api/schwab/mapping/candidates?account_id=nonexistent-account"
     )
     assert resp.status_code == 404
 
-    # 2. Provider auth failure returns 403 (not 500)
     resp = test_client.get("/api/schwab/mapping/candidates?account_id=schwab-taxable-1")
     assert resp.status_code == 403
 
@@ -350,7 +333,7 @@ def test_json_responses_contain_no_full_account_numbers_or_hashes(
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     exec_settings = ExecutionSettings(provider="schwab", schwab_execution_enabled=True)
     db_file = tmp_path / "redact_json.db"
-    repo = PortfolioRepository(f"sqlite:///{db_file}")
+    repo = Database(f"sqlite:///{db_file}")
     _seed_accounts(repo)
 
     http_client = RoutingFakeHttpClient(
@@ -386,7 +369,6 @@ def test_json_responses_contain_no_full_account_numbers_or_hashes(
     )
     client = TestClient(app)
 
-    # 1. Candidates
     cands_resp = client.get(
         "/api/schwab/mapping/candidates?account_id=schwab-taxable-1"
     )
@@ -395,7 +377,6 @@ def test_json_responses_contain_no_full_account_numbers_or_hashes(
     assert raw_hash not in cands_resp.text
     cand = cands_resp.json()["candidates"][0]
 
-    # 2. Save mapping
     save_resp = client.post(
         "/api/schwab/mapping/schwab-taxable-1",
         json={"candidate_id": cand["candidate_id"], "confirmed": True},
@@ -404,25 +385,21 @@ def test_json_responses_contain_no_full_account_numbers_or_hashes(
     assert raw_secret_number not in save_resp.text
     assert raw_hash not in save_resp.text
 
-    # 3. Get mapping
     get_resp = client.get("/api/schwab/mapping/schwab-taxable-1")
     assert get_resp.status_code == 200
     assert raw_secret_number not in get_resp.text
     assert raw_hash not in get_resp.text
 
-    # 4. List mappings
     list_resp = client.get("/api/schwab/mapping")
     assert list_resp.status_code == 200
     assert raw_secret_number not in list_resp.text
     assert raw_hash not in list_resp.text
 
-    # 5. Account readiness
     readiness_resp = client.get("/api/schwab/readiness/schwab-taxable-1")
     assert readiness_resp.status_code == 200
     assert raw_secret_number not in readiness_resp.text
     assert raw_hash not in readiness_resp.text
 
-    # 6. All readiness
     all_readiness_resp = client.get("/api/schwab/readiness")
     assert all_readiness_resp.status_code == 200
     assert raw_secret_number not in all_readiness_resp.text
@@ -434,7 +411,7 @@ def test_schwab_mapping_api_redacts_provider_errors_and_maps_rate_limits(
 ) -> None:
     settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
     database_url = f"sqlite:///{tmp_path / 'api-errors.db'}"
-    repo = PortfolioRepository(database_url)
+    repo = Database(database_url)
     _seed_accounts(repo)
     provider_secret = "private-provider-payload-marker"
 

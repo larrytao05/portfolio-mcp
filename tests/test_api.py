@@ -4,9 +4,11 @@ from decimal import Decimal
 from fastapi.testclient import TestClient
 
 from portfolio_mcp.api import create_app
-from portfolio_mcp.database import PortfolioRepository
+from portfolio_mcp.database import Database
 from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
 from portfolio_mcp.models import Account, HoldingsSnapshot, Instrument, Position
+from portfolio_mcp.portfolio_store import daily_values, save_refresh
+from portfolio_mcp.portfolio_store import list_positions as load_positions
 from portfolio_mcp.provider import ProviderAuthenticationError, ProviderUnavailableError
 
 
@@ -333,13 +335,80 @@ def test_removed_account_is_excluded_from_current_capability_responses(
             clock=lambda: datetime(2026, 9, 12, 21, 0, tzinfo=UTC),
         )
     )
-    removed.post("/api/refresh")
+    for _ in range(2):
+        refresh = removed.post("/api/refresh").json()["refresh"]
+        assert refresh["status"] == "partial"
+        outcomes = {item["provider"]: item for item in refresh["provider_outcomes"]}
+        assert outcomes["Schwab"]["stale_accounts"] == 1
+        assert outcomes["Schwab"]["accounts_refreshed"] == 0
+        assert outcomes["Schwab"]["warning"] is not None
+        assert outcomes["Fidelity"]["accounts_refreshed"] == 1
+
+    overview = removed.get("/api/overview").json()["overview"]
+    coverage = {item["provider"]: item for item in overview["provider_coverage"]}
+    assert coverage["Schwab"]["status"] == "stale"
+    assert coverage["Schwab"]["stale_accounts"] == 1
+    assert coverage["Fidelity"]["status"] == "fresh"
+    assert overview["total_known_usd_value"] == "5199.98"
+    removed_account = next(
+        account
+        for account in overview["accounts"]
+        if account["account_id"] == "schwab-taxable-demo"
+    )
+    assert removed_account["is_stale"] is True
+    assert removed_account["percentage_of_total"] is None
 
     status = removed.get("/api/trading/status").json()
     assert [item["account_id"] for item in status["accounts"]] == ["fidelity-roth-demo"]
     assert (
         removed.get("/api/accounts/schwab-taxable-demo/capabilities").status_code == 404
     )
+
+
+def test_returned_account_keeps_stale_capability_visible_until_recovery(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'capability-return.db'}"
+    now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+
+    def client(provider: FixturePortfolioProvider) -> TestClient:
+        return TestClient(
+            create_app(provider, database_url=database_url, clock=lambda: now)
+        )
+
+    healthy = client(FixturePortfolioProvider())
+    healthy.post("/api/refresh")
+    removed = client(RemovedAccountFixtureProvider())
+    removed.post("/api/refresh")
+    assert (
+        removed.get("/api/accounts/schwab-taxable-demo/capabilities").status_code == 404
+    )
+
+    returned = client(IncompleteCapabilityFixtureProvider())
+    returned.post("/api/refresh")
+    accounts = returned.get("/api/accounts").json()["accounts"]
+    account = next(
+        account for account in accounts if account["id"] == "schwab-taxable-demo"
+    )
+    assert account["is_stale"] is False
+    response = returned.get("/api/accounts/schwab-taxable-demo/capabilities")
+    assert response.status_code == 200
+    capability = response.json()["capability"]
+    assert capability["is_stale"] is True
+    assert capability["is_trade_capable"] is False
+    status = returned.get("/api/trading/status").json()
+    assert {account["account_id"] for account in status["accounts"]} == {
+        "schwab-taxable-demo",
+        "fidelity-roth-demo",
+    }
+    assert all(not account["is_trade_capable"] for account in status["accounts"])
+
+    healthy.post("/api/refresh")
+    recovered = healthy.get("/api/accounts/schwab-taxable-demo/capabilities").json()[
+        "capability"
+    ]
+    assert recovered["is_stale"] is False
+    assert recovered["is_trade_capable"] is True
 
 
 def test_partial_refresh_stales_existing_capability_and_auth_has_safe_recovery(
@@ -502,7 +571,7 @@ def test_account_detail_uses_persisted_account_metadata_and_holdings(tmp_path) -
 
 def test_account_detail_preserves_empty_and_unavailable_values(tmp_path) -> None:
     database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
-    repository = PortfolioRepository(database_url)
+    database = Database(database_url)
     refreshed_at = datetime(2020, 1, 2, tzinfo=UTC)
     empty_account = Account(
         id="empty-account",
@@ -518,7 +587,8 @@ def test_account_detail_preserves_empty_and_unavailable_values(tmp_path) -> None
         account_type="roth_ira",
         currency="USD",
     )
-    repository.save_refresh(
+    save_refresh(
+        database,
         [
             HoldingsSnapshot(
                 account=empty_account,
@@ -582,8 +652,8 @@ def test_refresh_replaces_the_same_new_york_daily_snapshot(tmp_path) -> None:
     client.post("/api/refresh")
     client.post("/api/refresh")
 
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    values = repository.daily_values("schwab-taxable-demo")
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    values = daily_values(database, "schwab-taxable-demo")
     assert values is not None
     assert len(values) == 1
     assert values[0].value == Decimal("4799.97")
@@ -605,8 +675,8 @@ def test_refresh_does_not_fabricate_missing_new_york_daily_snapshots(tmp_path) -
     client.post("/api/refresh")
     client.post("/api/refresh")
 
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    values = repository.daily_values("schwab-taxable-demo")
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    values = daily_values(database, "schwab-taxable-demo")
 
     assert values is not None
     assert [value.snapshot_date for value in values] == [
@@ -617,7 +687,7 @@ def test_refresh_does_not_fabricate_missing_new_york_daily_snapshots(tmp_path) -
 
 def test_database_preserves_high_precision_decimals(tmp_path) -> None:
     database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
-    repository = PortfolioRepository(database_url)
+    database = Database(database_url)
     timestamp = datetime(2026, 9, 12, 14, 0, tzinfo=UTC)
     account = Account(
         id="precise-account",
@@ -627,7 +697,8 @@ def test_database_preserves_high_precision_decimals(tmp_path) -> None:
         currency="USD",
     )
     precise_quantity = Decimal("0.123456789123456789")
-    repository.save_refresh(
+    save_refresh(
+        database,
         [
             HoldingsSnapshot(
                 account=account,
@@ -652,8 +723,8 @@ def test_database_preserves_high_precision_decimals(tmp_path) -> None:
         date(2026, 9, 12),
     )
 
-    reopened_repository = PortfolioRepository(database_url)
-    positions = reopened_repository.list_positions(account.id)
+    reopened_repository = Database(database_url)
+    positions = load_positions(reopened_repository, account.id)
 
     assert positions is not None
     assert positions[0].position.quantity == precise_quantity

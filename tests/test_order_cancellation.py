@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from portfolio_mcp.api import create_app
-from portfolio_mcp.database import CancellationObservation, PortfolioRepository
+from portfolio_mcp.database import Database
 from portfolio_mcp.execution import (
     ExecutionResult,
     FillSummary,
@@ -18,6 +18,11 @@ from portfolio_mcp.execution import (
     OrderState,
 )
 from portfolio_mcp.fixtures import FixturePortfolioProvider
+from portfolio_mcp.order_cancellation_store import (
+    CancellationObservation,
+    begin_order_cancellation,
+    finish_order_cancellation,
+)
 from portfolio_mcp.trading_service import allow_fixture_submission
 
 
@@ -85,12 +90,10 @@ def test_order_read_model_exposes_can_cancel_and_blocking_reason(tmp_path) -> No
     client = _client(tmp_path, execution)
     order = _submit_order(client)
 
-    # An open accepted order with broker ID is cancelable
     assert order["state"] == "ACCEPTED"
     assert order["can_cancel"] is True
     assert order["blocking_reason"] is None
 
-    # Cancel the order
     cancel_response = client.post(
         f"/api/orders/{order['id']}/cancel/confirm",
         json={
@@ -122,7 +125,6 @@ def test_cancellation_requires_explicit_confirmation(tmp_path) -> None:
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "confirmation_required"
 
-    # Provider cancel was never called
     assert not any(action == "cancel" for action, _ in execution.invocations)
 
 
@@ -131,7 +133,6 @@ def test_cancellation_rejects_noncancelable_or_stale_version_orders(tmp_path) ->
     client = _client(tmp_path, execution)
     order = _submit_order(client)
 
-    # Stale version returns 409
     response = client.post(
         f"/api/orders/{order['id']}/cancel/confirm",
         json={
@@ -143,7 +144,6 @@ def test_cancellation_rejects_noncancelable_or_stale_version_orders(tmp_path) ->
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "order_conflict"
 
-    # Nonexistent order returns 404
     missing_response = client.post(
         "/api/orders/non-existent-order-id/cancel/confirm",
         json={
@@ -161,7 +161,6 @@ def test_cancellation_allowed_under_kill_switch(tmp_path) -> None:
     client = _client(tmp_path, execution)
     order = _submit_order(client)
 
-    # Activate kill switch
     settings = client.put(
         "/api/trading/settings",
         json={
@@ -174,7 +173,6 @@ def test_cancellation_allowed_under_kill_switch(tmp_path) -> None:
     )
     assert settings.status_code == 200
 
-    # Cancellation MUST still succeed
     response = client.post(
         f"/api/orders/{order['id']}/cancel/confirm",
         json={
@@ -213,7 +211,6 @@ def test_cancellation_records_authorization_and_audit_events(tmp_path) -> None:
     assert "cancellation_requested" in event_types
     assert "cancellation_result" in event_types
 
-    # Find the cancellation events
     events = audit_response.json()["events"]
     req_event = next(e for e in events if e["type"] == "cancellation_requested")
     res_event = next(e for e in events if e["type"] == "cancellation_result")
@@ -230,7 +227,6 @@ def test_cancellation_concurrency_and_replay_calls_provider_at_most_once(
     client = _client(tmp_path, execution)
     order = _submit_order(client)
 
-    # First cancel
     res1 = client.post(
         f"/api/orders/{order['id']}/cancel/confirm",
         json={
@@ -242,7 +238,6 @@ def test_cancellation_concurrency_and_replay_calls_provider_at_most_once(
     assert res1.status_code == 200
     assert res1.json()["order"]["state"] == "CANCELED"
 
-    # Replay of the exact same request
     res2 = client.post(
         f"/api/orders/{order['id']}/cancel/confirm",
         json={
@@ -254,7 +249,6 @@ def test_cancellation_concurrency_and_replay_calls_provider_at_most_once(
     assert res2.status_code == 200
     assert res2.json()["order"]["state"] == "CANCELED"
 
-    # Verify provider was called at most once
     cancel_calls = [inv for inv in execution.invocations if inv[0] == "cancel"]
     assert len(cancel_calls) == 1
 
@@ -274,11 +268,9 @@ def test_cancellation_provider_rejection_retains_prior_state(tmp_path) -> None:
     )
     assert response.status_code == 200
     updated_order = response.json()["order"]
-    # Retains prior ACCEPTED state
     assert updated_order["state"] == "ACCEPTED"
     assert updated_order["can_cancel"] is True
 
-    # Audit records refused outcome
     audit_response = client.get(f"/api/order-audit?order_id={order['id']}")
     res_event = next(
         e for e in audit_response.json()["events"] if e["type"] == "cancellation_result"
@@ -306,11 +298,9 @@ def test_cancellation_unknown_enters_reconciliation_without_automatic_retry(
     assert unknown_order["state"] == "UNKNOWN"
     assert unknown_order["can_cancel"] is False
 
-    # Provider was called once, no auto-retry
     cancel_calls = [inv for inv in execution.invocations if inv[0] == "cancel"]
     assert len(cancel_calls) == 1
 
-    # Audit records unknown outcome
     audit_response = client.get(f"/api/order-audit?order_id={order['id']}")
     res_event = next(
         e for e in audit_response.json()["events"] if e["type"] == "cancellation_result"
@@ -323,13 +313,11 @@ def test_cancellation_partially_filled_order_preserves_fills(tmp_path) -> None:
     client = _client(tmp_path, execution)
     order = _submit_order(client)
 
-    # Order is partially filled
     assert order["state"] == "PARTIALLY_FILLED"
     fill = cast(dict[str, object], order["fill"])
     assert fill["quantity"] == "0.5"
     assert order["can_cancel"] is True
 
-    # Cancel the remaining 0.5 shares
     response = client.post(
         f"/api/orders/{order['id']}/cancel/confirm",
         json={
@@ -341,7 +329,6 @@ def test_cancellation_partially_filled_order_preserves_fills(tmp_path) -> None:
     assert response.status_code == 200
     canceled_order = response.json()["order"]
     assert canceled_order["state"] == "CANCELED"
-    # Preserves filled quantity
     canceled_fill = cast(dict[str, object], canceled_order["fill"])
     assert canceled_fill["quantity"] == "0.5"
     assert canceled_fill["average_price"] == "100"
@@ -554,7 +541,6 @@ def test_cancellation_bad_or_regressing_fill_commits_unknown_and_preserves_prior
     res_order = response.json()["order"]
     assert res_order["state"] == "UNKNOWN"
     assert res_order["can_cancel"] is False
-    # Preserves prior valid fill
     assert res_order["fill"]["quantity"] == "0.5"
 
 
@@ -596,9 +582,10 @@ def test_cancellation_late_obsolete_attempt_rejected(tmp_path) -> None:
     order_id = cast(str, order["id"])
     version = cast(int, order["version"])
     state = OrderState(cast(str, order["state"]))
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'cancellation.db'}")
+    database = Database(f"sqlite:///{tmp_path / 'cancellation.db'}")
     now = datetime.now(UTC)
-    stored, attempt_id, started = repository.begin_order_cancellation(
+    stored, attempt_id, started = begin_order_cancellation(
+        database,
         order_id,
         expected_version=version,
         expected_state=state,
@@ -608,7 +595,8 @@ def test_cancellation_late_obsolete_attempt_rejected(tmp_path) -> None:
     assert attempt_id is not None
 
     fake_attempt = uuid4()
-    res_obsolete = repository.finish_order_cancellation(
+    res_obsolete = finish_order_cancellation(
+        database,
         order_id,
         attempt_id=fake_attempt,
         observation=CancellationObservation(kind="canceled"),
@@ -616,7 +604,8 @@ def test_cancellation_late_obsolete_attempt_rejected(tmp_path) -> None:
     )
     assert res_obsolete.state == OrderState.CANCEL_PENDING
 
-    res_legit = repository.finish_order_cancellation(
+    res_legit = finish_order_cancellation(
+        database,
         order_id,
         attempt_id=attempt_id,
         observation=CancellationObservation(kind="canceled"),
@@ -632,10 +621,11 @@ def test_repository_begin_order_cancellation_claim_race_safety(tmp_path) -> None
     order_id = cast(str, order["id"])
     version = cast(int, order["version"])
     state = OrderState(cast(str, order["state"]))
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'cancellation.db'}")
+    database = Database(f"sqlite:///{tmp_path / 'cancellation.db'}")
     now = datetime.now(UTC)
 
-    stored1, attempt1, started1 = repository.begin_order_cancellation(
+    stored1, attempt1, started1 = begin_order_cancellation(
+        database,
         order_id,
         expected_version=version,
         expected_state=state,
@@ -645,7 +635,8 @@ def test_repository_begin_order_cancellation_claim_race_safety(tmp_path) -> None
     assert stored1.state == OrderState.CANCEL_PENDING
     assert attempt1 is not None
 
-    stored2, attempt2, started2 = repository.begin_order_cancellation(
+    stored2, attempt2, started2 = begin_order_cancellation(
+        database,
         order_id,
         expected_version=stored1.version,
         expected_state=OrderState.CANCEL_PENDING,
