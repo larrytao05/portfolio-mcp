@@ -9,6 +9,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
+import { ApiError } from "./api/client";
 import { quoteSourceLabel } from "./lib/portfolioDisplay";
 import type { Position } from "./api/client";
 
@@ -41,11 +42,14 @@ const api = vi.hoisted(() => ({
   refreshOrder: vi.fn(),
 }));
 
-vi.mock("./api/client", () => api);
+vi.mock("./api/client", async (importOriginal) => ({
+  ...api,
+  ApiError: (await importOriginal<typeof import("./api/client")>()).ApiError,
+}));
 
 function renderApp() {
   const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
+    defaultOptions: { queries: { retry: false, retryDelay: 0 } },
   });
   return render(
     <QueryClientProvider client={queryClient}>
@@ -908,10 +912,66 @@ describe("App", () => {
     expect(
       await screen.findByText(/Instrument search is unavailable\./),
     ).toBeTruthy();
+    expect(screen.queryByText("provider failure")).toBeNull();
     api.searchInstruments.mockResolvedValue({ instruments: [] });
     fireEvent.click(screen.getByRole("button", { name: "Search" }));
     expect(await screen.findByText(/No instruments found\./)).toBeTruthy();
+    expect(api.searchInstruments).toHaveBeenCalledTimes(5);
+  });
+
+  it("shows a provider search error and allows a manual retry", async () => {
+    api.searchInstruments.mockRejectedValueOnce(
+      new ApiError(503, "Repair backend certificate trust.", "provider_tls_verification_failed"),
+    );
+    renderApp();
+
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    expect((await screen.findByText("Repair backend certificate trust.")).getAttribute("role")).toBe("alert");
+    expect(api.searchInstruments).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    expect(await screen.findByText(/No instruments found\./)).toBeTruthy();
     expect(api.searchInstruments).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows a provider quote error and allows selecting the same instrument again", async () => {
+    api.searchInstruments.mockResolvedValue({
+      instruments: [{
+        id: "us-etf:VTI", symbol: "VTI", name: "Vanguard Total Stock Market ETF",
+        asset_class: "equity_etf", exchange: null, currency: "USD",
+      }],
+    });
+    api.getQuote.mockRejectedValueOnce(
+      new ApiError(503, "Repair backend certificate trust.", "provider_tls_verification_failed"),
+    );
+    renderApp();
+
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    const instrument = await screen.findByRole("button", { name: /VTI.*Vanguard Total Stock Market ETF/ });
+    fireEvent.click(instrument);
+    expect((await screen.findByText("Repair backend certificate trust.")).getAttribute("role")).toBe("alert");
+    expect(api.getQuote).toHaveBeenCalledTimes(1);
+
+    api.getQuote.mockResolvedValue({ quote: null });
+    fireEvent.click(instrument);
+    await waitFor(() => expect(api.getQuote).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByText("Repair backend certificate trust.")).toBeNull());
+  });
+
+  it("shows the trade search error and allows a manual retry", async () => {
+    api.searchInstruments.mockRejectedValueOnce(
+      new ApiError(401, "Reauthorize the Schwab account.", "schwab_reauthorization_required"),
+    );
+    renderApp();
+
+    fireEvent.change(screen.getByLabelText("Trade instrument search"), { target: { value: "VTI" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search trade instruments" }));
+    expect((await screen.findByText("Reauthorize the Schwab account.")).getAttribute("role")).toBe("alert");
+    expect(api.searchInstruments).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Search trade instruments" }));
+    await waitFor(() => expect(api.searchInstruments).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByText("Reauthorize the Schwab account.")).toBeNull());
   });
 
   it("renders fresh overview with total known USD value, asset class, security type, account contributions, cash, and gain/loss", async () => {
