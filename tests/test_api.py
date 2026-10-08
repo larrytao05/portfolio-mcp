@@ -9,7 +9,11 @@ from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioPr
 from portfolio_mcp.models import Account, HoldingsSnapshot, Instrument, Position
 from portfolio_mcp.portfolio_store import daily_values, save_refresh
 from portfolio_mcp.portfolio_store import list_positions as load_positions
-from portfolio_mcp.provider import ProviderAuthenticationError, ProviderUnavailableError
+from portfolio_mcp.provider import (
+    ProviderAuthenticationError,
+    ProviderTLSVerificationError,
+    ProviderUnavailableError,
+)
 
 
 class FailingFixtureProvider(FixturePortfolioProvider):
@@ -51,6 +55,11 @@ class RemovedAccountFixtureProvider(FixturePortfolioProvider):
 class FailingMarketDataProvider(FixtureMarketDataProvider):
     async def search_instruments(self, query: str) -> list[Instrument]:
         raise ProviderUnavailableError("Market data provider is unavailable")
+
+
+class TLSFailingMarketDataProvider(FixtureMarketDataProvider):
+    async def get_quote(self, instrument_id: str):
+        raise ProviderTLSVerificationError()
 
 
 def create_client(tmp_path, clock=None) -> TestClient:
@@ -903,10 +912,33 @@ def test_market_data_provider_failure_has_a_safe_api_response(tmp_path) -> None:
 
     response = client.get("/api/instruments/search", params={"query": "VTI"})
 
-    assert response.status_code == 502
+    assert response.status_code == 503
     assert response.json() == {
         "error": {
-            "code": "provider_error",
+            "code": "provider_unavailable",
             "message": "Market data provider is unavailable",
+        }
+    }
+
+
+def test_tls_failure_keeps_its_safe_code_in_api_response(tmp_path) -> None:
+    client = TestClient(
+        create_app(
+            FixturePortfolioProvider(),
+            market_data_provider=TLSFailingMarketDataProvider(),
+            database_url=f"sqlite:///{tmp_path / 'portfolio.db'}",
+        )
+    )
+
+    response = client.get("/api/instruments/us-equity%3AVTI/quote")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": {
+            "code": "provider_tls_verification_failed",
+            "message": (
+                "Schwab certificate verification failed; "
+                "repair backend certificate trust"
+            ),
         }
     }

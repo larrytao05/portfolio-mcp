@@ -3,8 +3,12 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 from portfolio_mcp.config import SchwabSettings
+from portfolio_mcp.provider import (
+    ProviderConfigurationError,
+    SchwabReauthorizationRequiredError,
+)
 from portfolio_mcp.schwab_market_data import SchwabMarketDataProvider
-from portfolio_mcp.schwab_oauth import run_authorization
+from portfolio_mcp.schwab_oauth import main, run_authorization
 
 
 class RecordingHttpClient:
@@ -86,3 +90,57 @@ async def test_authorization_cli_prints_a_new_refresh_token_without_writing_file
 
     assert output[0].startswith("Open this URL in a browser: https://")
     assert output[-1] == "SCHWAB_REFRESH_TOKEN=new-token"
+
+
+def test_authorization_cli_reports_safe_provider_error(
+    monkeypatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import portfolio_mcp.schwab_oauth as oauth_module
+
+    monkeypatch.setattr(
+        SchwabSettings,
+        "from_environment",
+        classmethod(
+            lambda cls: SchwabSettings(
+                client_id="test-id",
+                client_secret="test-secret",
+                refresh_token="test-refresh",
+            )
+        ),
+    )
+
+    async def reject_authorization(*args, **kwargs) -> None:
+        raise SchwabReauthorizationRequiredError()
+
+    monkeypatch.setattr(oauth_module, "run_authorization", reject_authorization)
+
+    with pytest.raises(SystemExit, match="1"):
+        main()
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "schwab_reauthorization_required" in captured.err
+    assert "Traceback" not in captured.err
+    assert "test-secret" not in captured.err
+    assert "test-refresh" not in captured.err
+
+
+def test_authorization_cli_reports_safe_configuration_error(
+    monkeypatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def missing_settings(cls):
+        raise ProviderConfigurationError("SCHWAB_CLIENT_ID is required")
+
+    monkeypatch.setattr(
+        SchwabSettings,
+        "from_environment",
+        classmethod(missing_settings),
+    )
+
+    with pytest.raises(SystemExit, match="1"):
+        main()
+
+    captured = capsys.readouterr()
+    assert "provider_configuration_error" in captured.err
+    assert "SCHWAB_CLIENT_ID is required" in captured.err
+    assert "Traceback" not in captured.err

@@ -20,6 +20,8 @@ from portfolio_mcp.portfolio_store import stored_account as load_stored_account
 from portfolio_mcp.provider import (
     ProviderAuthenticationError,
     ProviderAuthorizationError,
+    ProviderConfigurationError,
+    ProviderError,
     ProviderResponseError,
     ProviderUnavailableError,
 )
@@ -48,6 +50,16 @@ class SchwabReadinessState(StrEnum):
     UNMAPPED = "unmapped"
     ACCOUNT_UNAVAILABLE = "account_unavailable"
     UNSUPPORTED_ACCOUNT = "unsupported_account"
+
+
+def _provider_failure_state(error: ProviderError) -> SchwabReadinessState:
+    if isinstance(error, ProviderConfigurationError):
+        return SchwabReadinessState.NOT_CONFIGURED
+    if isinstance(error, ProviderAuthenticationError):
+        return SchwabReadinessState.AUTH_FAILED
+    if isinstance(error, ProviderAuthorizationError):
+        return SchwabReadinessState.NOT_ENTITLED
+    return SchwabReadinessState.ACCOUNT_UNAVAILABLE
 
 
 @dataclass(frozen=True)
@@ -297,10 +309,8 @@ class SchwabReadinessService:
         assert self._transport is not None
         try:
             await self._transport.access_token()
-        except ProviderAuthenticationError:
-            return blocked(
-                SchwabReadinessState.AUTH_FAILED, "Schwab authentication failed"
-            )
+        except ProviderError as error:
+            return blocked(_provider_failure_state(error), str(error))
         except Exception:
             return blocked(
                 SchwabReadinessState.ACCOUNT_UNAVAILABLE,
@@ -312,15 +322,8 @@ class SchwabReadinessService:
                 "GET", f"{self._trader_api_url}/accounts/accountNumbers"
             )
             raise_for_status(status, context="Schwab Trader API")
-        except ProviderAuthorizationError:
-            return blocked(
-                SchwabReadinessState.NOT_ENTITLED,
-                "Schwab Accounts and Trading product is not authorized or entitled",
-            )
-        except ProviderAuthenticationError:
-            return blocked(
-                SchwabReadinessState.AUTH_FAILED, "Schwab authentication failed"
-            )
+        except ProviderError as error:
+            return blocked(_provider_failure_state(error), str(error))
         except Exception:
             return blocked(
                 SchwabReadinessState.ACCOUNT_UNAVAILABLE,
@@ -357,11 +360,8 @@ class SchwabReadinessService:
                     "Schwab account detail returned 404 Not Found",
                 )
             raise_for_status(status, context="Schwab Trader API")
-        except ProviderAuthorizationError:
-            return blocked(
-                SchwabReadinessState.NOT_ENTITLED,
-                "Schwab account detail access is not authorized",
-            )
+        except ProviderError as error:
+            return blocked(_provider_failure_state(error), str(error))
         except Exception:
             return blocked(
                 SchwabReadinessState.ACCOUNT_UNAVAILABLE,
