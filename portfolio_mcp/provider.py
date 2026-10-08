@@ -1,5 +1,5 @@
 from datetime import date
-from typing import Protocol, runtime_checkable
+from typing import ClassVar, Protocol, runtime_checkable
 
 from portfolio_mcp.models import (
     Account,
@@ -14,39 +14,86 @@ from portfolio_mcp.models import (
 class ProviderError(ValueError):
     """A client-safe provider failure that never includes secrets or raw payloads."""
 
-    pass
+    code: ClassVar[str] = "provider_error"
 
 
 class ProviderConfigurationError(ProviderError):
-    pass
+    code: ClassVar[str] = "provider_configuration_error"
 
 
 class ProviderAuthenticationError(ProviderError):
-    pass
+    code: ClassVar[str] = "provider_authentication_failed"
 
 
 class ProviderAuthorizationError(ProviderError):
-    pass
+    code: ClassVar[str] = "provider_authorization_failed"
 
 
 class ProviderRateLimitError(ProviderError):
-    pass
+    code: ClassVar[str] = "provider_rate_limited"
 
 
 class ProviderUnavailableError(ProviderError):
-    pass
+    code: ClassVar[str] = "provider_unavailable"
 
 
 class ProviderResponseError(ProviderError):
-    pass
+    code: ClassVar[str] = "provider_response_error"
+
+
+class ProviderTLSVerificationError(ProviderUnavailableError):
+    code: ClassVar[str] = "provider_tls_verification_failed"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Schwab certificate verification failed; repair backend certificate trust"
+        )
+
+
+class ProviderTLSConfigurationError(ProviderConfigurationError):
+    code: ClassVar[str] = "provider_tls_configuration_error"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Schwab certificate trust configuration is invalid; "
+            "repair the configured trust source"
+        )
+
+
+class SchwabReauthorizationRequiredError(ProviderAuthenticationError):
+    code: ClassVar[str] = "schwab_reauthorization_required"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Schwab rejected the refresh grant; "
+            "reauthorize through the Schwab OAuth helper"
+        )
+
+
+class SchwabAuthorizationCodeRejectedError(ProviderAuthenticationError):
+    code: ClassVar[str] = "schwab_authorization_code_rejected"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Schwab rejected the authorization code; start a new authorization flow"
+        )
+
+
+class SchwabClientAuthenticationError(ProviderAuthenticationError):
+    code: ClassVar[str] = "schwab_client_authentication_failed"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Schwab rejected client authentication; check the app configuration"
+        )
 
 
 class AccountNotFoundError(ProviderError):
-    pass
+    code: ClassVar[str] = "account_not_found"
 
 
 class InstrumentNotFoundError(ProviderError):
-    pass
+    code: ClassVar[str] = "instrument_not_found"
 
 
 class PortfolioProvider(Protocol):
