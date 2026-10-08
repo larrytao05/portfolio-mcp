@@ -11,10 +11,13 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from portfolio_mcp.database import Database
 from portfolio_mcp.execution import OrderState
-from portfolio_mcp.fixtures import FixturePortfolioProvider
+from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
 from portfolio_mcp.order_history import OrderStatusSource
 from portfolio_mcp.order_query_store import list_orders as query_orders
-from portfolio_mcp.provider import AccountNotFoundError
+from portfolio_mcp.provider import (
+    AccountNotFoundError,
+    ProviderTLSVerificationError,
+)
 from portfolio_mcp.refresh import PortfolioRefreshService
 from portfolio_mcp.schema import OrderDraftRecord, OrderRecord
 from portfolio_mcp.server import create_server
@@ -181,6 +184,22 @@ async def test_search_instruments_tool(tmp_path) -> None:
     assert isinstance(data, dict)
     assert "instruments" in data
     assert any(inst["symbol"] == "VTI" for inst in data["instruments"])
+
+
+@pytest.mark.asyncio
+async def test_search_instruments_preserves_safe_provider_error(tmp_path) -> None:
+    class TLSFailingMarketDataProvider(FixtureMarketDataProvider):
+        async def search_instruments(self, query: str):
+            raise ProviderTLSVerificationError()
+
+    server = create_server(
+        FixturePortfolioProvider(),
+        market_data_provider=TLSFailingMarketDataProvider(),
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+    )
+
+    with pytest.raises(ToolError, match="provider_tls_verification_failed"):
+        await server.call_tool("search_instruments", {"query": "VTI"})
 
 
 @pytest.mark.asyncio

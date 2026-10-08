@@ -3,6 +3,7 @@ import sys
 from collections.abc import Callable, Sequence
 
 from portfolio_mcp.config import SchwabSettings
+from portfolio_mcp.provider import ProviderError
 from portfolio_mcp.schwab_market_data import SchwabMarketDataProvider
 
 
@@ -24,14 +25,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     if argv:
         raise SystemExit("This command does not accept arguments")
 
-    provider = SchwabMarketDataProvider(SchwabSettings.from_environment())
-    asyncio.run(
-        run_authorization(
-            provider,
-            read_redirect_url=lambda: input("Paste the full redirect URL: "),
-            write=print,
+    try:
+        provider = SchwabMarketDataProvider(SchwabSettings.from_environment())
+        asyncio.run(
+            run_authorization(
+                provider,
+                read_redirect_url=lambda: input("Paste the full redirect URL: "),
+                write=print,
+            )
         )
-    )
+    except ProviderError as error:
+        print(f"{error.code}: {error}", file=sys.stderr)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

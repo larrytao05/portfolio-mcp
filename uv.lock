@@ -954,6 +954,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "alembic" },
+    { name = "certifi" },
     { name = "fastapi" },
     { name = "mcp", extra = ["cli"] },
     { name = "snaptrade-python-sdk" },
@@ -973,6 +974,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "alembic", specifier = ">=1.14.0" },
+    { name = "certifi", specifier = ">=2025.1.31" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "mcp", extras = ["cli"], specifier = ">=2.1.1" },
     { name = "snaptrade-python-sdk", specifier = ">=13.0.13" },

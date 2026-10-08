@@ -1,12 +1,18 @@
 import asyncio
 import base64
 import json
+import os
+import re
+import ssl
 import time
 from collections.abc import Mapping
-from typing import Protocol
+from pathlib import Path
+from typing import Literal, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
+
+import certifi
 
 from portfolio_mcp.config import SchwabSettings
 from portfolio_mcp.provider import (
@@ -14,8 +20,102 @@ from portfolio_mcp.provider import (
     ProviderAuthorizationError,
     ProviderRateLimitError,
     ProviderResponseError,
+    ProviderTLSConfigurationError,
+    ProviderTLSVerificationError,
     ProviderUnavailableError,
+    SchwabAuthorizationCodeRejectedError,
+    SchwabClientAuthenticationError,
+    SchwabReauthorizationRequiredError,
 )
+
+_GrantType = Literal["refresh_token", "authorization_code"]
+
+
+def _validate_explicit_trust_paths() -> tuple[list[Path], list[Path]]:
+    certificate_files: list[Path] = []
+    certificate_directories: list[Path] = []
+
+    if "SSL_CERT_FILE" in os.environ:
+        raw_file = os.environ["SSL_CERT_FILE"]
+        if not raw_file:
+            raise ProviderTLSConfigurationError()
+        certificate_file = Path(raw_file)
+        try:
+            if not certificate_file.is_file():
+                raise ProviderTLSConfigurationError()
+            with certificate_file.open("rb") as source:
+                if not source.read(1):
+                    raise ProviderTLSConfigurationError()
+        except OSError:
+            raise ProviderTLSConfigurationError() from None
+        certificate_files.append(certificate_file)
+
+    if "SSL_CERT_DIR" in os.environ:
+        raw_directories = os.environ["SSL_CERT_DIR"]
+        if not raw_directories:
+            raise ProviderTLSConfigurationError()
+        for raw_directory in raw_directories.split(os.pathsep):
+            if not raw_directory:
+                raise ProviderTLSConfigurationError()
+            certificate_directory = Path(raw_directory)
+            try:
+                if not certificate_directory.is_dir():
+                    raise ProviderTLSConfigurationError()
+                with os.scandir(certificate_directory) as entries:
+                    if not any(
+                        entry.is_file()
+                        and re.fullmatch(r"[0-9a-fA-F]{8}\.\d+", entry.name)
+                        for entry in entries
+                    ):
+                        raise ProviderTLSConfigurationError()
+            except OSError:
+                raise ProviderTLSConfigurationError() from None
+            certificate_directories.append(certificate_directory)
+
+    return certificate_files, certificate_directories
+
+
+def _schwab_ssl_context() -> ssl.SSLContext:
+    try:
+        certificate_files, certificate_directories = _validate_explicit_trust_paths()
+        context = ssl.create_default_context()
+        for certificate_file in certificate_files:
+            context.load_verify_locations(cafile=str(certificate_file))
+        for certificate_directory in certificate_directories:
+            context.load_verify_locations(capath=str(certificate_directory))
+        context.load_verify_locations(cafile=certifi.where())
+        if not context.check_hostname or context.verify_mode != ssl.CERT_REQUIRED:
+            raise ProviderTLSConfigurationError()
+        return context
+    except ProviderTLSConfigurationError:
+        raise
+    except (OSError, ssl.SSLError, ValueError):
+        raise ProviderTLSConfigurationError() from None
+
+
+def _raise_token_error(
+    status: int, response: object, grant_type: _GrantType, context: str
+) -> None:
+    if 200 <= status < 300:
+        return
+    if status == 429 or status <= 0 or status >= 500 or status == 403:
+        raise_for_status(status, context)
+
+    oauth_error = response.get("error") if isinstance(response, Mapping) else None
+    if not isinstance(oauth_error, str):
+        oauth_error = None
+
+    if oauth_error == "invalid_client" and status in (400, 401):
+        raise SchwabClientAuthenticationError()
+    if oauth_error == "invalid_grant" and status == 400:
+        if grant_type == "refresh_token":
+            raise SchwabReauthorizationRequiredError()
+        raise SchwabAuthorizationCodeRejectedError()
+    if status == 401:
+        raise ProviderAuthenticationError("Unable to authenticate with Schwab")
+    if status == 400:
+        raise ProviderResponseError(f"{context} rejected the token request")
+    raise_for_status(status, context)
 
 
 class SchwabHttpClient(Protocol):
@@ -38,6 +138,7 @@ def decode_body(body: bytes) -> object:
 class UrllibSchwabHttpClient:
     def __init__(self, context: str = "Schwab") -> None:
         self._context = context
+        self._ssl_context: ssl.SSLContext | None = None
 
     def request(
         self,
@@ -48,11 +149,17 @@ class UrllibSchwabHttpClient:
     ) -> tuple[int, object]:
         request = Request(url, data=body, headers=headers, method=method)
         try:
-            with urlopen(request, timeout=15) as response:
+            if self._ssl_context is None:
+                self._ssl_context = _schwab_ssl_context()
+            with urlopen(request, timeout=15, context=self._ssl_context) as response:
                 return response.status, decode_body(response.read())
         except HTTPError as error:
             return error.code, decode_body(error.read())
-        except URLError:
+        except ssl.SSLCertVerificationError:
+            raise ProviderTLSVerificationError() from None
+        except URLError as error:
+            if isinstance(error.reason, ssl.SSLCertVerificationError):
+                raise ProviderTLSVerificationError() from None
             raise ProviderUnavailableError(
                 f"{self._context} is temporarily unavailable"
             ) from None
@@ -147,6 +254,7 @@ class SchwabOAuthTransport:
                 }
             ).encode(),
         )
+        _raise_token_error(status, response, "authorization_code", self._context)
         raise_for_status(status, self._context)
         if not isinstance(response, Mapping) or not response.get("refresh_token"):
             raise ProviderResponseError(
@@ -173,12 +281,7 @@ class SchwabOAuthTransport:
             self.token_headers(),
             body,
         )
-        if status == 400:
-            raise ProviderAuthenticationError(
-                "Refresh token was rejected by Schwab; run "
-                "`uv run --env-file .env python -m portfolio_mcp.schwab_oauth` "
-                "to replace it"
-            )
+        _raise_token_error(status, response, "refresh_token", self._context)
         raise_for_status(status, self._context)
         if not isinstance(response, Mapping) or not response.get("access_token"):
             raise ProviderResponseError(

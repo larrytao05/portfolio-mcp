@@ -22,6 +22,7 @@ import {
 import { OwnerReview } from "../../components/OwnerReview";
 import { capabilityLabel } from "../../lib/capabilityLabel";
 import { quoteSourceLabel } from "../../lib/portfolioDisplay";
+import { readErrorMessage, retryProviderRead } from "../../lib/providerErrors";
 
 export function ExecutionStatus({
   status,
@@ -403,6 +404,7 @@ export function TradeSection({ accounts }: { accounts: Account[] }) {
     queryKey: ["trade-instrument-search", submittedInstrumentQuery],
     queryFn: () => searchInstruments(submittedInstrumentQuery ?? ""),
     enabled: submittedInstrumentQuery !== null,
+    retry: retryProviderRead,
   });
   const confirm = useMutation({
     mutationFn: () =>
@@ -501,6 +503,11 @@ export function TradeSection({ accounts }: { accounts: Account[] }) {
             </label>
             <button onClick={search} type="button">Search trade instruments</button>
           </div>
+          {instruments.isError && (
+            <p className="inline-alert" role="alert">
+              {readErrorMessage(instruments.error, "Instrument search is unavailable. Try the search again.")}
+            </p>
+          )}
           {instruments.data?.instruments.map((instrument) => (
             <button
               key={instrument.id}

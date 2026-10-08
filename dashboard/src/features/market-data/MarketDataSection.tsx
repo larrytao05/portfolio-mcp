@@ -3,6 +3,7 @@ import { useState, type FormEvent } from "react";
 
 import { getQuote, searchInstruments } from "../../api/client";
 import { quoteSourceLabel } from "../../lib/portfolioDisplay";
+import { readErrorMessage, retryProviderRead } from "../../lib/providerErrors";
 
 export function MarketDataSection() {
   const [instrumentQuery, setInstrumentQuery] = useState(""),
@@ -14,11 +15,13 @@ export function MarketDataSection() {
     queryKey: ["instrument-search", submittedQuery],
     queryFn: () => searchInstruments(submittedQuery ?? ""),
     enabled: submittedQuery !== null,
+    retry: retryProviderRead,
   });
   const quote = useQuery({
     queryKey: ["quote", selectedInstrumentId],
     queryFn: () => getQuote(selectedInstrumentId ?? ""),
     enabled: selectedInstrumentId !== null,
+    retry: retryProviderRead,
   });
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -54,8 +57,8 @@ export function MarketDataSection() {
         <p className="state">Searching instruments…</p>
       )}
       {search.isError && (
-        <p className="state state-error">
-          Instrument search is unavailable. Try the search again.
+        <p className="state state-error" role="alert">
+          {readErrorMessage(search.error, "Instrument search is unavailable. Try the search again.")}
         </p>
       )}
       {search.data?.instruments.length === 0 && (
@@ -88,8 +91,8 @@ export function MarketDataSection() {
         <p className="state">Loading quote…</p>
       )}
       {quote.isError && (
-        <p className="state state-error">
-          Quote is unavailable. Select an instrument again to retry.
+        <p className="state state-error" role="alert">
+          {readErrorMessage(quote.error, "Quote is unavailable. Select an instrument again to retry.")}
         </p>
       )}
       {quote.data?.quote && (
