@@ -50,6 +50,20 @@ uv run pyright
 uv run pytest
 ```
 
+For repeatable UI verification, use the project-local
+[verify skill](.agents/skills/verify/SKILL.md). It provides an isolated,
+fixture-only launcher, a read-only readiness check, browser journeys for each
+feature, retained evidence, and cleanup. It does not load brokerage `.env`
+values or use the normal portfolio database.
+
+```sh
+python3 .agents/skills/verify/scripts/verify_dashboard.py start --history
+```
+
+Use the printed dashboard URL and run directory with the skill's doctor,
+browser, and cleanup steps. Local server permissions and browser access are
+required to complete the browser proof; a blocked launch is not a UI pass.
+
 ## Dashboard development
 
 The dashboard frontend lives in `dashboard/` and talks to a local FastAPI API.

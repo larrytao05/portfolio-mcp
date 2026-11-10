@@ -8,7 +8,7 @@ import {
   type AccountDetail,
   type Position,
 } from "../../api/client";
-import { accountTypeLabel, displayValue, isStale } from "../../lib/portfolioDisplay";
+import { accountTypeLabel, compareDecimalValues, displayValue, isStale } from "../../lib/portfolioDisplay";
 import { capabilityLabel } from "../../lib/capabilityLabel";
 
 type SortField =
@@ -35,33 +35,6 @@ const sortFields = [
   "cost_basis",
   "gain_loss",
 ] as const satisfies readonly SortField[];
-function compareDecimalValues(left: string | null, right: string | null) {
-  if (left === right) return 0;
-  if (left === null) return 1;
-  if (right === null) return -1;
-  const leftNegative = left.startsWith("-");
-  const rightNegative = right.startsWith("-");
-  if (leftNegative !== rightNegative) return leftNegative ? -1 : 1;
-  const result = compareUnsignedDecimals(
-    leftNegative ? left.slice(1) : left,
-    rightNegative ? right.slice(1) : right,
-  );
-  return leftNegative ? -result : result;
-}
-function compareUnsignedDecimals(left: string, right: string) {
-  const [leftWhole = "", leftFraction = ""] = left.split(".");
-  const [rightWhole = "", rightFraction = ""] = right.split(".");
-  const normalizedLeft = leftWhole.replace(/^0+/, "") || "0";
-  const normalizedRight = rightWhole.replace(/^0+/, "") || "0";
-  if (normalizedLeft.length !== normalizedRight.length)
-    return normalizedLeft.length - normalizedRight.length;
-  if (normalizedLeft !== normalizedRight)
-    return normalizedLeft.localeCompare(normalizedRight);
-  const precision = Math.max(leftFraction.length, rightFraction.length);
-  return leftFraction
-    .padEnd(precision, "0")
-    .localeCompare(rightFraction.padEnd(precision, "0"));
-}
 function AccountSummary({ account }: { account: AccountDetail }) {
   return (
     <dl className="account-facts">

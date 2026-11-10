@@ -5,6 +5,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -134,6 +135,23 @@ describe("App", () => {
     ).toBeTruthy();
   });
 
+  it("keeps secondary panels collapsed and opens them from navigation, including repeated links", async () => {
+    const { container } = renderApp();
+    await screen.findByRole("heading", { name: "Portfolio Dashboard" });
+    const panels = Array.from(container.querySelectorAll<HTMLDetailsElement>(".workspace-panel"));
+    expect(panels).toHaveLength(4);
+    expect(panels.every((panel) => !panel.open)).toBe(true);
+    const overview = container.querySelector("#overview")!;
+    const positions = container.querySelector("#positions")!;
+    expect(overview.compareDocumentPosition(positions) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    fireEvent.click(screen.getByRole("link", { name: "Accounts" }));
+    expect(panels[0].open).toBe(true);
+    fireEvent.click(screen.getByText("Account details", { selector: "summary" }));
+    expect(panels[0].open).toBe(false);
+    fireEvent.click(screen.getByRole("link", { name: "Accounts" }));
+    expect(panels[0].open).toBe(true);
+  });
+
   it("starts with visibly blocking trading safeguards", async () => {
     renderApp();
 
@@ -210,10 +228,11 @@ describe("App", () => {
   });
 
   it.each([
-    ["UNKNOWN", /Reconciliation is required/],
-    ["PARTIALLY_FILLED", /partially filled the order/],
-    ["FILLED", /filled the order/],
-  ])("reviews and confirms a fake order with %s outcome", async (state, message) => {
+    ["UNKNOWN", /Reconciliation is required/, "schwab_market_data", "Schwab market data"],
+    ["PARTIALLY_FILLED", /partially filled the order/, "fixture_market_data", "Fixture market data"],
+    ["FILLED", /filled the order/, "future_market_data", "Unknown source"],
+    ["FILLED", /filled the order/, null, "Unavailable"],
+  ])("reviews and confirms a fake order with %s outcome", async (state, message, source, sourceLabel) => {
     api.getAccounts.mockResolvedValue({
       accounts: [
         {
@@ -244,7 +263,7 @@ describe("App", () => {
           limit_price: "333.33",
           time_in_force: "day",
         },
-        quote: { observed_at: null, last_price: null, bid_price: null, ask_price: null, source: null },
+        quote: { observed_at: null, last_price: null, bid_price: null, ask_price: null, source },
         safety: {
           estimated_notional: "333.33",
           account_refreshed_at: "2026-09-12T20:00:00Z",
@@ -280,8 +299,8 @@ describe("App", () => {
 
     await waitFor(() =>
       expect(
-        screen.getAllByRole("option", { name: "Schwab Taxable ••••4821" }),
-      ).toHaveLength(2),
+        within(screen.getByLabelText("Trade account")).getAllByRole("option", { name: "Schwab Taxable ••••4821" }),
+      ).toHaveLength(1),
     );
     fireEvent.change(await screen.findByLabelText("Trade account"), {
       target: { value: "schwab-taxable-demo" },
@@ -301,6 +320,8 @@ describe("App", () => {
     expect(screen.getByText("Canonical instrument ID")).toBeTruthy();
     expect(screen.getByText("us-etf:VTI")).toBeTruthy();
     expect(screen.getByText("Time in force")).toBeTruthy();
+    expect(screen.getByText(sourceLabel, { selector: "dd" })).toBeTruthy();
+    if (source) expect(screen.queryByText(source)).toBeNull();
     expect(screen.getByText(/Fake execution provider/)).toBeTruthy();
     expect(screen.getByText(/preview_unavailable/)).toBeTruthy();
     expect(screen.getByText("Estimated notional")).toBeTruthy();
@@ -331,7 +352,7 @@ describe("App", () => {
     });
     renderApp();
 
-    await waitFor(() => expect(screen.getAllByRole("option", { name: "Schwab Taxable ••••4821" })).toHaveLength(2));
+    await waitFor(() => expect(within(screen.getByLabelText("Trade account")).getAllByRole("option", { name: "Schwab Taxable ••••4821" })).toHaveLength(1));
     fireEvent.change(screen.getByLabelText("Trade account"), { target: { value: "schwab-taxable-demo" } });
     fireEvent.change(screen.getByLabelText("Trade instrument search"), { target: { value: "VTI" } });
     fireEvent.click(screen.getByRole("button", { name: "Search trade instruments" }));
@@ -407,19 +428,21 @@ describe("App", () => {
       )
       .mockRejectedValueOnce(new Error("unavailable"));
     renderApp();
+    fireEvent.click(screen.getByText("Account details", { selector: "summary" }));
+    const accountScreen = within(screen.getByRole("region", { name: "Accounts" }));
 
     expect(
-      await screen.findByText(/Vanguard Total Stock Market ETF/),
+      await accountScreen.findByText(/Vanguard Total Stock Market ETF/),
     ).toBeTruthy();
     fireEvent.click(
       await screen.findByRole("button", { name: "Refresh portfolio" }),
     );
 
     expect(
-      await screen.findByText(/Saved account details are unavailable/),
+      await accountScreen.findByText(/Saved account details are unavailable/),
     ).toBeTruthy();
     expect(
-      screen.getByText(/Vanguard Total Stock Market ETF/),
+      accountScreen.getByText(/Vanguard Total Stock Market ETF/),
     ).toBeTruthy();
   });
 
@@ -539,20 +562,22 @@ describe("App", () => {
     });
 
     renderApp();
+    fireEvent.click(screen.getByText("Account details", { selector: "summary" }));
+    const accountScreen = within(screen.getByRole("region", { name: "Accounts" }));
 
     expect(
-      await screen.findByText("Schwab Taxable ••••4821", {
+      await accountScreen.findByText("Schwab Taxable ••••4821", {
         selector: "strong",
       }),
     ).toBeTruthy();
-    expect(await screen.findByText(/9.123456789123456789/)).toBeTruthy();
-    expect(screen.getAllByText("Unavailable")).toHaveLength(4);
-    fireEvent.change(screen.getByLabelText("Filter holdings"), {
+    expect(await accountScreen.findByText(/9.123456789123456789/)).toBeTruthy();
+    expect(accountScreen.getAllByText("Unavailable")).toHaveLength(4);
+    fireEvent.change(accountScreen.getByLabelText("Filter holdings"), {
       target: { value: "VTI" },
     });
-    expect(screen.queryByText("MISSING", { selector: "strong" })).toBeNull();
-    expect(screen.getByText("VTI", { selector: "strong" })).toBeTruthy();
-    expect(screen.getByText(/Vanguard Total Stock Market ETF/)).toBeTruthy();
+    expect(accountScreen.queryByText("MISSING", { selector: "strong" })).toBeNull();
+    expect(accountScreen.getByText("VTI", { selector: "strong" })).toBeTruthy();
+    expect(accountScreen.getByText(/Vanguard Total Stock Market ETF/)).toBeTruthy();
   });
 
   it("shows an empty account and marks stale saved data", async () => {
@@ -633,12 +658,14 @@ describe("App", () => {
     );
 
     renderApp();
+    fireEvent.click(screen.getByText("Account details", { selector: "summary" }));
+    const accountScreen = within(screen.getByRole("region", { name: "Accounts" }));
 
     fireEvent.click(
-      await screen.findByRole("button", { name: "Sort by Quantity" }),
+      await accountScreen.findByRole("button", { name: "Sort by Quantity" }),
     );
     expect(
-      screen
+      accountScreen
         .getAllByRole("row")
         .slice(1)
         .map((row) => row.textContent),
@@ -647,9 +674,9 @@ describe("App", () => {
       expect.stringContaining("HIGH"),
     ]);
 
-    fireEvent.click(screen.getByRole("button", { name: "Sort by Gain/loss" }));
+    fireEvent.click(accountScreen.getByRole("button", { name: "Sort by Gain/loss" }));
     expect(
-      screen
+      accountScreen
         .getAllByRole("row")
         .slice(1)
         .map((row) => row.textContent),
@@ -812,7 +839,12 @@ describe("App", () => {
     expect(await screen.findByText(/VTI/)).toBeTruthy();
   });
 
-  it("shows no-match and unavailable quote states", async () => {
+  it.each([
+    ["fixture_market_data", "Fixture market data"],
+    ["schwab_market_data", "Schwab"],
+    ["future_market_data", "Unknown source"],
+    ["", "Unavailable"],
+  ])("shows no-match and unavailable quote states for %s", async (source, label) => {
     api.searchInstruments
       .mockResolvedValueOnce({ instruments: [] })
       .mockResolvedValueOnce({
@@ -837,7 +869,7 @@ describe("App", () => {
           exchange: null,
           currency: "USD",
         },
-        source: "fixture_market_data",
+        source,
         observed_at: "2026-09-12T20:00:00+00:00",
         last_price: null,
         bid_price: null,
@@ -865,7 +897,8 @@ describe("App", () => {
     expect(quote.textContent).toContain(
       "Canonical identity: us-fund:FIXTURE_UNAVAILABLE",
     );
-    expect(quote.textContent).toContain("Source: fixture_market_data");
+    expect(quote.textContent).toContain(`Source: ${label}`);
+    if (source) expect(quote.textContent).not.toContain(source);
     expect(quote.textContent).toContain("unavailable USD");
     expect(await screen.findByText(/Observed:/)).toBeTruthy();
   });
@@ -1142,14 +1175,16 @@ describe("App", () => {
     });
 
     renderApp();
+    fireEvent.click(await screen.findByText("Portfolio breakdown & recorded history", { selector: "summary" }));
+    const historyScreen = within(screen.getByRole("region", { name: "Recorded value history table" }));
 
-    expect(await screen.findByText("2026-09-10")).toBeTruthy();
-    expect(screen.getByText("10,000.00 USD")).toBeTruthy();
-    expect(screen.getByText("1 of 2 accounts")).toBeTruthy();
-    expect(screen.getByText("Incomplete")).toBeTruthy();
-    expect(screen.getByText("2026-09-14")).toBeTruthy();
-    expect(screen.getAllByText("10,500.00 USD").length).toBeGreaterThan(0);
-    expect(screen.getByText("2 of 2 accounts")).toBeTruthy();
-    expect(screen.getByText(/Gap in recorded history/)).toBeTruthy();
+    expect(await historyScreen.findByText("2026-09-10")).toBeTruthy();
+    expect(historyScreen.getByText("10,000.00 USD")).toBeTruthy();
+    expect(historyScreen.getByText("1 of 2 accounts")).toBeTruthy();
+    expect(historyScreen.getByText("Incomplete")).toBeTruthy();
+    expect(historyScreen.getByText("2026-09-14")).toBeTruthy();
+    expect(historyScreen.getAllByText("10,500.00 USD").length).toBeGreaterThan(0);
+    expect(historyScreen.getByText("2 of 2 accounts")).toBeTruthy();
+    expect(historyScreen.getByText(/Gap in recorded history/)).toBeTruthy();
   });
 });

@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 
 import { type AllocationGroup, type DailyRecordedPoint, type GainLossCoverage, type OverviewAccountContribution, type OverviewExclusion, type PortfolioOverview } from "../../api/client";
+import { PortfolioChart } from "./PortfolioChart";
 import { StatusPill } from "../../components/StatusPill";
 import { accountTypeLabel, displayValue } from "../../lib/portfolioDisplay";
 
@@ -53,7 +54,7 @@ function OverviewHeading() {
       <div>
         <h2 id="overview-heading">Portfolio overview</h2>
       </div>
-      <span className="muted">Authoritative aggregate record</span>
+      <span className="muted">Across all accounts</span>
     </div>
   );
 }
@@ -67,7 +68,7 @@ function OverviewSummary({ overview }: { overview: PortfolioOverview }) {
   return (
     <div className="overview-strip">
       <div className="overview-total-card">
-        <span className="eyebrow">Total Known USD Value</span>
+        <span className="eyebrow">Portfolio value · Known USD</span>
         <div className="overview-headline">
           <strong className="overview-total-value">
             {displayValue(overview.total_known_usd_value, "USD")}
@@ -521,11 +522,15 @@ export function OverviewSection({
   history,
   loading,
   error,
+  historyLoading,
+  historyError,
 }: {
   overview: PortfolioOverview | undefined;
   history: DailyRecordedPoint[] | undefined;
   loading: boolean;
   error: boolean;
+  historyLoading?: boolean;
+  historyError?: boolean;
 }) {
   if (loading && !overview) {
     return (
@@ -609,17 +614,22 @@ export function OverviewSection({
         <ExclusionsCallout exclusions={overview.exclusions} />
       )}
 
-      <GainLossSummary gainLoss={overview.gain_loss} />
+      <PortfolioChart history={history ?? overview.history} loading={historyLoading} error={historyError} />
 
-      {overview.accounts && overview.accounts.length > 0 && (
-        <AccountContributions accounts={overview.accounts} />
-      )}
+      <details className="overview-details">
+        <summary>Portfolio breakdown &amp; recorded history</summary>
+        <GainLossSummary gainLoss={overview.gain_loss} />
 
-      <AllocationBreakdown allocations={overview.allocations} />
+        {overview.accounts && overview.accounts.length > 0 && (
+          <AccountContributions accounts={overview.accounts} />
+        )}
 
-      <RecordedHistorySection
-        history={history ?? overview.history}
-      />
+        <AllocationBreakdown allocations={overview.allocations} />
+
+        <RecordedHistorySection
+          history={history ?? overview.history}
+        />
+      </details>
     </section>
   );
 }
