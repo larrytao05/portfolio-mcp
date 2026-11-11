@@ -50,6 +50,9 @@ uv run pyright
 uv run pytest
 ```
 
+The concrete Schwab HTTPS regression tests require the `openssl` executable.
+They generate their temporary test certificates and keys outside the repository.
+
 ## Dashboard development
 
 The dashboard frontend lives in `dashboard/` and talks to a local FastAPI API.
@@ -122,6 +125,36 @@ uv run --env-file .env python -m portfolio_mcp.schwab_oauth
 Open the printed authorization URL, complete Schwab authorization, and paste the
 full redirect URL when prompted. The command prints a replacement
 `SCHWAB_REFRESH_TOKEN`; manually replace that value in `.env`.
+
+If a Schwab request fails after restarting the backend, use the reported error
+to choose the recovery step:
+
+- `provider_tls_verification_failed`: repair the backend's certificate trust
+  or network inspection configuration. Reauthorizing the Schwab account does
+  not fix certificate verification.
+- `provider_tls_configuration_error`: repair the configured `SSL_CERT_FILE` or
+  `SSL_CERT_DIR` source, or remove an unintended override. Public Schwab HTTPS
+  also uses the maintained certifi bundle alongside OpenSSL's default roots.
+- `schwab_reauthorization_required`: Schwab rejected the refresh grant as
+  `invalid_grant`; run the owner-operated OAuth helper above and replace the
+  local refresh token.
+- `schwab_client_authentication_failed`: check that the Schwab app's client ID
+  and secret are correct and belong to the approved app.
+- `provider_authorization_failed`: verify the app's API permissions and
+  entitlements. A new refresh token may not change these permissions.
+- `provider_unavailable` or `provider_rate_limited`: retry after the temporary
+  outage or rate limit has cleared.
+
+An anonymous HTTPS response can help diagnose certificate connectivity without
+using account credentials:
+
+```sh
+curl -sS -o /dev/null -w 'HTTP %{http_code}\n' https://api.schwabapi.com/
+```
+
+Any HTTP response, including an error such as 404, confirms only that DNS,
+network connectivity, and TLS completed for that request. It does not validate
+the configured client credentials or refresh token.
 
 Start the API with `uv run --env-file .env uvicorn api_main:app --reload`.
 This enables only read-only Schwab instrument search and quote requests; it

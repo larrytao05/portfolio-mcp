@@ -440,6 +440,7 @@ def test_schwab_mapping_api_redacts_provider_errors_and_maps_rate_limits(
     )
     assert candidates.status_code == 502
     assert candidates.json()["detail"] == "Schwab returned an invalid response"
+    assert candidates.json()["error"]["code"] == "provider_response_error"
     assert provider_secret not in candidates.text
 
     service.candidate_error = RuntimeError(provider_secret)
@@ -456,4 +457,5 @@ def test_schwab_mapping_api_redacts_provider_errors_and_maps_rate_limits(
     )
     assert save.status_code == 429
     assert save.json()["detail"] == "Schwab rate limit reached"
+    assert save.json()["error"]["code"] == "provider_rate_limited"
     assert provider_secret not in save.text

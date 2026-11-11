@@ -242,17 +242,17 @@ async def test_schwab_market_data_sanitizes_authentication_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_schwab_market_data_explains_rejected_refresh_token() -> None:
+async def test_schwab_market_data_classifies_rejected_refresh_token() -> None:
     provider = SchwabMarketDataProvider(
         SchwabSettings(
             client_id="client-id",
             client_secret="client-secret",
             refresh_token="refresh-token",
         ),
-        http_client=FakeSchwabHttpClient([(400, None)]),
+        http_client=FakeSchwabHttpClient([(400, {"error": "invalid_grant"})]),
     )
 
-    with pytest.raises(ProviderAuthenticationError, match="Refresh token was rejected"):
+    with pytest.raises(ProviderAuthenticationError, match="rejected the refresh grant"):
         await provider.search_instruments("VTI")
 
 

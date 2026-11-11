@@ -66,10 +66,16 @@ from portfolio_mcp.provider import (
     PortfolioProvider,
     ProviderAuthenticationError,
     ProviderAuthorizationError,
+    ProviderConfigurationError,
     ProviderError,
     ProviderRateLimitError,
     ProviderResponseError,
+    ProviderTLSConfigurationError,
+    ProviderTLSVerificationError,
     ProviderUnavailableError,
+    SchwabAuthorizationCodeRejectedError,
+    SchwabClientAuthenticationError,
+    SchwabReauthorizationRequiredError,
 )
 from portfolio_mcp.refresh import PortfolioRefreshService
 from portfolio_mcp.schwab_mapping_store import (
@@ -105,20 +111,61 @@ class SaveSchwabMappingRequest(BaseModel):
     confirmed: StrictBool
 
 
+class _SchwabProviderHTTPException(HTTPException):
+    def __init__(self, status_code: int, error: ProviderError, message: str) -> None:
+        self.provider_code = error.code
+        super().__init__(status_code=status_code, detail=message)
+
+
+def _provider_status_code(error: ProviderError) -> int:
+    if isinstance(error, (ProviderAuthenticationError, ProviderAuthorizationError)):
+        return 403
+    if isinstance(error, ProviderRateLimitError):
+        return 429
+    if isinstance(error, ProviderUnavailableError):
+        return 503
+    if isinstance(error, ProviderConfigurationError):
+        return 400
+    return 502
+
+
+def _schwab_provider_message(error: ProviderError) -> str:
+    if isinstance(
+        error,
+        (
+            ProviderTLSVerificationError,
+            ProviderTLSConfigurationError,
+            SchwabAuthorizationCodeRejectedError,
+            SchwabClientAuthenticationError,
+            SchwabReauthorizationRequiredError,
+        ),
+    ):
+        return str(error)
+    if isinstance(error, ProviderAuthenticationError):
+        return "Unable to authenticate with Schwab"
+    if isinstance(error, ProviderAuthorizationError):
+        return "Schwab access is not authorized"
+    if isinstance(error, ProviderRateLimitError):
+        return "Schwab rate limit reached"
+    if isinstance(error, ProviderUnavailableError):
+        return "Schwab is temporarily unavailable"
+    if isinstance(error, ProviderConfigurationError):
+        return "Schwab configuration is invalid"
+    if isinstance(error, ProviderResponseError):
+        return "Schwab returned an invalid response"
+    return "Unable to process Schwab mapping"
+
+
 def _schwab_mapping_error(exc: Exception) -> HTTPException:
     if isinstance(exc, AccountNotFoundError):
         return HTTPException(status_code=404, detail="Portfolio account was not found")
     if isinstance(exc, SchwabAccountMappingConflictError):
         return HTTPException(status_code=409, detail="Schwab account is already mapped")
-    if isinstance(exc, (ProviderAuthenticationError, ProviderAuthorizationError)):
-        return HTTPException(status_code=403, detail="Schwab access is not authorized")
-    if isinstance(exc, ProviderRateLimitError):
-        return HTTPException(status_code=429, detail="Schwab rate limit reached")
-    if isinstance(exc, ProviderUnavailableError):
-        return HTTPException(status_code=503, detail="Schwab service is unavailable")
-    if isinstance(exc, ProviderResponseError):
-        return HTTPException(
-            status_code=502, detail="Schwab returned an invalid response"
+    if isinstance(exc, ProviderError):
+        return _SchwabProviderHTTPException(
+            status_code=_provider_status_code(exc),
+            error=exc,
+            message=_schwab_provider_message(exc),
         )
     if isinstance(exc, ValueError):
         return HTTPException(status_code=400, detail="Invalid Schwab mapping request")
@@ -763,8 +810,20 @@ def create_app(
     @app.exception_handler(ProviderError)
     async def provider_error(_: Request, error: ProviderError) -> JSONResponse:
         return JSONResponse(
-            status_code=502,
-            content={"error": {"code": "provider_error", "message": str(error)}},
+            status_code=_provider_status_code(error),
+            content={"error": {"code": error.code, "message": str(error)}},
+        )
+
+    @app.exception_handler(_SchwabProviderHTTPException)
+    async def schwab_provider_http_error(
+        _: Request, error: _SchwabProviderHTTPException
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=error.status_code,
+            content={
+                "detail": error.detail,
+                "error": {"code": error.provider_code, "message": error.detail},
+            },
         )
 
     @app.exception_handler(TradingValidationError)

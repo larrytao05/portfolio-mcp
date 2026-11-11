@@ -10,6 +10,7 @@ from portfolio_mcp.models import is_schwab_account_eligible
 from portfolio_mcp.provider import (
     ProviderAuthenticationError,
     ProviderConfigurationError,
+    ProviderTLSVerificationError,
 )
 from portfolio_mcp.schema import AccountRecord, SchwabAccountMappingRecord
 from portfolio_mcp.schwab_mapping_store import (
@@ -136,7 +137,7 @@ async def test_transport_error_mapping() -> None:
         ]
     )
     transport = SchwabOAuthTransport(settings, http_client=client)
-    with pytest.raises(ProviderAuthenticationError, match="Refresh token was rejected"):
+    with pytest.raises(ProviderAuthenticationError, match="rejected the refresh grant"):
         await transport.access_token()
 
 
@@ -408,6 +409,31 @@ async def test_readiness_does_not_expose_provider_exception_text(
 
     assert provider_secret not in str(result.to_dict())
     assert result.ready is False
+
+
+@pytest.mark.asyncio
+async def test_tls_failure_does_not_mark_readiness_ready(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    _seed_accounts(repo)
+    save_schwab_account_mapping(repo, "schwab-taxable-1", "hash-1234", "*1234")
+    settings = SchwabSettings(client_id="cid", client_secret="csec", refresh_token="rt")
+    service = SchwabReadinessService(
+        repo,
+        transport=SchwabOAuthTransport(
+            settings,
+            http_client=FakeHttpClient([ProviderTLSVerificationError()]),
+        ),
+        execution_settings=ExecutionSettings(
+            provider="schwab", schwab_execution_enabled=True
+        ),
+        schwab_settings=settings,
+    )
+
+    result = await service.check_account_readiness("schwab-taxable-1")
+
+    assert result.state == SchwabReadinessState.ACCOUNT_UNAVAILABLE
+    assert result.ready is False
+    assert "certificate verification failed" in result.message
 
 
 def test_legacy_schwab_mapping_mask_is_unavailable_and_not_ready(

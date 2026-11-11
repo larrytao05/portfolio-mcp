@@ -39,6 +39,7 @@ from portfolio_mcp.provider import (
     InstrumentNotFoundError,
     MarketDataProvider,
     PortfolioProvider,
+    ProviderError,
 )
 from portfolio_mcp.submission_locks import SubmissionLockError
 from portfolio_mcp.trading_safety import (
@@ -187,7 +188,10 @@ def create_server(
     @mcp.tool()
     async def search_instruments(query: str = "") -> dict[str, object]:
         """Search tradable market instruments by symbol or name. Read-only."""
-        instruments = await market_data.search_instruments(query)
+        try:
+            instruments = await market_data.search_instruments(query)
+        except ProviderError as error:
+            raise ToolError(f"{error.code}: {error}") from error
         return {"instruments": [instrument.to_dict() for instrument in instruments]}
 
     @mcp.tool()
@@ -219,6 +223,8 @@ def create_server(
             raise ToolError(f"{error.code}: {error}") from error
         except InstrumentNotFoundError as error:
             raise ToolError(f"instrument_not_found: {error}") from error
+        except ProviderError as error:
+            raise ToolError(f"{error.code}: {error}") from error
 
     @mcp.tool()
     async def get_order_draft(draft_id: str) -> dict[str, object]:
