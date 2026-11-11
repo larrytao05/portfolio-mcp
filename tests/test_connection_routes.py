@@ -2,17 +2,19 @@ from datetime import UTC, datetime
 
 import pytest
 
-from portfolio_mcp.database import PortfolioRepository
+from portfolio_mcp.connection_store import ConnectionStore
+from portfolio_mcp.database import Database
+from portfolio_mcp.portfolio_store import daily_values, list_positions, save_refresh
 
 
 def test_routes_persist_and_disconnect_without_deleting_history(tmp_path):
     database_url = f"sqlite:///{tmp_path / 'portfolio.sqlite'}"
-    repository = PortfolioRepository(database_url)
+    repository = ConnectionStore(Database(database_url))
     repository.save_connection(
         "fixture-connection", "fixture", "fixture", "fixture", True
     )
     repository.save_account_route("account-1", "fixture-connection", "upstream-1")
-    route = PortfolioRepository(database_url).account_route("account-1")
+    route = ConnectionStore(Database(database_url)).account_route("account-1")
     assert route is not None
     assert route.active and route.included and not route.trade_enabled
     repository.save_connection(
@@ -31,7 +33,8 @@ async def test_registry_rejects_unknown_hidden_and_disconnected_accounts(tmp_pat
     from portfolio_mcp.provider import AccountNotFoundError
     from portfolio_mcp.provider_registry import ProviderRegistry
 
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.sqlite'}")
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.sqlite'}")
+    repository = ConnectionStore(database)
     provider = FixturePortfolioProvider()
     registry = ProviderRegistry(repository, {"fixture": provider})
     repository.save_connection("fixture", "fixture", "fixture", "fixture", True)
@@ -40,7 +43,7 @@ async def test_registry_rejects_unknown_hidden_and_disconnected_accounts(tmp_pat
     snapshot = await registry.get_holdings("canonical")
     assert snapshot.positions[0].account_id == "canonical"
     now = datetime.now(UTC)
-    repository.save_refresh([snapshot], now, now, now.date())
+    save_refresh(database, [snapshot], now, now, now.date())
     with pytest.raises(AccountNotFoundError):
         registry.get_portfolio_provider("unknown")
     repository.save_account_route(
@@ -56,8 +59,8 @@ async def test_registry_rejects_unknown_hidden_and_disconnected_accounts(tmp_pat
     repository.save_connection("fixture", "fixture", "fixture", "fixture", False)
     with pytest.raises(AccountNotFoundError):
         await registry.get_holdings("canonical")
-    assert repository.list_positions("canonical") is not None
-    assert repository.daily_values("canonical")
+    assert list_positions(database, "canonical") is not None
+    assert daily_values(database, "canonical")
 
 
 @pytest.mark.asyncio
@@ -110,7 +113,7 @@ async def test_registry_rejects_mismatched_provider_ownership(tmp_path, method, 
                 )
             )
 
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.sqlite'}")
+    repository = ConnectionStore(Database(f"sqlite:///{tmp_path / 'portfolio.sqlite'}"))
     repository.save_connection("fixture", "fixture", "fixture", "fixture", True)
     repository.save_account_route("canonical", "fixture", "schwab-taxable-demo")
     registry = ProviderRegistry(repository, {"fixture": WrongAccount()})
@@ -126,7 +129,7 @@ async def test_registry_rejects_mismatched_provider_ownership(tmp_path, method, 
 
 
 def test_hiding_and_disconnecting_clear_trade_permission(tmp_path):
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.sqlite'}")
+    repository = ConnectionStore(Database(f"sqlite:///{tmp_path / 'portfolio.sqlite'}"))
     repository.save_connection("fixture", "fixture", "fixture", "fixture", True)
     repository.save_account_route("account", "fixture", "upstream", trade_enabled=True)
     repository.save_account_route(
@@ -143,7 +146,7 @@ def test_hiding_and_disconnecting_clear_trade_permission(tmp_path):
 
 
 def test_stale_enable_after_hide_is_rejected(tmp_path):
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.sqlite'}")
+    repository = ConnectionStore(Database(f"sqlite:///{tmp_path / 'portfolio.sqlite'}"))
     repository.save_connection("fixture", "fixture", "fixture", "fixture", True)
     repository.save_account_route("account", "fixture", "upstream", trade_enabled=True)
     assert repository.change_account_settings("account", 0, included=False)

@@ -6,9 +6,11 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from portfolio_mcp.api import create_app
-from portfolio_mcp.database import PortfolioRepository
+from portfolio_mcp.connection_store import ConnectionStore
+from portfolio_mcp.database import Database
 from portfolio_mcp.fixtures import FixturePortfolioProvider
 from portfolio_mcp.models import Account, HoldingsSnapshot, Position
+from portfolio_mcp.portfolio_store import list_accounts, save_refresh
 from portfolio_mcp.provider import ProviderUnavailableError
 
 
@@ -41,7 +43,7 @@ def create_client(
     provider: FixturePortfolioProvider | None = None,
     tmp_path: Path | None = None,
     clock: Callable[[], datetime] | None = None,
-) -> tuple[TestClient, PortfolioRepository]:
+) -> tuple[TestClient, Database]:
     assert tmp_path is not None
     if provider is None:
         provider = FixturePortfolioProvider()
@@ -54,15 +56,14 @@ def create_client(
     )
     client = TestClient(app)
     client.post("/api/connections/fixture")
-    return client, PortfolioRepository(database_url)
+    return client, Database(database_url)
 
 
-def bind_saved(repository):
-    for account in repository.list_accounts():
-        if repository.account_route(account.account.id) is None:
-            repository.save_account_route(
-                account.account.id, "fixture", account.account.id
-            )
+def bind_saved(database):
+    routes = ConnectionStore(database)
+    for account in list_accounts(database):
+        if routes.account_route(account.account.id) is None:
+            routes.save_account_route(account.account.id, "fixture", account.account.id)
 
 
 def test_fresh_overview_endpoint(tmp_path) -> None:
@@ -88,9 +89,12 @@ def test_fresh_overview_endpoint(tmp_path) -> None:
     assert overview["warnings"] == []
     assert overview["exclusions"] == []
 
-    # Accounts
     accounts = overview["accounts"]
     assert len(accounts) == 2
+    assert {a["account_id"]: a["percentage_of_total"] for a in accounts} == {
+        "schwab-taxable-demo": "0.4800",
+        "fidelity-roth-demo": "0.5200",
+    }
     for acc in accounts:
         assert isinstance(acc["account_id"], str)
         assert isinstance(acc["label"], str)
@@ -101,7 +105,6 @@ def test_fresh_overview_endpoint(tmp_path) -> None:
         assert acc["is_stale"] is False
         assert isinstance(acc["percentage_of_total"], str)
 
-    # Allocations
     allocations = overview["allocations"]
     assert "account" in allocations
     assert "asset_class" in allocations
@@ -132,14 +135,12 @@ def test_fresh_overview_endpoint(tmp_path) -> None:
     assert sec_alloc["excluded_count"] == 0
     assert len(sec_alloc["slices"]) > 0
 
-    # Provider coverage
     assert "provider_coverage" in overview
     assert len(overview["provider_coverage"]) == 2
     for pc in overview["provider_coverage"]:
         assert pc["status"] == "fresh"
         assert pc["is_included_in_totals"] is True
 
-    # Gain / loss
     gain_loss = overview["gain_loss"]
     assert gain_loss["unrealized_gain_loss"] == "758.95"
     assert gain_loss["cost_basis"] == "9241.00"
@@ -147,7 +148,6 @@ def test_fresh_overview_endpoint(tmp_path) -> None:
     assert gain_loss["included_count"] == 9
     assert gain_loss["excluded_count"] == 0
 
-    # History in overview
     history = overview["history"]
     assert len(history) == 1
     assert history[0]["date"] == "2026-08-29"
@@ -270,7 +270,7 @@ def test_history_endpoint_preserves_gaps(tmp_path) -> None:
             ),
         ),
     )
-    repo.save_refresh([snap1], now, now, snapshot_date=date(2026, 8, 20))
+    save_refresh(repo, [snap1], now, now, snapshot_date=date(2026, 8, 20))
 
     now2 = datetime(2026, 8, 25, 10, 0, 0, tzinfo=UTC)
     snap2_1 = HoldingsSnapshot(
@@ -307,7 +307,7 @@ def test_history_endpoint_preserves_gaps(tmp_path) -> None:
             ),
         ),
     )
-    repo.save_refresh([snap2_1, snap2_2], now2, now2, snapshot_date=date(2026, 8, 25))
+    save_refresh(repo, [snap2_1, snap2_2], now2, now2, snapshot_date=date(2026, 8, 25))
 
     bind_saved(repo)
     response = client.get("/api/overview/history")
@@ -353,17 +353,14 @@ def test_overview_endpoints_make_zero_provider_calls(tmp_path) -> None:
     provider = TrackingPortfolioProvider()
     client, _ = create_client(provider=provider, tmp_path=tmp_path)
 
-    # Refresh will make provider calls
     client.post("/api/refresh")
     initial_calls = provider.call_count
     assert initial_calls > 0
 
-    # Calling /api/overview must make ZERO provider calls
     resp = client.get("/api/overview")
     assert resp.status_code == 200
     assert provider.call_count == initial_calls
 
-    # Calling /api/overview/history must make ZERO provider calls
     resp_hist = client.get("/api/overview/history")
     assert resp_hist.status_code == 200
     assert provider.call_count == initial_calls
@@ -408,22 +405,19 @@ def test_missing_market_value_and_cost_basis_exclusions(tmp_path) -> None:
             ),
         ),
     )
-    repo.save_refresh([snap], now, now, snapshot_date=date(2026, 8, 20))
+    save_refresh(repo, [snap], now, now, snapshot_date=date(2026, 8, 20))
     bind_saved(repo)
 
     resp = client.get("/api/overview")
     assert resp.status_code == 200
     overview = resp.json()["overview"]
 
-    # Total should only include NOBASIS (250.00)
     assert overview["total_known_usd_value"] == "250.00"
 
     reasons = {e["symbol"]: e["reason"] for e in overview["exclusions"]}
     assert reasons["UNVALUED"] == "missing_market_value"
     assert reasons["NOBASIS"] == "missing_cost_basis"
 
-    # Gain loss should have 0 included because neither has both market_value
-    # and cost_basis
     assert overview["gain_loss"]["included_count"] == 0
     assert overview["gain_loss"]["excluded_count"] == 2
     assert overview["gain_loss"]["unrealized_gain_loss"] is None
@@ -497,8 +491,8 @@ def test_provider_coverage_mixed_account_outcomes(tmp_path) -> None:
         )
     ]
 
-    # Save initial refresh with 2 accounts
-    repo.save_refresh(
+    save_refresh(
+        repo,
         snapshots=[
             HoldingsSnapshot(account=acc1, as_of=snap_date, positions=tuple(pos1)),
             HoldingsSnapshot(account=acc2, as_of=snap_date, positions=tuple(pos2)),
@@ -508,8 +502,8 @@ def test_provider_coverage_mixed_account_outcomes(tmp_path) -> None:
         snapshot_date=snap_date,
     )
 
-    # Second refresh: only acc1 is refreshed, acc2 fails (stale)
-    repo.save_refresh(
+    save_refresh(
+        repo,
         snapshots=[
             HoldingsSnapshot(account=acc1, as_of=snap_date, positions=tuple(pos1)),
         ],
@@ -525,7 +519,6 @@ def test_provider_coverage_mixed_account_outcomes(tmp_path) -> None:
     overview = resp.json()["overview"]
 
     assert overview["status"] == "partial"
-    # Fresh positions from acc1 remain in total
     assert overview["total_known_usd_value"] == "1000.00"
 
     coverages = {pc["provider"]: pc for pc in overview["provider_coverage"]}

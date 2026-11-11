@@ -2,20 +2,26 @@ from datetime import UTC, datetime
 
 import pytest
 
-from portfolio_mcp.config import SchwabMarketDataSettings
+from portfolio_mcp.config import SchwabSettings
+from portfolio_mcp.connection_store import ConnectionStore
+from portfolio_mcp.database import Database
 from portfolio_mcp.direct_schwab_orders import DirectSchwabOrders
 from portfolio_mcp.models import Account
+from portfolio_mcp.portfolio_store import save_refresh
+from portfolio_mcp.schwab_mapping_store import save_schwab_account_mapping
 from portfolio_mcp.schwab_orders import SchwabOrderLeg, SchwabOrderResult
+from portfolio_mcp.schwab_transport import SchwabOAuthTransport
 
 
 @pytest.mark.asyncio
 async def test_direct_orders_use_explicit_binding_and_preserve_leg_ownership(
     monkeypatch,
+    tmp_path,
 ):
     calls = []
 
     class FakeReader:
-        def __init__(self, account_id, encrypted_account_id, token):
+        def __init__(self, account_id, encrypted_account_id, token, *, transport):
             calls.append((account_id, encrypted_account_id, token))
 
         async def list_orders(self, start, end):
@@ -44,22 +50,32 @@ async def test_direct_orders_use_explicit_binding_and_preserve_leg_ownership(
                 True,
             )
 
-    async def fake_token():
-        return "synthetic-token"
+    from dataclasses import replace
 
+    from portfolio_mcp.fixtures import FixturePortfolioProvider
+
+    database = Database(f"sqlite:///{tmp_path / 'direct.sqlite'}")
+    fixture = FixturePortfolioProvider()
+    snapshot = await fixture.get_holdings("schwab-taxable-demo")
+    snapshot = replace(
+        snapshot,
+        account=replace(snapshot.account, id="canonical"),
+        positions=tuple(replace(p, account_id="canonical") for p in snapshot.positions),
+    )
+    now = datetime.now(UTC)
+    save_refresh(database, [snapshot], now, now, now.date())
+    save_schwab_account_mapping(database, "canonical", "explicit-hash", "*1234")
     monkeypatch.setattr(
         "portfolio_mcp.direct_schwab_orders.SchwabOrderReader", FakeReader
     )
     service = DirectSchwabOrders(
-        SchwabMarketDataSettings("id", "secret", "refresh"),
-        {"canonical": "explicit-hash"},
+        database, SchwabOAuthTransport(SchwabSettings("id", "secret", "refresh"))
     )
-    monkeypatch.setattr(service._auth, "_access_token", fake_token)
     assert not service.has_account("another-account")
     result = await service.get_orders(
         Account("canonical", "Schwab", "A", "brokerage", "USD"), "VTI", "open"
     )
-    assert calls == [("canonical", "explicit-hash", "synthetic-token")]
+    assert calls == [("canonical", "explicit-hash", "transport")]
     assert result.truncated
     assert [row.leg_id for row in result.orders] == ["1", "2"]
     assert all(row.account_id == "canonical" for row in result.orders)
@@ -76,12 +92,12 @@ def test_direct_schwab_api_refreshes_oauth_and_uses_verified_account_route(
     from fastapi.testclient import TestClient
 
     from portfolio_mcp.api import create_app
-    from portfolio_mcp.database import PortfolioRepository
     from portfolio_mcp.fixtures import FixturePortfolioProvider
     from portfolio_mcp.snaptrade import SnapTradeProvider
 
     url = f"sqlite:///{tmp_path / 'portfolio.sqlite'}"
-    repository = PortfolioRepository(url)
+    database = Database(url)
+    repository = ConnectionStore(database)
     repository.save_connection(
         "snaptrade:auth-1", "snaptrade", "live", "server_env:snaptrade", True
     )
@@ -94,7 +110,8 @@ def test_direct_schwab_api_refreshes_oauth_and_uses_verified_account_route(
         positions=tuple(replace(p, account_id="canonical") for p in snapshot.positions),
     )
     now = datetime.now(UTC)
-    repository.save_refresh([snapshot], now, now, now.date())
+    save_refresh(database, [snapshot], now, now, now.date())
+    save_schwab_account_mapping(database, "canonical", "explicit-hash", "*1234")
     snaptrade = SnapTradeProvider.__new__(SnapTradeProvider)
 
     async def connection_accounts():
@@ -103,15 +120,14 @@ def test_direct_schwab_api_refreshes_oauth_and_uses_verified_account_route(
     monkeypatch.setattr(snaptrade, "connection_accounts", connection_accounts)
     requests = []
 
-    def oauth_request(self, method, url, headers, body=None):
+    def schwab_request(self, method, url, headers, body=None):
         requests.append((method, url))
-        assert method == "POST" and url == "https://api.schwabapi.com/v1/oauth/token"
-        assert body is not None
-        assert parse_qs(body.decode())["grant_type"] == ["refresh_token"]
-        return 200, {"access_token": "synthetic-token"}
-
-    def order_request(self, url, headers):
-        requests.append(("GET", url))
+        if method == "POST":
+            assert url == "https://api.schwabapi.com/v1/oauth/token"
+            assert body is not None
+            assert parse_qs(body.decode())["grant_type"] == ["refresh_token"]
+            return 200, {"access_token": "synthetic-token"}
+        assert method == "GET"
         assert headers["Authorization"] == "Bearer synthetic-token"
         assert urlsplit(url).path == "/trader/v1/accounts/explicit-hash/orders"
         query = parse_qs(urlsplit(url).query)
@@ -136,14 +152,10 @@ def test_direct_schwab_api_refreshes_oauth_and_uses_verified_account_route(
         ]
 
     monkeypatch.setattr(
-        "portfolio_mcp.schwab_market_data.UrllibSchwabHttpClient.request", oauth_request
-    )
-    monkeypatch.setattr(
-        "portfolio_mcp.alpaca_market_data.UrllibAlpacaHttpClient.request", order_request
+        "portfolio_mcp.schwab_transport.UrllibSchwabHttpClient.request", schwab_request
     )
     direct = DirectSchwabOrders(
-        SchwabMarketDataSettings("id", "secret", "refresh"),
-        {"canonical": "explicit-hash"},
+        database, SchwabOAuthTransport(SchwabSettings("id", "secret", "refresh"))
     )
     app = create_app(
         snaptrade,

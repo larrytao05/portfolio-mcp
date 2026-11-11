@@ -6,7 +6,8 @@ from urllib.parse import quote as encode
 
 from portfolio_mcp.alpaca_market_data import AlpacaMarketDataProvider
 from portfolio_mcp.alpaca_portfolio import AlpacaPortfolioProvider, _mapping
-from portfolio_mcp.database import OrderDraft, PortfolioRepository
+from portfolio_mcp.connection_store import ConnectionStore
+from portfolio_mcp.stored_orders import OrderDraft
 from portfolio_mcp.trading_safety import TradeIntent, TradingGuard
 from portfolio_mcp.trading_service import SubmissionCheck, TradingValidationError
 
@@ -14,7 +15,7 @@ from portfolio_mcp.trading_service import SubmissionCheck, TradingValidationErro
 class AlpacaTradingPolicy:
     def __init__(
         self,
-        repository: PortfolioRepository,
+        repository: ConnectionStore,
         portfolio: AlpacaPortfolioProvider,
         market_data: AlpacaMarketDataProvider,
         guard: TradingGuard,

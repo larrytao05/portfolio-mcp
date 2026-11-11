@@ -141,6 +141,7 @@ export type AccountCapability = {
   blocks: CapabilityBlock[];
   is_stale: boolean;
   is_trade_capable: boolean;
+  schwab_mapping_eligible?: boolean;
 };
 
 export type TradingSettings = {
@@ -274,8 +275,14 @@ export type HistoryResponse = {
   history: DailyRecordedPoint[];
 };
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number) {
+  status: number;
+  code?: string;
+
+  constructor(status: number, message: string, code?: string) {
     super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
   }
 }
 
@@ -283,12 +290,16 @@ async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.ok) {
     const body = await response.json().catch(() => null);
-    const message = body?.error?.message;
+    const message =
+      body?.error?.message ??
+      (typeof body?.detail === "string" ? body.detail : undefined);
+    const code = body?.error?.code;
     throw new ApiError(
+      response.status,
       typeof message === "string"
         ? message
         : `Request failed with status ${response.status}`,
-      response.status,
+      typeof code === "string" ? code : undefined,
     );
   }
 
@@ -505,4 +516,344 @@ export function getSnapTradePortal(reconnect?: string): Promise<{ url: string }>
 
 export function reactivateConnection(connectionId: string): Promise<unknown> {
   return getJson(`/api/connections/${encodeURIComponent(connectionId)}/reactivate`, { method: "POST" });
+}
+
+export type StoredOrder = {
+  id: string;
+  draft_id: string;
+  fingerprint: string;
+  account: {
+    id: string;
+    label: string;
+  };
+  provider: string;
+  instrument: {
+    id: string;
+    symbol: string;
+  };
+  instruction: {
+    side: "buy" | "sell" | string;
+    type: "market" | "limit" | string;
+    quantity: string;
+    limit_price: string | null;
+    time_in_force?: string;
+  };
+  state: string;
+  broker_order_id: string | null;
+  result: {
+    code: string | null;
+    message: string | null;
+    source: string | null;
+  };
+  fill: {
+    quantity: string;
+    average_price: string | null;
+  } | null;
+  remaining_quantity?: string | null;
+  provider_submission_started_at?: string | null;
+  provider_updated_at: string | null;
+  provider_status_label: string | null;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  can_cancel?: boolean;
+  blocking_reason?: string | null;
+  warnings?: string[];
+  draft?: {
+    id: string;
+    created_at: string;
+    expires_at: string;
+    instruction: {
+      instrument_id: string;
+      symbol: string;
+      side: string;
+      type: string;
+      quantity: string;
+      limit_price: string | null;
+    };
+    warnings?: string[];
+  };
+
+  reconciliation?: {
+    status: string;
+    source: string | null;
+    provider_updated_at: string | null;
+    next_refresh_at: string | null;
+    target_order_id: string | null;
+  };
+};
+
+export type OrderRefreshGroup = {
+  provider: string;
+  account_id: string;
+  target_order_id: string | null;
+  next_refresh_at: string;
+};
+
+export type OrderListPage = {
+  orders: StoredOrder[];
+  next_cursor: string | null;
+  refresh_groups: OrderRefreshGroup[];
+  server_time: string;
+};
+
+export type OrderAuditEvent = {
+  event_id: string;
+  draft_id: string | null;
+  order_id: string | null;
+  account_id: string | null;
+  type: string;
+  actor: string;
+  previous_state: string | null;
+  next_state: string | null;
+  code: string | null;
+  details: Record<string, unknown>;
+  occurred_at: string;
+};
+
+export type OrderAuditPage = {
+  events: OrderAuditEvent[];
+  next_cursor: string | null;
+};
+
+export type RefreshOrderResult = {
+  order: StoredOrder;
+  refresh: {
+    status: "attempted" | "throttled" | "target_changed" | "not_refreshable" | string;
+    provider_read_started: boolean;
+    next_refresh_at: string | null;
+    target_order_id: string | null;
+    server_time: string;
+  };
+};
+
+export type OrderListFilters = {
+  account_id?: string;
+  provider?: string;
+  symbol?: string;
+  state?: string[];
+  start_date?: string;
+  end_date?: string;
+  limit?: number;
+  cursor?: string;
+};
+
+export type OrderAuditFilters = OrderListFilters & {
+  order_id?: string;
+  draft_id?: string;
+};
+
+function orderQueryString(filters: OrderAuditFilters): string {
+  const params = new URLSearchParams();
+  for (const key of ["order_id", "draft_id", "account_id", "provider", "symbol", "start_date", "end_date", "cursor"] as const) {
+    const value = filters[key];
+    if (value) params.set(key, value);
+  }
+  for (const state of filters.state ?? []) params.append("state", state);
+  if (filters.limit) params.set("limit", String(filters.limit));
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+export function getOrders(filters: OrderListFilters = {}): Promise<OrderListPage> {
+  return getJson(`/api/orders${orderQueryString(filters)}`);
+}
+
+export function getOrderAudit(filters: OrderAuditFilters = {}): Promise<OrderAuditPage> {
+  return getJson(`/api/order-audit${orderQueryString(filters)}`);
+}
+
+export function refreshOrder(
+  orderId: string,
+  mode: "scheduled" | "manual" = "manual",
+): Promise<RefreshOrderResult> {
+  return getJson(`/api/orders/${encodeURIComponent(orderId)}/refresh`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
+}
+
+export type ConfirmOrderCancellationInput = {
+  expected_version: number;
+  expected_state: string;
+  confirmed: boolean;
+};
+
+export type ConfirmOrderCancellationResponse = {
+  order: StoredOrder;
+};
+
+export function confirmOrderCancellation(
+  orderId: string,
+  input: ConfirmOrderCancellationInput,
+): Promise<ConfirmOrderCancellationResponse> {
+  return getJson(`/api/orders/${encodeURIComponent(orderId)}/cancel/confirm`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export function getOrder(orderId: string): Promise<{ order: StoredOrder }> {
+  return getJson(`/api/orders/${encodeURIComponent(orderId)}`);
+}
+
+export type CreateMcpAuthorizationResult = {
+  authorization_id: string;
+  code: string;
+  expires_at: string;
+  draft: {
+    id: string;
+    symbol: string;
+    side: string;
+    quantity: string;
+    order_type: string;
+    limit_price: string | null;
+    fingerprint: string;
+  };
+};
+
+export function getOrderDraft(draftId: string): Promise<{ draft: OrderDraft }> {
+  return getJson(`/api/order-drafts/${encodeURIComponent(draftId)}`);
+}
+
+export function issueMcpAuthorization(
+  draftId: string,
+  expectedFingerprint: string,
+  confirmed: boolean,
+): Promise<CreateMcpAuthorizationResult> {
+  return getJson(
+    `/api/order-drafts/${encodeURIComponent(draftId)}/mcp-authorization`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        expected_fingerprint: expectedFingerprint,
+        confirmed,
+      }),
+    },
+  );
+}
+
+export type StoredCancellationRequest = {
+  id: string;
+  order_id: string;
+  expected_version: number;
+  expected_state: string;
+  account_id: string;
+  provider: string;
+  symbol: string;
+  broker_order_id: string | null;
+  remaining_quantity: string;
+  fingerprint: string;
+  created_at: string;
+  expires_at: string;
+  status: string;
+  invalidation_reason: string | null;
+};
+
+export type CreateCancellationMcpAuthorizationResult = {
+  authorization_id: string;
+  code: string;
+  expires_at: string;
+  cancellation_request: StoredCancellationRequest;
+};
+
+export function getCancellationRequest(
+  requestId: string,
+): Promise<{ cancellation_request: StoredCancellationRequest }> {
+  return getJson(`/api/cancellation-requests/${encodeURIComponent(requestId)}`);
+}
+
+export function createCancellationMcpAuthorization(
+  requestId: string,
+  expectedFingerprint: string,
+  confirmed: boolean,
+): Promise<CreateCancellationMcpAuthorizationResult> {
+  return getJson(
+    `/api/cancellation-requests/${encodeURIComponent(requestId)}/mcp-authorization`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        expected_fingerprint: expectedFingerprint,
+        confirmed,
+      }),
+    },
+  );
+}
+
+export type StoredSchwabAccountMapping = {
+  id: string;
+  account_id: string;
+  masked_account_number: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type SchwabAccountCandidate = {
+  candidate_id: string;
+  masked_account_number: string;
+  is_mapped: boolean;
+  mapped_to_account_id: string | null;
+  suggested: boolean;
+};
+
+export type SchwabAccountReadiness = {
+  account_id: string;
+  state:
+    | "ready"
+    | "not_configured"
+    | "not_opted_in"
+    | "auth_failed"
+    | "not_entitled"
+    | "unmapped"
+    | "account_unavailable"
+    | "unsupported_account";
+  ready: boolean;
+  masked_account_number: string | null;
+  message: string;
+  details: Record<string, unknown>;
+};
+
+
+export function getSchwabMapping(
+  accountId: string,
+): Promise<{ mapping: StoredSchwabAccountMapping }> {
+  return getJson(`/api/schwab/mapping/${encodeURIComponent(accountId)}`);
+}
+
+export function getSchwabMappingCandidates(
+  accountId: string,
+): Promise<{ account_id: string; candidates: SchwabAccountCandidate[] }> {
+  return getJson(`/api/schwab/mapping/candidates?account_id=${encodeURIComponent(accountId)}`);
+}
+
+export function saveSchwabMapping(
+  accountId: string,
+  data: {
+    candidate_id: string;
+    confirmed: boolean;
+  },
+): Promise<{ mapping: StoredSchwabAccountMapping }> {
+  return getJson(`/api/schwab/mapping/${encodeURIComponent(accountId)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+export function deleteSchwabMapping(
+  accountId: string,
+): Promise<{ deleted: boolean; account_id: string }> {
+  return getJson(`/api/schwab/mapping/${encodeURIComponent(accountId)}`, {
+    method: "DELETE",
+  });
+}
+
+export function getSchwabReadiness(
+  accountId: string,
+): Promise<{ readiness: SchwabAccountReadiness }> {
+  return getJson(`/api/schwab/readiness/${encodeURIComponent(accountId)}`);
 }

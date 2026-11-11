@@ -1,7 +1,8 @@
+import asyncio
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-from portfolio_mcp.database import PortfolioRepository
+from portfolio_mcp.connection_store import ConnectionStore
 from portfolio_mcp.execution import ExecutionProvider, OrderState
 from portfolio_mcp.trading_service import TradingValidationError
 
@@ -9,7 +10,7 @@ from portfolio_mcp.trading_service import TradingValidationError
 class CancellationService:
     def __init__(
         self,
-        repository: PortfolioRepository,
+        repository: ConnectionStore,
         provider_for_account: Callable[[str], ExecutionProvider],
         clock: Callable[[], datetime],
     ) -> None:
@@ -56,8 +57,11 @@ class CancellationService:
                 "order_unavailable", "The order is not available for cancellation"
             )
         try:
-            state, created = self._repository.reserve_cancellation(
-                account_id, broker_order_id, self._now()
+            state, created = await asyncio.to_thread(
+                self._repository.reserve_cancellation,
+                account_id,
+                broker_order_id,
+                self._now(),
             )
         except ValueError:
             raise TradingValidationError(
@@ -68,18 +72,31 @@ class CancellationService:
         self._require_route(account_id)
         try:
             result = await provider.cancel_order(broker_order_id)
+        except asyncio.CancelledError:
+            await asyncio.to_thread(
+                self._repository.finish_cancellation,
+                account_id,
+                broker_order_id,
+                "UNKNOWN",
+                self._now(),
+            )
+            raise
         except Exception:
-            return "UNKNOWN"
-        if result.broker_order_id != broker_order_id:
-            return "UNKNOWN"
+            result = None
         state = (
             result.state.value
-            if result.state
+            if result is not None
+            and result.broker_order_id == broker_order_id
+            and result.state
             in {OrderState.CANCEL_PENDING, OrderState.CANCELED, OrderState.FILLED}
             else "UNKNOWN"
         )
-        self._repository.finish_cancellation(
-            account_id, broker_order_id, state, self._now()
+        await asyncio.to_thread(
+            self._repository.finish_cancellation,
+            account_id,
+            broker_order_id,
+            state,
+            self._now(),
         )
         return state
 
@@ -95,24 +112,29 @@ class CancellationService:
         provider = self._provider_for_account(account_id)
         try:
             capability = await provider.get_execution_capability(account_id)
-            if (
-                capability.account_id != account_id
-                or not capability.permits_cancellation
-            ):
-                return state
-            result = await provider.get_order(broker_order_id)
+            result = (
+                await provider.get_order(broker_order_id)
+                if capability.account_id == account_id
+                and capability.permits_cancellation
+                else None
+            )
         except Exception:
-            return state
+            result = None
         if (
-            result is None
-            or result.broker_order_id != broker_order_id
-            or result.state not in {OrderState.CANCELED, OrderState.FILLED}
+            result is not None
+            and result.broker_order_id == broker_order_id
+            and result.state in {OrderState.CANCELED, OrderState.FILLED}
         ):
-            return state
-        self._repository.finish_cancellation(
-            account_id, broker_order_id, result.state.value, self._now()
+            state = result.state.value
+        await asyncio.to_thread(
+            self._repository.finish_cancellation,
+            account_id,
+            broker_order_id,
+            state,
+            self._now(),
+            kind="reconciliation",
         )
-        return result.state.value
+        return state
 
     def _now(self) -> datetime:
         value = self._clock()

@@ -8,19 +8,25 @@ from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from portfolio_mcp.database import PortfolioRepository
+from portfolio_mcp.connection_store import ConnectionStore
+from portfolio_mcp.database import Database
 from portfolio_mcp.fixtures import FixturePortfolioProvider
+from portfolio_mcp.portfolio_store import save_refresh
 
 
 async def seed(database_path: Path):
     if database_path.exists():
         raise ValueError("History seeding requires a new database.")
     provider = FixturePortfolioProvider()
-    repo = PortfolioRepository(f"sqlite:///{database_path}")
+    database = Database(f"sqlite:///{database_path}")
+    routes = ConnectionStore(database)
+    routes.save_connection("fixture", "fixture", "fixture", "fixture", True)
     snapshots = [
         await provider.get_holdings(account.id)
         for account in await provider.list_accounts()
     ]
+    for snapshot in snapshots:
+        routes.save_account_route(snapshot.account.id, "fixture", snapshot.account.id)
     now = datetime.now(ZoneInfo("America/New_York"))
     for offset in range(45, 0, -1):
         if offset in {10, 11}:
@@ -53,7 +59,7 @@ async def seed(database_path: Path):
         ]
         if offset == 15:
             daily = daily[:1]
-        repo.save_refresh(daily, saved, saved, snapshot_date=snapshot_date)
+        save_refresh(database, daily, saved, saved, snapshot_date=snapshot_date)
 
 
 if __name__ == "__main__":

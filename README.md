@@ -65,6 +65,9 @@ Use the printed dashboard URL and run directory with the skill's doctor,
 browser, and cleanup steps. Local server permissions and browser access are
 required to complete the browser proof; a blocked launch is not a UI pass.
 
+The concrete Schwab HTTPS regression tests require the `openssl` executable.
+They generate their temporary test certificates and keys outside the repository.
+
 ## Dashboard development
 
 The dashboard frontend lives in `dashboard/` and talks to a local FastAPI API.
@@ -118,12 +121,56 @@ Alpaca delayed SIP is the normal market-data provider. Schwab remains available
 for instrument search and quotes but does not provide this app’s intraday chart. After completing Schwab's approved production OAuth flow,
 add the locally stored credentials and select the Schwab adapter:
 
+`SCHWAB_CALLBACK_URL` defaults to `https://127.0.0.1:8182`; keep the explicit
+setting below when it matches the callback URL registered with Schwab.
+
 ```sh
 MARKET_DATA_PROVIDER=schwab
 SCHWAB_CLIENT_ID=
 SCHWAB_CLIENT_SECRET=
 SCHWAB_REFRESH_TOKEN=
+SCHWAB_CALLBACK_URL=https://127.0.0.1:8182
 ```
+
+To replace an expired refresh token, run:
+
+```sh
+uv run --env-file .env python -m portfolio_mcp.schwab_oauth
+```
+
+Open the printed authorization URL, complete Schwab authorization, and paste the
+full redirect URL when prompted. The command prints a replacement
+`SCHWAB_REFRESH_TOKEN`; manually replace that value in `.env`.
+
+If a Schwab request fails after restarting the backend, use the reported error
+to choose the recovery step:
+
+- `provider_tls_verification_failed`: repair the backend's certificate trust
+  or network inspection configuration. Reauthorizing the Schwab account does
+  not fix certificate verification.
+- `provider_tls_configuration_error`: repair the configured `SSL_CERT_FILE` or
+  `SSL_CERT_DIR` source, or remove an unintended override. Public Schwab HTTPS
+  also uses the maintained certifi bundle alongside OpenSSL's default roots.
+- `schwab_reauthorization_required`: Schwab rejected the refresh grant as
+  `invalid_grant`; run the owner-operated OAuth helper above and replace the
+  local refresh token.
+- `schwab_client_authentication_failed`: check that the Schwab app's client ID
+  and secret are correct and belong to the approved app.
+- `provider_authorization_failed`: verify the app's API permissions and
+  entitlements. A new refresh token may not change these permissions.
+- `provider_unavailable` or `provider_rate_limited`: retry after the temporary
+  outage or rate limit has cleared.
+
+An anonymous HTTPS response can help diagnose certificate connectivity without
+using account credentials:
+
+```sh
+curl -sS -o /dev/null -w 'HTTP %{http_code}\n' https://api.schwabapi.com/
+```
+
+Any HTTP response, including an error such as 404, confirms only that DNS,
+network connectivity, and TLS completed for that request. It does not validate
+the configured client credentials or refresh token.
 
 Start the API with `uv run --env-file .env uvicorn api_main:app --reload`.
 These settings provide read-only Schwab instrument search and quote requests;
@@ -153,24 +200,13 @@ window. SnapTrade completeness and source sync time are unknown; Fidelity data
 may update daily with a delay of up to 24 hours. Open orders require direct
 access. Each account reports its source, coverage and any retrieval failure.
 
-For direct Schwab order reads, configure the existing Schwab OAuth variables
-above and explicitly bind each canonical application account ID to its verified
-Schwab encrypted account hash. Set `SCHWAB_ORDER_ACCOUNT_BINDINGS` to a JSON
-object, for example (both values below are fictional placeholders):
-
-```sh
-SCHWAB_ORDER_ACCOUNT_BINDINGS='{"example-application-account-id":"example-verified-encrypted-hash"}'
-```
-
-The hash must be verified for the same brokerage account as the canonical
-SnapTrade account; account labels are not used for matching. Schwab's account
-numbers endpoint returns encrypted hashes to authorized clients. Configure the
-mapping on the server without sharing account hashes or credentials. When no
-mapping is configured, the account remains on the SnapTrade executed-order
-view and direct access requires setup. Direct Schwab history requests cover a
-90-day window and identify results that reach the provider limit as potentially
-incomplete. These reads do not submit or cancel orders; configuring them does
-not enable trading.
+For direct Schwab order reads, configure the Schwab OAuth variables above and
+confirm the account mapping in the dashboard. The mapping links a canonical
+portfolio account to an owner-verified Schwab account; labels do not establish
+identity. Without a verified mapping, the account remains on the SnapTrade
+executed-order view. Direct Schwab requests cover a 90-day window and mark a
+provider-limit result as potentially incomplete. These reads do not enable
+trading. This project does not currently ship a direct Schwab execution adapter.
 
 For explicit offline development set `PORTFOLIO_PROVIDER=fixture` and
 `MARKET_DATA_PROVIDER=fixture`. The verification helper sets both automatically
@@ -183,3 +219,26 @@ The dashboard can connect an Alpaca live account using the server's existing Alp
 The supported order scope is long-only US stocks and ETFs, whole shares, market or limit orders, and DAY duration. Market-order reviews use a separate current IEX quote from one exchange, with limited market coverage. Ticker display data remains delayed SIP. A missing, stale, or unauthorized execution quote blocks a market order.
 
 Review the LIVE account and order details before confirmation. Pending or unknown order and cancellation outcomes require reconciliation; do not submit them again. A local disconnect disables the connection and its trading authorization but does not cancel broker orders or revoke remote credentials.
+
+## Isolated browser verification
+
+Use fictional providers and a separate SQLite database for UI checks:
+
+```sh
+verification_dir="$(mktemp -d)"
+export PORTFOLIO_DATABASE_URL="sqlite:///$verification_dir/portfolio.db"
+export PORTFOLIO_PROVIDER=fixture
+export MARKET_DATA_PROVIDER=fixture
+export EXECUTION_PROVIDER=fixture
+export SCHWAB_EXECUTION_ENABLED=false
+uv run uvicorn api_main:app --host 127.0.0.1 --port 8000
+```
+
+In another terminal, run `npm --prefix dashboard run dev`. Open the printed
+localhost URL and refresh the portfolio. Check Overview, Accounts, Activity,
+Market data, Orders, and Settings. Search for VTI and confirm that its quote
+shows Fixture market data. Order actions use the fixture execution provider.
+
+Stop both servers when finished and remove the temporary directory printed by
+`echo "$verification_dir"`. Attach screenshots and recordings directly to PR
+descriptions. Keep them outside the repository.

@@ -1,7 +1,7 @@
 from sqlalchemy import engine_from_config, pool
 
 from alembic import context
-from portfolio_mcp.database import Base
+from portfolio_mcp.schema import Base
 
 config = context.config
 target_metadata = Base.metadata

@@ -2,7 +2,7 @@ from dataclasses import replace
 from datetime import date
 from typing import Literal
 
-from portfolio_mcp.database import AccountRoute, PortfolioRepository
+from portfolio_mcp.connection_store import AccountRoute, ConnectionStore
 from portfolio_mcp.models import (
     Account,
     AccountCapabilities,
@@ -25,7 +25,7 @@ from portfolio_mcp.ticker import BrokerOrderHistory
 
 class ProviderRegistry:
     def __init__(
-        self, repository: PortfolioRepository, providers: dict[str, PortfolioProvider]
+        self, repository: ConnectionStore, providers: dict[str, PortfolioProvider]
     ) -> None:
         self._repository = repository
         self._providers = providers

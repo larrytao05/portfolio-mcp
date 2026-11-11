@@ -1,13 +1,14 @@
-import json
 import os
 from collections.abc import Mapping
 
 from portfolio_mcp.alpaca_market_data import AlpacaMarketDataProvider
 from portfolio_mcp.config import (
     AlpacaMarketDataSettings,
-    SchwabMarketDataSettings,
+    ExecutionSettings,
+    SchwabSettings,
     SnapTradeSettings,
 )
+from portfolio_mcp.execution import ExecutionProvider, FixtureExecutionProvider
 from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
 from portfolio_mcp.provider import (
     MarketDataProvider,
@@ -16,6 +17,22 @@ from portfolio_mcp.provider import (
 )
 from portfolio_mcp.schwab_market_data import SchwabMarketDataProvider
 from portfolio_mcp.snaptrade import SnapTradeProvider
+from portfolio_mcp.trading_service import (
+    SubmissionValidator,
+    fixture_submission_validator,
+)
+
+
+def resolve_submission_validator(
+    provider: PortfolioProvider,
+    execution_provider: ExecutionProvider,
+    validator: SubmissionValidator | None,
+) -> SubmissionValidator:
+    if validator is not None:
+        return validator
+    if type(execution_provider) is FixtureExecutionProvider:
+        return fixture_submission_validator(provider)
+    raise ValueError("A final trading policy validator is required")
 
 
 def create_provider(
@@ -47,7 +64,7 @@ def create_market_data_provider(
             AlpacaMarketDataSettings.from_environment(source)
         )
     if mode == "schwab":
-        settings = SchwabMarketDataSettings.from_environment(source)
+        settings = SchwabSettings.from_environment(source)
         return SchwabMarketDataProvider(settings)
 
     raise ProviderConfigurationError(
@@ -84,24 +101,16 @@ def create_dashboard_providers(
     return providers
 
 
-def create_direct_schwab_orders(environment: Mapping[str, str] | None = None):
-    from portfolio_mcp.direct_schwab_orders import DirectSchwabOrders
+def create_execution_settings(
+    environment: Mapping[str, str] | None = None,
+) -> ExecutionSettings:
+    return ExecutionSettings.from_environment(environment)
 
-    source = os.environ if environment is None else environment
-    raw = source.get("SCHWAB_ORDER_ACCOUNT_BINDINGS")
-    if not raw:
-        return None
+
+def create_schwab_settings(
+    environment: Mapping[str, str] | None = None,
+) -> SchwabSettings | None:
     try:
-        bindings = json.loads(raw)
-    except ValueError:
-        raise ProviderConfigurationError(
-            "Invalid Schwab order account bindings"
-        ) from None
-    if not isinstance(bindings, dict) or any(
-        not isinstance(k, str) or not k or not isinstance(v, str) or not v
-        for k, v in bindings.items()
-    ):
-        raise ProviderConfigurationError("Invalid Schwab order account bindings")
-    return DirectSchwabOrders(
-        SchwabMarketDataSettings.from_environment(source), bindings
-    )
+        return SchwabSettings.from_environment(environment)
+    except ProviderConfigurationError:
+        return None

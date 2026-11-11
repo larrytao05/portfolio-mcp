@@ -112,7 +112,7 @@ def test_upstream_disabled_refresh_and_orders_fail_closed_preserving_history(tmp
             client.get(
                 "/api/accounts/schwab-taxable-demo/broker-orders?symbol=VTI"
             ).status_code
-            == 502
+            == 503
         )
         assert client.post("/api/connections/snaptrade").status_code == 200
         assert not client.get("/api/connections").json()["accounts"][0]["active"]

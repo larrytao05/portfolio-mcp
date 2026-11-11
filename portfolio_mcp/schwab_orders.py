@@ -13,6 +13,7 @@ from portfolio_mcp.provider import (
     ProviderResponseError,
     ProviderUnavailableError,
 )
+from portfolio_mcp.schwab_transport import SchwabOAuthTransport
 
 
 @dataclass(frozen=True)
@@ -47,9 +48,11 @@ class SchwabOrderReader:
         access_token: str,
         *,
         http_client: AlpacaHttpClient | None = None,
+        transport: SchwabOAuthTransport | None = None,
     ):
         if not account_id or not encrypted_account_id or not access_token:
             raise ValueError("Explicit account mapping and authorization are required")
+        self._transport = transport
         self.account_id = account_id
         self._encrypted_id = encrypted_account_id
         self._client = http_client or UrllibAlpacaHttpClient()
@@ -83,7 +86,12 @@ class SchwabOrderReader:
             "https://api.schwabapi.com/trader/v1/accounts/"
             f"{quote(self._encrypted_id, safe='')}/orders?{urlencode(params)}"
         )
-        status, body = await asyncio.to_thread(self._client.request, url, self._headers)
+        if self._transport is not None:
+            status, body = await self._transport.request("GET", url)
+        else:
+            status, body = await asyncio.to_thread(
+                self._client.request, url, self._headers
+            )
         if status == 401:
             raise ProviderAuthenticationError("Unable to authenticate with Schwab")
         if status == 403:

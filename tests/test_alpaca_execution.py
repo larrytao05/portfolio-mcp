@@ -61,7 +61,11 @@ def authorized_transport(responses):
 
 def provider(transport):
     return AlpacaExecutionProvider(
-        "canonical-1", "upstream-1", transport, dispatch_guard=lambda _: None
+        "canonical-1",
+        "upstream-1",
+        transport,
+        dispatch_guard=lambda _: None,
+        cancel_dispatch=lambda dispatch: dispatch(),
     )
 
 
@@ -397,3 +401,83 @@ def test_guard_delay_cannot_expire_quote_before_post():
             adapter.submit_order(command(valid_until=now + timedelta(seconds=60)))
         )
     assert [request[0] for request in transport.requests] == ["GET"]
+
+
+@pytest.mark.parametrize("change", ["disable", "disconnect"])
+def test_cancellation_route_change_during_order_read_blocks_delete(tmp_path, change):
+    from portfolio_mcp.connection_store import ConnectionStore
+    from portfolio_mcp.database import Database
+
+    store = ConnectionStore(Database(f"sqlite:///{tmp_path / 'routes.sqlite'}"))
+    store.save_connection("live", "alpaca", "live", "server_env:alpaca", True)
+    store.save_account_route("canonical-1", "live", "upstream-1", trade_enabled=True)
+    route = store.account_route("canonical-1")
+    assert route is not None
+
+    class ChangingTransport(FakeTransport):
+        def request(self, method, path, body=None):
+            result = super().request(method, path, body)
+            if path == "/v2/orders/broker-1" and method == "GET":
+                if change == "disconnect":
+                    store.disconnect_connection("live")
+                else:
+                    assert store.change_account_settings(
+                        "canonical-1", route.version, trade_enabled=False
+                    )
+            return result
+
+    transport = ChangingTransport(
+        [
+            (
+                200,
+                {
+                    "id": "upstream-1",
+                    "status": "ACTIVE",
+                    "trading_blocked": False,
+                    "account_blocked": False,
+                },
+            ),
+            (200, {"id": "broker-1", "status": "new"}),
+            (204, None),
+        ]
+    )
+    adapter = AlpacaExecutionProvider(
+        "canonical-1",
+        "upstream-1",
+        transport,
+        cancel_dispatch=lambda dispatch: store.dispatch_cancellation(route, dispatch),
+    )
+    with pytest.raises(ExecutionIndeterminateError):
+        asyncio.run(adapter.cancel_order("broker-1"))
+    assert all(method != "DELETE" for method, _, _ in transport.requests)
+
+
+def test_cancellation_dispatch_does_not_consult_global_kill_switch(tmp_path):
+    from portfolio_mcp.connection_store import ConnectionStore
+    from portfolio_mcp.database import Database
+    from portfolio_mcp.trading_safety import TradingSettingsService
+
+    database = Database(f"sqlite:///{tmp_path / 'routes.sqlite'}")
+    store = ConnectionStore(database)
+    store.save_connection("live", "alpaca", "live", "server_env:alpaca", True)
+    store.save_account_route("canonical-1", "live", "upstream-1", trade_enabled=True)
+    route = store.account_route("canonical-1")
+    assert route is not None
+    assert (
+        TradingSettingsService(database, lambda: datetime.now(UTC))
+        .get()
+        .kill_switch_active
+    )
+    transport = authorized_transport(
+        [(200, {"id": "broker-1", "status": "new"}), (204, None)]
+    )
+    adapter = AlpacaExecutionProvider(
+        "canonical-1",
+        "upstream-1",
+        transport,
+        cancel_dispatch=lambda dispatch: store.dispatch_cancellation(route, dispatch),
+    )
+    assert (
+        asyncio.run(adapter.cancel_order("broker-1")).state == OrderState.CANCEL_PENDING
+    )
+    assert transport.requests[-1][0] == "DELETE"

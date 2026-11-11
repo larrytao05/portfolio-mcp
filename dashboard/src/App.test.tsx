@@ -10,6 +10,8 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
+import { ApiError } from "./api/client";
+import { quoteSourceLabel } from "./lib/portfolioDisplay";
 import type { Position } from "./api/client";
 
 const api = vi.hoisted(() => ({
@@ -36,13 +38,27 @@ const api = vi.hoisted(() => ({
   refreshPortfolio: vi.fn(),
   updateTradingSettings: vi.fn(),
   searchInstruments: vi.fn(),
+  getOrders: vi.fn().mockResolvedValue({
+    orders: [],
+    next_cursor: null,
+    refresh_groups: [],
+    server_time: "2026-09-12T20:00:00Z",
+  }),
+  getOrderAudit: vi.fn().mockResolvedValue({
+    events: [],
+    next_cursor: null,
+  }),
+  refreshOrder: vi.fn(),
 }));
 
-vi.mock("./api/client", () => api);
+vi.mock("./api/client", async (importOriginal) => ({
+  ...api,
+  ApiError: (await importOriginal<typeof import("./api/client")>()).ApiError,
+}));
 
 function renderApp() {
   const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
+    defaultOptions: { queries: { retry: false, retryDelay: 0 } },
   });
   return render(
     <QueryClientProvider client={queryClient}>
@@ -70,6 +86,18 @@ function savedAccount(positions: Position[] = []) {
     },
   };
 }
+
+it.each([
+  ["schwab_market_data", "Schwab market data"],
+  ["fixture_market_data", "Fixture market data"],
+  ["future_market_data", "Unknown source"],
+  [null, "Unavailable"],
+  ["", "Unavailable"],
+  ["  ", "Unavailable"],
+  [" schwab_market_data ", "Schwab market data"],
+])("labels quote source %s", (source, label) => {
+  expect(quoteSourceLabel(source)).toBe(label);
+});
 
 describe("App", () => {
   afterEach(cleanup);
@@ -148,7 +176,7 @@ describe("App", () => {
     const { container } = renderApp();
     await screen.findByRole("heading", { name: "Portfolio Dashboard" });
     const panels = Array.from(container.querySelectorAll<HTMLDetailsElement>(".workspace-panel"));
-    expect(panels).toHaveLength(5);
+    expect(panels).toHaveLength(6);
     expect(panels.every((panel) => !panel.open)).toBe(true);
     const overview = container.querySelector("#overview")!;
     const positions = container.querySelector("#positions")!;
@@ -921,10 +949,66 @@ describe("App", () => {
     expect(
       await screen.findByText(/Instrument search is unavailable\./),
     ).toBeTruthy();
+    expect(screen.queryByText("provider failure")).toBeNull();
     api.searchInstruments.mockResolvedValue({ instruments: [] });
     fireEvent.click(screen.getByRole("button", { name: "Search" }));
     expect(await screen.findByText(/No instruments found\./)).toBeTruthy();
+    expect(api.searchInstruments).toHaveBeenCalledTimes(5);
+  });
+
+  it("shows a provider search error and allows a manual retry", async () => {
+    api.searchInstruments.mockRejectedValueOnce(
+      new ApiError(503, "Repair backend certificate trust.", "provider_tls_verification_failed"),
+    );
+    renderApp();
+
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    expect((await screen.findByText("Repair backend certificate trust.")).getAttribute("role")).toBe("alert");
+    expect(api.searchInstruments).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    expect(await screen.findByText(/No instruments found\./)).toBeTruthy();
     expect(api.searchInstruments).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows a provider quote error and allows selecting the same instrument again", async () => {
+    api.searchInstruments.mockResolvedValue({
+      instruments: [{
+        id: "us-etf:VTI", symbol: "VTI", name: "Vanguard Total Stock Market ETF",
+        asset_class: "equity_etf", exchange: null, currency: "USD",
+      }],
+    });
+    api.getQuote.mockRejectedValueOnce(
+      new ApiError(503, "Repair backend certificate trust.", "provider_tls_verification_failed"),
+    );
+    renderApp();
+
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    const instrument = await screen.findByRole("button", { name: /VTI.*Vanguard Total Stock Market ETF/ });
+    fireEvent.click(instrument);
+    expect((await screen.findByText("Repair backend certificate trust.")).getAttribute("role")).toBe("alert");
+    expect(api.getQuote).toHaveBeenCalledTimes(1);
+
+    api.getQuote.mockResolvedValue({ quote: null });
+    fireEvent.click(instrument);
+    await waitFor(() => expect(api.getQuote).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByText("Repair backend certificate trust.")).toBeNull());
+  });
+
+  it("shows the trade search error and allows a manual retry", async () => {
+    api.searchInstruments.mockRejectedValueOnce(
+      new ApiError(401, "Reauthorize the Schwab account.", "schwab_reauthorization_required"),
+    );
+    renderApp();
+
+    fireEvent.change(screen.getByLabelText("Trade instrument search"), { target: { value: "VTI" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search trade instruments" }));
+    expect((await screen.findByText("Reauthorize the Schwab account.")).getAttribute("role")).toBe("alert");
+    expect(api.searchInstruments).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Search trade instruments" }));
+    await waitFor(() => expect(api.searchInstruments).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByText("Reauthorize the Schwab account.")).toBeNull());
   });
 
   it("renders fresh overview with total known USD value, asset class, security type, account contributions, cash, and gain/loss", async () => {
@@ -1196,4 +1280,11 @@ describe("App", () => {
     expect(historyScreen.getByText("2 of 2 accounts")).toBeTruthy();
     expect(historyScreen.getByText(/Gap in recorded history/)).toBeTruthy();
   });
+  it("reports an unavailable safeguard read instead of permanent loading", async () => {
+    api.getTradingSettings.mockRejectedValue(new Error("Service unavailable"));
+    renderApp();
+    expect(await screen.findByText("Trading safeguards are unavailable. Reload to try again.")).toBeTruthy();
+    expect(screen.queryByText("Loading trading safeguards…")).toBeNull();
+  });
+
 });

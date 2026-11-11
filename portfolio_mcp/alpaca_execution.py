@@ -90,7 +90,12 @@ class AlpacaExecutionProvider:
         *,
         dispatch_guard: Callable[[ExecutionCommand], None] | None = None,
         clock: Callable[[], datetime] | None = None,
+        cancel_dispatch: Callable[
+            [Callable[[], tuple[int, object]]], tuple[int, object]
+        ]
+        | None = None,
     ) -> None:
+        self._cancel_dispatch = cancel_dispatch
         self._account_id = account_id
         self._upstream_account_id = upstream_account_id
         self._transport = transport
@@ -235,6 +240,12 @@ class AlpacaExecutionProvider:
         )
         return [parsed] if parsed else []
 
+    def _dispatch_cancellation(self, broker_order_id: str) -> tuple[int, object]:
+        if self._cancel_dispatch is None:
+            raise ExecutionPreflightError("Cancellation route guard is unavailable")
+        path = f"/v2/orders/{quote(broker_order_id, safe='')}"
+        return self._cancel_dispatch(lambda: self._transport.request("DELETE", path))
+
     async def cancel_order(self, broker_order_id: str) -> ExecutionResult:
         capability = await self.get_execution_capability(self._account_id)
         if not capability.permits_cancellation:
@@ -246,8 +257,8 @@ class AlpacaExecutionProvider:
         }:
             raise ExecutionError("Order cannot be canceled")
         try:
-            status, _ = await self._request(
-                "DELETE", f"/v2/orders/{quote(broker_order_id, safe='')}"
+            status, _ = await asyncio.to_thread(
+                self._dispatch_cancellation, broker_order_id
             )
         except Exception as error:
             raise ExecutionIndeterminateError(

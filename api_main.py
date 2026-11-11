@@ -4,7 +4,6 @@ from portfolio_mcp.api import create_app
 from portfolio_mcp.bootstrap import (
     create_dashboard_providers,
     create_database_url,
-    create_direct_schwab_orders,
     create_market_data_provider,
 )
 from portfolio_mcp.provider import ProviderConfigurationError
@@ -25,7 +24,6 @@ app = create_app(
     market_data_provider=market_data,
     configured_providers=providers,
     database_url=create_database_url(),
-    direct_schwab_orders=create_direct_schwab_orders(),
 )
 
 if __name__ == "__main__":

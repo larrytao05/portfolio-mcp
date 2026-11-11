@@ -67,6 +67,7 @@ class AlpacaPortfolioProvider:
         *,
         dispatch_guard=None,
         clock=None,
+        cancel_dispatch=None,
     ):
         from portfolio_mcp.alpaca_execution import (
             AlpacaExecutionProvider,
@@ -79,6 +80,14 @@ class AlpacaPortfolioProvider:
             UrllibAlpacaExecutionTransport(self._settings),
             dispatch_guard=dispatch_guard,
             clock=clock,
+            cancel_dispatch=cancel_dispatch,
+        )
+
+    def order_reader(self, account_id: str, upstream_account_id: str):
+        from portfolio_mcp.alpaca_orders import AlpacaOrderReader
+
+        return AlpacaOrderReader(
+            account_id, upstream_account_id, self._settings, http_client=self._client
         )
 
     async def list_accounts(self) -> list[Account]:

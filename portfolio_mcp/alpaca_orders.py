@@ -35,6 +35,7 @@ class AlpacaOrder:
     canceled_at: str | None
     expired_at: str | None
     replaced_at: str | None
+    time_in_force: str | None = None
 
 
 class AlpacaOrderReader:
@@ -195,4 +196,5 @@ def _parse_order(account_id: str, value: object) -> AlpacaOrder:
         canceled_at=_optional_text(value.get("canceled_at")),
         expired_at=_optional_text(value.get("expired_at")),
         replaced_at=_optional_text(value.get("replaced_at")),
+        time_in_force=_optional_text(value.get("time_in_force")),
     )

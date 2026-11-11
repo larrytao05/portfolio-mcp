@@ -4,14 +4,17 @@ from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Callable, Iterable, Sequence
 
-from portfolio_mcp.database import (
+from portfolio_mcp.database import Database
+from portfolio_mcp.models import Position
+from portfolio_mcp.portfolio_records import (
     DailyAccountValue,
-    PortfolioRepository,
     RefreshResult,
     StoredAccount,
     StoredPosition,
 )
-from portfolio_mcp.models import Position
+from portfolio_mcp.portfolio_store import (
+    read_portfolio_view,
+)
 
 
 def _sum_decimals(values: Iterable[Decimal | None]) -> Decimal:
@@ -223,12 +226,13 @@ class PortfolioOverview:
 
 
 class OverviewService:
-    def __init__(self, repository: PortfolioRepository) -> None:
-        self._repository = repository
+    def __init__(self, database: Database) -> None:
+        self._database = database
 
     def get_overview(self) -> PortfolioOverview:
-        latest_refresh = self._repository.latest_refresh()
-        stored_accounts = self._included_accounts()
+        view = read_portfolio_view(self._database, included_only=True)
+        latest_refresh = view.latest_refresh
+        stored_accounts = view.accounts
 
         if not stored_accounts:
             if latest_refresh and latest_refresh.status == "failed":
@@ -242,13 +246,14 @@ class OverviewService:
                     if raw_warnings
                     else ("Overview unavailable: provider refresh failed.",)
                 )
-                return self._error_overview(
+                return self._empty_overview(
+                    status="error",
                     warnings=warnings,
                     provider_coverage=self._build_provider_coverage(
                         latest_refresh, stored_accounts
                     ),
                 )
-            if self._repository.list_accounts():
+            if view.excluded_accounts:
                 return self._empty_overview(
                     warnings=(
                         "Saved accounts are unlinked or hidden. "
@@ -257,17 +262,8 @@ class OverviewService:
                 )
             return self._empty_overview()
 
-        included_ids = {account.account.id for account in stored_accounts}
-        stored_positions = [
-            position
-            for position in self._repository.all_positions()
-            if position.position.account_id in included_ids
-        ]
-        all_daily = [
-            value
-            for value in self._repository.all_daily_values()
-            if value.account_id in included_ids
-        ]
+        stored_positions = view.positions
+        all_daily = view.daily_values
 
         status = self._determine_status(stored_accounts, latest_refresh)
         as_of = max((p.as_of for p in stored_positions), default=None)
@@ -304,6 +300,11 @@ class OverviewService:
             gain_loss_positions, len(stored_positions)
         )
         warnings = self._collect_warnings(stored_accounts, latest_refresh)
+        if view.unlinked_accounts:
+            warnings += (
+                "Saved accounts are unlinked and excluded from totals. "
+                "Reconnect them to include their value.",
+            )
         history = self._build_history(all_daily, len(stored_accounts))
         provider_coverage = self._build_provider_coverage(
             latest_refresh, stored_accounts
@@ -326,27 +327,8 @@ class OverviewService:
         )
 
     def get_history(self) -> RecordedHistory:
-        accounts = self._included_accounts()
-        included_ids = {account.account.id for account in accounts}
-        all_daily = [
-            value
-            for value in self._repository.all_daily_values()
-            if value.account_id in included_ids
-        ]
-        return self._build_history(all_daily, len(accounts))
-
-    def _included_accounts(self) -> list[StoredAccount]:
-        routes = {
-            route.account_id: route for route in self._repository.account_routes()
-        }
-        accounts = self._repository.list_accounts()
-        return [
-            account
-            for account in accounts
-            if (route := routes.get(account.account.id)) is not None
-            and route.active
-            and route.included
-        ]
+        view = read_portfolio_view(self._database, included_only=True)
+        return self._build_history(view.daily_values, len(view.accounts))
 
     def _empty_overview(
         self,
@@ -376,20 +358,9 @@ class OverviewService:
             provider_coverage=provider_coverage,
         )
 
-    def _error_overview(
-        self,
-        warnings: tuple[str, ...] = ("Overview unavailable: provider refresh failed.",),
-        provider_coverage: tuple[ProviderCoverage, ...] = (),
-    ) -> PortfolioOverview:
-        return self._empty_overview(
-            status="error",
-            warnings=warnings,
-            provider_coverage=provider_coverage,
-        )
-
     def _determine_status(
         self,
-        stored_accounts: list[StoredAccount],
+        stored_accounts: Sequence[StoredAccount],
         latest_refresh: RefreshResult | None,
     ) -> str:
         if all(a.is_stale for a in stored_accounts) or (
@@ -404,8 +375,8 @@ class OverviewService:
 
     def _classify_positions(
         self,
-        stored_positions: list[StoredPosition],
-        stored_accounts: list[StoredAccount],
+        stored_positions: Sequence[StoredPosition],
+        stored_accounts: Sequence[StoredAccount],
     ) -> tuple[list[StoredPosition], list[OverviewExclusion], list[StoredPosition]]:
         stale_account_ids = {a.account.id for a in stored_accounts if a.is_stale}
         fresh_usd_positions: list[StoredPosition] = []
@@ -466,7 +437,9 @@ class OverviewService:
         return fresh_usd_positions, exclusions, gain_loss_positions
 
     def _calculate_cash_usd(
-        self, fresh_usd_positions: list[StoredPosition], accounts: list[StoredAccount]
+        self,
+        fresh_usd_positions: list[StoredPosition],
+        accounts: Sequence[StoredAccount],
     ) -> Decimal | None:
         cash = [
             p
@@ -479,8 +452,8 @@ class OverviewService:
 
     def _calculate_contributions(
         self,
-        stored_accounts: list[StoredAccount],
-        stored_positions: list[StoredPosition],
+        stored_accounts: Sequence[StoredAccount],
+        stored_positions: Sequence[StoredPosition],
         fresh_usd_positions: list[StoredPosition],
         total_known_usd: Decimal | None,
     ) -> tuple[list[OverviewAccountContribution], list[AllocationSlice]]:
@@ -701,7 +674,7 @@ class OverviewService:
 
     def _collect_warnings(
         self,
-        stored_accounts: list[StoredAccount],
+        stored_accounts: Sequence[StoredAccount],
         latest_refresh: RefreshResult | None,
     ) -> tuple[str, ...]:
         warnings: list[str] = []
@@ -726,7 +699,7 @@ class OverviewService:
     def _build_provider_coverage(
         self,
         latest_refresh: RefreshResult | None,
-        stored_accounts: list[StoredAccount],
+        stored_accounts: Sequence[StoredAccount],
     ) -> tuple[ProviderCoverage, ...]:
         provider_coverages: list[ProviderCoverage] = []
         if latest_refresh and latest_refresh.provider_outcomes:
@@ -775,7 +748,7 @@ class OverviewService:
         return tuple(provider_coverages)
 
     def _build_history(
-        self, all_daily: list[DailyAccountValue], total_accounts: int
+        self, all_daily: Sequence[DailyAccountValue], total_accounts: int
     ) -> RecordedHistory:
         date_groups: dict[date, list[DailyAccountValue]] = defaultdict(list)
         all_currencies: set[str] = set()

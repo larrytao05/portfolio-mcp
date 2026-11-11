@@ -49,7 +49,7 @@ it("requires inline confirmation before cancellation and reconciles unknown", as
 
 it("does not label a refused cancellation as sent", async () => {
   const api = await import("../../api/client");
-  const cancel = vi.spyOn(api, "cancelBrokerOrder").mockRejectedValue(new api.ApiError("Order unavailable", 400));
+  const cancel = vi.spyOn(api, "cancelBrokerOrder").mockRejectedValue(new api.ApiError(400, "Order unavailable"));
   render(<OrdersPanel accountLabel="Alpaca" symbol="VTI" view="open" history={{ ...history, source: "Alpaca", orders: [{ ...order, status: "new", leg_id: null }] }} failed={false} />);
   fireEvent.click(screen.getByRole("button", { name: "Review cancellation" }));
   fireEvent.click(screen.getByRole("button", { name: "Confirm cancellation" }));

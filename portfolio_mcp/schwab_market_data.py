@@ -1,79 +1,51 @@
-import asyncio
-import base64
-import json
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Protocol
-from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
-from urllib.request import Request, build_opener
 
-from portfolio_mcp.alpaca_market_data import _NoRedirect
-from portfolio_mcp.config import SchwabMarketDataSettings
+from portfolio_mcp.config import SchwabSettings
 from portfolio_mcp.models import Instrument, Quote
 from portfolio_mcp.provider import (
     InstrumentNotFoundError,
-    ProviderAuthenticationError,
-    ProviderAuthorizationError,
-    ProviderRateLimitError,
     ProviderResponseError,
-    ProviderUnavailableError,
 )
-
-
-class SchwabHttpClient(Protocol):
-    def request(
-        self,
-        method: str,
-        url: str,
-        headers: dict[str, str],
-        body: bytes | None = None,
-    ) -> tuple[int, object]: ...
-
-
-class UrllibSchwabHttpClient:
-    def request(
-        self,
-        method: str,
-        url: str,
-        headers: dict[str, str],
-        body: bytes | None = None,
-    ) -> tuple[int, object]:
-        request = Request(url, data=body, headers=headers, method=method)
-        try:
-            with build_opener(_NoRedirect()).open(request, timeout=15) as response:
-                return response.status, _decode_body(response.read())
-        except HTTPError as error:
-            return error.code, _decode_body(error.read())
-        except URLError:
-            raise ProviderUnavailableError(
-                "Schwab market data is temporarily unavailable"
-            ) from None
+from portfolio_mcp.schwab_transport import (
+    SchwabHttpClient,
+    SchwabOAuthTransport,
+    raise_for_status,
+)
 
 
 class SchwabMarketDataProvider:
     source = "schwab_market_data"
-    _token_url = "https://api.schwabapi.com/v1/oauth/token"
     _market_data_url = "https://api.schwabapi.com/marketdata/v1"
 
     def __init__(
         self,
-        settings: SchwabMarketDataSettings,
+        settings: SchwabSettings,
         *,
         http_client: SchwabHttpClient | None = None,
-        clock: Callable[[], datetime] | None = None,
+        transport: SchwabOAuthTransport | None = None,
     ) -> None:
-        self._settings = settings
-        self._http_client = http_client or UrllibSchwabHttpClient()
-        self._clock = clock or (lambda: datetime.now(UTC))
+        self._transport = transport or SchwabOAuthTransport(
+            settings, http_client=http_client, context="Schwab market data"
+        )
+
+    def authorization_url(self) -> str:
+        return self._transport.authorization_url()
+
+    def authorization_code_from_redirect_url(self, redirect_url: str) -> str:
+        return self._transport.authorization_code_from_redirect_url(redirect_url)
+
+    async def exchange_authorization_code(self, code: str) -> str:
+        return await self._transport.exchange_authorization_code(code)
 
     async def search_instruments(self, query: str) -> list[Instrument]:
         normalized_query = query.strip()
         if not normalized_query:
             return []
         parameters = urlencode({"symbol": normalized_query, "projection": "search"})
-        status, body = await self._request(
+        status, body = await self._transport.request(
             "GET",
             f"{self._market_data_url}/instruments?{parameters}",
         )
@@ -87,7 +59,7 @@ class SchwabMarketDataProvider:
 
     async def get_quote(self, instrument_id: str) -> Quote:
         asset_class, symbol = _instrument_id_parts(instrument_id)
-        status, body = await self._request(
+        status, body = await self._transport.request(
             "GET",
             f"{self._market_data_url}/{quote(symbol, safe='')}/quotes",
         )
@@ -97,7 +69,7 @@ class SchwabMarketDataProvider:
         source = _required_mapping(body, symbol)
         quote_data = _required_mapping(source.get("quote"))
         reference = _required_mapping(source.get("reference"))
-        observed_at = _observation_time(quote_data.get("quoteTime"), self._clock)
+        observed_at = _observation_time(quote_data.get("quoteTime"))
         symbol = _optional_string(source.get("symbol")) or _required_string(
             reference.get("symbol")
         )
@@ -119,78 +91,9 @@ class SchwabMarketDataProvider:
             currency=instrument.currency,
         )
 
-    async def _request(self, method: str, url: str) -> tuple[int, object]:
-        token = await self._access_token()
-        return await self._http_request(
-            method,
-            url,
-            {"Authorization": f"Bearer {token}", "Accept": "application/json"},
-        )
-
-    async def _access_token(self) -> str:
-        credentials = f"{self._settings.client_id}:{self._settings.client_secret}"
-        authorization = base64.b64encode(credentials.encode()).decode()
-        body = urlencode(
-            {
-                "grant_type": "refresh_token",
-                "refresh_token": self._settings.refresh_token,
-            }
-        ).encode()
-        status, response = await self._http_request(
-            "POST",
-            self._token_url,
-            {
-                "Authorization": f"Basic {authorization}",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-            },
-            body,
-        )
-        _raise_for_status(status)
-        return _required_string(_required_mapping(response).get("access_token"))
-
-    async def _http_request(
-        self,
-        method: str,
-        url: str,
-        headers: dict[str, str],
-        body: bytes | None = None,
-    ) -> tuple[int, object]:
-        try:
-            return await asyncio.to_thread(
-                self._http_client.request,
-                method,
-                url,
-                headers,
-                body,
-            )
-        except TimeoutError:
-            raise ProviderUnavailableError(
-                "Schwab market data is temporarily unavailable"
-            ) from None
-
-
-def _decode_body(body: bytes) -> object:
-    try:
-        return json.loads(body)
-    except (TypeError, ValueError):
-        return None
-
 
 def _raise_for_status(status: int) -> None:
-    if 200 <= status < 300:
-        return
-    if status == 401:
-        raise ProviderAuthenticationError("Unable to authenticate with Schwab")
-    if status == 403:
-        raise ProviderAuthorizationError("Schwab market data access is not authorized")
-    if status == 429:
-        raise ProviderRateLimitError(
-            "Schwab market data rate limit reached; try again later"
-        )
-    if status <= 0 or status >= 500:
-        raise ProviderUnavailableError("Schwab market data is temporarily unavailable")
-    raise ProviderResponseError("Schwab market data returned an unexpected response")
+    raise_for_status(status, context="Schwab market data")
 
 
 def _required_mapping(value: object, key: str | None = None) -> Mapping[str, object]:
@@ -217,28 +120,25 @@ def _optional_decimal(value: object) -> Decimal | None:
         return None
     if isinstance(value, (str, int, float)):
         try:
-            return Decimal(str(value))
+            result = Decimal(str(value))
+            if result.is_finite():
+                return result
         except ArithmeticError:
             pass
     raise ProviderResponseError("Schwab market data returned an unexpected response")
 
 
-def _observation_time(value: object, clock: Callable[[], datetime]) -> datetime:
-    if value is not None:
-        if not isinstance(value, (int, float)) or isinstance(value, bool):
-            raise ProviderResponseError(
-                "Schwab market data returned an unexpected response"
-            )
-        try:
-            return datetime.fromtimestamp(value / 1000, UTC)
-        except (OverflowError, OSError, ValueError):
-            raise ProviderResponseError(
-                "Schwab market data returned an unexpected response"
-            ) from None
-    now = clock()
-    if now.tzinfo is None:
-        raise ValueError("Clock must return a timezone-aware timestamp")
-    return now.astimezone(UTC)
+def _observation_time(value: object) -> datetime:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ProviderResponseError(
+            "Schwab market data returned an unexpected response"
+        )
+    try:
+        return datetime.fromtimestamp(value / 1000, UTC)
+    except (OverflowError, OSError, ValueError):
+        raise ProviderResponseError(
+            "Schwab market data returned an unexpected response"
+        ) from None
 
 
 def _asset_class(value: str) -> str:

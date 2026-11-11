@@ -18,6 +18,7 @@ import { ConnectionsSection } from "./features/connections/ConnectionsSection";
 import { AccountsSection } from "./features/accounts/AccountsSection";
 import { MarketDataSection } from "./features/market-data/MarketDataSection";
 import { PositionsSection } from "./features/positions/PositionsSection";
+import { OrdersSection } from "./features/orders/OrdersSection";
 import { OverviewSection } from "./features/overview/OverviewSection";
 import { RecordStrip } from "./features/record/RecordStrip";
 import { ExecutionStatus, TradeSection, TradingSettingsPanel } from "./features/trading/TradingPanels";
@@ -51,6 +52,7 @@ function Navigation() {
         ["accounts", "Accounts"],
         ["connections", "Connections"],
         ["activity", "Activity"],
+        ["orders", "Orders"],
         ["market-data", "Market data"],
         ["settings", "Settings"],
         ["trade", "Trade"],
@@ -95,6 +97,8 @@ export function App() {
         queryClient.invalidateQueries({ queryKey: ["activity"] }),
         queryClient.invalidateQueries({ queryKey: ["overview"] }),
         queryClient.invalidateQueries({ queryKey: ["trading", "status"] }),
+        queryClient.invalidateQueries({ queryKey: ["orders"] }),
+        queryClient.invalidateQueries({ queryKey: ["order-audit"] }),
       ]);
     },
   });
@@ -190,6 +194,10 @@ export function App() {
         <details className="workspace-panel">
           <summary>Activity</summary>
           <ActivitySection accounts={accounts.data?.accounts ?? []} />
+        </details>
+        <details className="workspace-panel">
+          <summary>Orders</summary>
+          <OrdersSection accounts={accounts.data?.accounts ?? []} />
         </details>
         <details className="workspace-panel">
           <summary>Market data</summary>

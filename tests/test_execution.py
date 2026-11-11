@@ -1,15 +1,18 @@
 import asyncio
+import multiprocessing
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import cast
+from multiprocessing.connection import Connection
+from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
 
 from portfolio_mcp.api import create_app
-from portfolio_mcp.database import PortfolioRepository
+from portfolio_mcp.connection_store import ConnectionStore
+from portfolio_mcp.database import Database
 from portfolio_mcp.execution import (
     CapabilityState,
     ExecutionCapability,
@@ -21,6 +24,21 @@ from portfolio_mcp.execution import (
     require_transition,
 )
 from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
+from portfolio_mcp.order_authorization_store import authorization_for_draft
+from portfolio_mcp.order_query_store import (
+    list_order_events,
+    order_draft,
+    order_for_draft,
+)
+from portfolio_mcp.order_query_store import order as load_order
+from portfolio_mcp.order_submission_store import (
+    begin_order_submission,
+    finish_order_submission,
+    recover_stranded_submissions,
+)
+from portfolio_mcp.portfolio_store import save_refresh
+from portfolio_mcp.server import create_server
+from portfolio_mcp.submission_locks import SubmissionLockError
 from portfolio_mcp.trading_safety import (
     TradeIntent,
     TradingGuard,
@@ -33,6 +51,43 @@ from portfolio_mcp.trading_service import (
     allow_fixture_submission,
     fixture_submission_validator,
 )
+
+
+def _start_mcp_and_report_order_state(
+    database_url: str, draft_id: str, now: datetime, connection: Connection
+) -> None:
+    database = Database(database_url, lambda: now)
+    create_server(
+        FixturePortfolioProvider(),
+        database_url=database_url,
+        clock=lambda: now,
+        database=database,
+    )
+    order = order_for_draft(database, draft_id)
+    connection.send(order.state.value if order is not None else None)
+    connection.close()
+
+
+def _submit_and_wait_for_termination(
+    database_url: str,
+    draft_id: str,
+    fingerprint: str,
+    now: datetime,
+    started: Any,
+) -> None:
+    database = Database(database_url, lambda: now)
+
+    class BlockingProvider(FixtureExecutionProvider):
+        async def submit_order(self, command: ExecutionCommand) -> ExecutionResult:
+            self.invocations.append(("submit", command.client_order_id))
+            started.set()
+            await asyncio.sleep(3600)
+            raise AssertionError("the terminated provider call unexpectedly returned")
+
+    service = OrderSubmissionService(
+        database, BlockingProvider(), lambda: now, allow_fixture_submission
+    )
+    asyncio.run(service.confirm(draft_id, fingerprint, True))
 
 
 def command() -> ExecutionCommand:
@@ -78,14 +133,13 @@ async def test_trading_guard_applies_conservative_limits_and_capabilities(
 ) -> None:
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
     portfolio = FixturePortfolioProvider()
-    repository = PortfolioRepository(
-        f"sqlite:///{tmp_path / 'portfolio.db'}", lambda: now
-    )
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}", lambda: now)
     snapshots = [
         await portfolio.get_holdings(account.id)
         for account in await portfolio.list_accounts()
     ]
-    repository.save_refresh(
+    save_refresh(
+        database,
         snapshots,
         now,
         now,
@@ -94,11 +148,14 @@ async def test_trading_guard_applies_conservative_limits_and_capabilities(
             [snapshot.account.id for snapshot in snapshots]
         ),
     )
-    repository.save_connection("fixture", "fixture", "fixture", "fixture", True)
-    repository.save_account_route(
+    ConnectionStore(database).save_connection(
+        "fixture", "fixture", "fixture", "fixture", True
+    )
+    ConnectionStore(database).save_account_route(
         "schwab-taxable-demo", "fixture", "schwab-taxable-demo", trade_enabled=True
     )
-    settings = TradingSettingsService(repository, lambda: now)
+    settings = TradingSettingsService(database, lambda: now)
+
     settings.replace(
         live_trading_enabled=True,
         kill_switch_active=False,
@@ -106,7 +163,7 @@ async def test_trading_guard_applies_conservative_limits_and_capabilities(
         max_order_notional_usd="200",
         version=0,
     )
-    guard = TradingGuard(repository, settings)
+    guard = TradingGuard(database, settings)
 
     allowed = guard.evaluate(
         TradeIntent(
@@ -151,14 +208,13 @@ async def test_trading_guard_fails_closed_for_each_safety_precondition(
 ) -> None:
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
     portfolio = FixturePortfolioProvider()
-    repository = PortfolioRepository(
-        f"sqlite:///{tmp_path / 'portfolio.db'}", lambda: now
-    )
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}", lambda: now)
     snapshots = [
         await portfolio.get_holdings(account.id)
         for account in await portfolio.list_accounts()
     ]
-    repository.save_refresh(
+    save_refresh(
+        database,
         snapshots,
         now,
         now,
@@ -167,11 +223,14 @@ async def test_trading_guard_fails_closed_for_each_safety_precondition(
             [snapshot.account.id for snapshot in snapshots]
         ),
     )
-    repository.save_connection("fixture", "fixture", "fixture", "fixture", True)
-    repository.save_account_route(
+    ConnectionStore(database).save_connection(
+        "fixture", "fixture", "fixture", "fixture", True
+    )
+    ConnectionStore(database).save_account_route(
         "schwab-taxable-demo", "fixture", "schwab-taxable-demo", trade_enabled=True
     )
-    settings = TradingSettingsService(repository, lambda: now)
+    settings = TradingSettingsService(database, lambda: now)
+
     enabled = settings.replace(
         live_trading_enabled=True,
         kill_switch_active=False,
@@ -179,7 +238,7 @@ async def test_trading_guard_fails_closed_for_each_safety_precondition(
         max_order_notional_usd="10000",
         version=0,
     )
-    guard = TradingGuard(repository, settings)
+    guard = TradingGuard(database, settings)
     intent = TradeIntent(
         account_id="schwab-taxable-demo",
         symbol="VTI",
@@ -272,13 +331,13 @@ class IndeterminateExecutionProvider:
 
 
 async def create_limit_draft(
-    repository: PortfolioRepository,
+    database: Database,
     now: datetime,
     account_id: str = "schwab-taxable-demo",
 ):
     portfolio = FixturePortfolioProvider()
     service = await enabled_order_draft_service(
-        repository,
+        database,
         portfolio,
         FixtureMarketDataProvider(),
         lambda: now,
@@ -294,7 +353,7 @@ async def create_limit_draft(
 
 
 async def enabled_trading_guard(
-    repository: PortfolioRepository, portfolio: FixturePortfolioProvider
+    database: Database, portfolio: FixturePortfolioProvider
 ) -> TradingGuard:
     refreshed_at = datetime.now(UTC)
     accounts = await portfolio.list_accounts()
@@ -310,18 +369,22 @@ async def enabled_trading_guard(
             [account.id for account in accounts]
         )
     ]
-    repository.save_refresh(
+    save_refresh(
+        database,
         snapshots,
         refreshed_at,
         refreshed_at,
         refreshed_at.date(),
         capabilities=capabilities,
     )
-    repository.save_connection("fixture", "fixture", "fixture", "fixture", True)
-    repository.save_account_route(
+    ConnectionStore(database).save_connection(
+        "fixture", "fixture", "fixture", "fixture", True
+    )
+    ConnectionStore(database).save_account_route(
         "schwab-taxable-demo", "fixture", "schwab-taxable-demo", trade_enabled=True
     )
-    settings = TradingSettingsService(repository, lambda: refreshed_at)
+    settings = TradingSettingsService(database, lambda: refreshed_at)
+
     settings.replace(
         live_trading_enabled=True,
         kill_switch_active=False,
@@ -329,20 +392,20 @@ async def enabled_trading_guard(
         max_order_notional_usd="1000000",
         version=0,
     )
-    return TradingGuard(repository, settings)
+    return TradingGuard(database, settings)
 
 
 async def enabled_order_draft_service(
-    repository: PortfolioRepository,
+    database: Database,
     portfolio: FixturePortfolioProvider,
     market_data: FixtureMarketDataProvider,
     clock: Callable[[], datetime],
 ) -> OrderDraftService:
     return OrderDraftService(
-        repository,
+        database,
         market_data,
         clock,
-        await enabled_trading_guard(repository, portfolio),
+        await enabled_trading_guard(database, portfolio),
     )
 
 
@@ -396,7 +459,7 @@ async def test_fixture_capabilities_deny_unknown_accounts_by_default() -> None:
 async def test_drafts_require_whole_share_quantities(tmp_path) -> None:
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
     service = OrderDraftService(
-        PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}"),
+        Database(f"sqlite:///{tmp_path / 'portfolio.db'}"),
         FixtureMarketDataProvider(),
         lambda: now,
     )
@@ -423,10 +486,10 @@ async def test_drafts_accept_canonical_etf_asset_class(tmp_path) -> None:
                 quote, instrument=replace(quote.instrument, asset_class="etf")
             )
 
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
     portfolio = FixturePortfolioProvider()
     service = await enabled_order_draft_service(
-        repository,
+        database,
         portfolio,
         CanonicalEtfMarketDataProvider(),
         lambda: now,
@@ -444,7 +507,7 @@ async def test_drafts_accept_canonical_etf_asset_class(tmp_path) -> None:
     assert draft.estimated_notional == Decimal("300.25")
     assert draft.account_refreshed_at is not None
     assert draft.capability_observed_at is not None
-    assert repository.order_draft(draft.id) == draft
+    assert order_draft(database, draft.id) == draft
 
 
 @pytest.mark.asyncio
@@ -456,10 +519,10 @@ async def test_drafts_reject_future_market_quotes(tmp_path) -> None:
             quote = await super().get_quote(instrument_id)
             return replace(quote, observed_at=now + timedelta(seconds=1))
 
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
     portfolio = FixturePortfolioProvider()
     service = await enabled_order_draft_service(
-        repository, portfolio, FutureQuoteProvider(), lambda: now
+        database, portfolio, FutureQuoteProvider(), lambda: now
     )
 
     with pytest.raises(TradingValidationError, match="current quote"):
@@ -502,9 +565,9 @@ async def test_fixture_submission_validator_rechecks_current_sell_holdings(
 ) -> None:
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
     portfolio = FixturePortfolioProvider()
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
     service = await enabled_order_draft_service(
-        repository, portfolio, FixtureMarketDataProvider(), lambda: now
+        database, portfolio, FixtureMarketDataProvider(), lambda: now
     )
     draft = await service.create(
         account_id="schwab-taxable-demo",
@@ -529,7 +592,7 @@ async def test_fixture_submission_validator_rejects_unavailable_state(tmp_path) 
             raise RuntimeError("unavailable")
 
     draft = await create_limit_draft(
-        PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}"),
+        Database(f"sqlite:///{tmp_path / 'portfolio.db'}"),
         datetime(2026, 9, 12, 20, 0, tzinfo=UTC),
     )
 
@@ -548,7 +611,7 @@ async def test_fixture_submission_validator_rejects_missing_account(tmp_path) ->
 
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
     draft = await create_limit_draft(
-        PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}"), now
+        Database(f"sqlite:///{tmp_path / 'portfolio.db'}"), now
     )
 
     with pytest.raises(TradingValidationError, match="Account not found"):
@@ -568,7 +631,7 @@ async def test_fixture_submission_validator_rejects_stale_account_state(
 
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
     draft = await create_limit_draft(
-        PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}"), now
+        Database(f"sqlite:///{tmp_path / 'portfolio.db'}"), now
     )
 
     with pytest.raises(TradingValidationError, match="account state is stale"):
@@ -580,10 +643,10 @@ async def test_market_quote_can_stale_after_intent_and_reject_without_provider_c
     tmp_path,
 ) -> None:
     observed_at = FixtureMarketDataProvider.observed_at
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
     portfolio = FixturePortfolioProvider()
     draft_service = await enabled_order_draft_service(
-        repository,
+        database,
         portfolio,
         FixtureMarketDataProvider(),
         lambda: observed_at,
@@ -606,7 +669,7 @@ async def test_market_quote_can_stale_after_intent_and_reject_without_provider_c
     )
     provider = FixtureExecutionProvider()
     service = OrderSubmissionService(
-        repository, provider, lambda: next(clock_values), allow_fixture_submission
+        database, provider, lambda: next(clock_values), allow_fixture_submission
     )
 
     order = await service.confirm(draft.id, draft.fingerprint, True)
@@ -646,15 +709,25 @@ def test_state_machine_rejects_terminal_and_regressive_transitions() -> None:
 @pytest.mark.asyncio
 async def test_repository_enforces_persisted_state_transitions(tmp_path) -> None:
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    draft = await create_limit_draft(repository, now)
-    order, _ = repository.begin_order_submission(draft, now)
-    repository.finish_order_submission(order.id, OrderState.UNKNOWN, now)
-    reconciled = repository.finish_order_submission(order.id, OrderState.FILLED, now)
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    draft = await create_limit_draft(database, now)
+    order, _ = begin_order_submission(database, draft, now)
+    unknown = finish_order_submission(
+        database, order.id, OrderState.UNKNOWN, now, expected_version=order.version
+    )
+    reconciled = finish_order_submission(
+        database, order.id, OrderState.FILLED, now, expected_version=unknown.version
+    )
 
     assert reconciled.state == OrderState.FILLED
     with pytest.raises(ValueError):
-        repository.finish_order_submission(order.id, OrderState.ACCEPTED, now)
+        finish_order_submission(
+            database,
+            order.id,
+            OrderState.ACCEPTED,
+            now,
+            expected_version=reconciled.version,
+        )
 
 
 @pytest.mark.asyncio
@@ -662,10 +735,10 @@ async def test_submission_persists_intent_once_and_never_retries_unknown(
     tmp_path,
 ) -> None:
     now = datetime(2026, 9, 12, 20, 0, 30, tzinfo=UTC)
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
     portfolio = FixturePortfolioProvider()
     draft_service = await enabled_order_draft_service(
-        repository,
+        database,
         portfolio,
         FixtureMarketDataProvider(),
         lambda: now,
@@ -680,7 +753,7 @@ async def test_submission_persists_intent_once_and_never_retries_unknown(
     )
     provider = FixtureExecutionProvider("timeout")
     service = OrderSubmissionService(
-        repository, provider, lambda: now, allow_fixture_submission
+        database, provider, lambda: now, allow_fixture_submission
     )
 
     first = await service.confirm(draft.id, draft.fingerprint, True)
@@ -698,10 +771,10 @@ async def test_submission_runs_the_final_policy_check_before_persisting_intent(
     tmp_path,
 ) -> None:
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
     portfolio = FixturePortfolioProvider()
     draft_service = await enabled_order_draft_service(
-        repository,
+        database,
         portfolio,
         FixtureMarketDataProvider(),
         lambda: now,
@@ -719,13 +792,13 @@ async def test_submission_runs_the_final_policy_check_before_persisting_intent(
     async def reject_policy(_, __):
         raise TradingValidationError("trading_disabled", "Trading is disabled")
 
-    service = OrderSubmissionService(repository, provider, lambda: now, reject_policy)
+    service = OrderSubmissionService(database, provider, lambda: now, reject_policy)
     with pytest.raises(TradingValidationError, match="disabled"):
         await service.confirm(draft.id, draft.fingerprint, True)
 
     assert provider.invocations == []
-    assert repository.order_for_draft(draft.id) is None
-    assert repository.authorization_for_draft(draft.id) is None
+    assert order_for_draft(database, draft.id) is None
+    assert authorization_for_draft(database, draft.id) is None
 
 
 @pytest.mark.asyncio
@@ -740,39 +813,39 @@ async def test_unsupported_execution_capability_blocks_before_intent(
     tmp_path, capability: ExecutionCapability
 ) -> None:
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    draft = await create_limit_draft(repository, now)
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    draft = await create_limit_draft(database, now)
     provider = FixtureExecutionProvider(capabilities={draft.account_id: capability})
     service = OrderSubmissionService(
-        repository, provider, lambda: now, allow_fixture_submission
+        database, provider, lambda: now, allow_fixture_submission
     )
 
     with pytest.raises(TradingValidationError, match="cannot submit"):
         await service.confirm(draft.id, draft.fingerprint, True)
 
     assert [name for name, _ in provider.invocations] == ["capability"]
-    assert repository.order_for_draft(draft.id) is None
-    assert repository.authorization_for_draft(draft.id) is None
+    assert order_for_draft(database, draft.id) is None
+    assert authorization_for_draft(database, draft.id) is None
 
 
 @pytest.mark.asyncio
 async def test_capability_read_failure_blocks_before_intent(tmp_path) -> None:
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    draft = await create_limit_draft(repository, now)
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    draft = await create_limit_draft(database, now)
     provider = IndeterminateExecutionProvider(
         ExecutionResult(OrderState.ACCEPTED, "fixture-order"),
         RuntimeError("unavailable"),
     )
     service = OrderSubmissionService(
-        repository, provider, lambda: now, allow_fixture_submission
+        database, provider, lambda: now, allow_fixture_submission
     )
 
     with pytest.raises(TradingValidationError, match="capability is unavailable"):
         await service.confirm(draft.id, draft.fingerprint, True)
 
     assert provider.invocations == 0
-    assert repository.order_for_draft(draft.id) is None
+    assert order_for_draft(database, draft.id) is None
 
 
 @pytest.mark.asyncio
@@ -789,27 +862,27 @@ async def test_malformed_capability_blocks_before_intent(
     tmp_path, capability: object
 ) -> None:
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    draft = await create_limit_draft(repository, now)
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    draft = await create_limit_draft(database, now)
     provider = IndeterminateExecutionProvider(
         ExecutionResult(OrderState.ACCEPTED, "fixture-order"), capability
     )
     service = OrderSubmissionService(
-        repository, provider, lambda: now, allow_fixture_submission
+        database, provider, lambda: now, allow_fixture_submission
     )
 
     with pytest.raises(TradingValidationError, match="capability is unavailable"):
         await service.confirm(draft.id, draft.fingerprint, True)
 
     assert provider.invocations == 0
-    assert repository.order_for_draft(draft.id) is None
+    assert order_for_draft(database, draft.id) is None
 
 
 @pytest.mark.asyncio
 async def test_mismatched_capability_account_blocks_before_intent(tmp_path) -> None:
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    draft = await create_limit_draft(repository, now)
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    draft = await create_limit_draft(database, now)
     provider = IndeterminateExecutionProvider(
         ExecutionResult(OrderState.ACCEPTED, "fixture-order"),
         ExecutionCapability(
@@ -817,14 +890,14 @@ async def test_mismatched_capability_account_blocks_before_intent(tmp_path) -> N
         ),
     )
     service = OrderSubmissionService(
-        repository, provider, lambda: now, allow_fixture_submission
+        database, provider, lambda: now, allow_fixture_submission
     )
 
     with pytest.raises(TradingValidationError, match="capability is unavailable"):
         await service.confirm(draft.id, draft.fingerprint, True)
 
     assert provider.invocations == 0
-    assert repository.order_for_draft(draft.id) is None
+    assert order_for_draft(database, draft.id) is None
 
 
 @pytest.mark.asyncio
@@ -887,11 +960,11 @@ async def test_malformed_or_missing_identity_response_becomes_unknown(
     tmp_path, result: object
 ) -> None:
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    draft = await create_limit_draft(repository, now)
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    draft = await create_limit_draft(database, now)
     provider = IndeterminateExecutionProvider(result)
     service = OrderSubmissionService(
-        repository, provider, lambda: now, allow_fixture_submission
+        database, provider, lambda: now, allow_fixture_submission
     )
 
     order = await service.confirm(draft.id, draft.fingerprint, True)
@@ -905,17 +978,17 @@ async def test_cancellation_persists_unknown_then_propagates_cancellation(
     tmp_path,
 ) -> None:
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    draft = await create_limit_draft(repository, now)
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    draft = await create_limit_draft(database, now)
     provider = IndeterminateExecutionProvider(asyncio.CancelledError())
     service = OrderSubmissionService(
-        repository, provider, lambda: now, allow_fixture_submission
+        database, provider, lambda: now, allow_fixture_submission
     )
 
     with pytest.raises(asyncio.CancelledError):
         await service.confirm(draft.id, draft.fingerprint, True)
 
-    recovered = repository.order_for_draft(draft.id)
+    recovered = order_for_draft(database, draft.id)
     assert recovered is not None
     assert recovered.state == OrderState.UNKNOWN
 
@@ -926,10 +999,10 @@ async def test_definite_immediate_fill_results_are_preserved(
     tmp_path, scenario: str
 ) -> None:
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    draft = await create_limit_draft(repository, now)
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    draft = await create_limit_draft(database, now)
     service = OrderSubmissionService(
-        repository,
+        database,
         FixtureExecutionProvider(scenario),
         lambda: now,
         allow_fixture_submission,
@@ -947,24 +1020,196 @@ async def test_definite_immediate_fill_results_are_preserved(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_result",
+    [ExecutionResult(OrderState.ACCEPTED, "fixture-order"), TimeoutError()],
+)
+async def test_submission_result_event_uses_provider_observation_time(
+    tmp_path, provider_result: object
+) -> None:
+    now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+    clock = [now]
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}", lambda: clock[0])
+    draft = await create_limit_draft(database, now)
+
+    class DelayedProvider(IndeterminateExecutionProvider):
+        async def submit_order(self, command: ExecutionCommand) -> ExecutionResult:
+            del command
+            self.invocations += 1
+            clock[0] += timedelta(minutes=1)
+            if isinstance(self.result, BaseException):
+                raise self.result
+            return cast(ExecutionResult, self.result)
+
+    service = OrderSubmissionService(
+        database,
+        DelayedProvider(provider_result),
+        lambda: clock[0],
+        allow_fixture_submission,
+    )
+
+    order = await service.confirm(draft.id, draft.fingerprint, True)
+
+    events = list_order_events(database, order_id=order.id, limit=100).items
+    submitted_at = next(
+        event.occurred_at
+        for event in events
+        if event.event_type.value == "submission_started"
+    )
+    result_at = next(
+        event.occurred_at
+        for event in events
+        if event.event_type.value == "submission_result"
+    )
+    assert result_at > submitted_at
+    stored = load_order(database, order.id)
+    assert stored is not None
+    assert stored.provider_submission_started_at == submitted_at
+
+
+@pytest.mark.asyncio
 async def test_startup_recovers_stranded_submitting_order_without_resubmission(
     tmp_path,
 ) -> None:
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    draft = await create_limit_draft(repository, now)
-    pending, created = repository.begin_order_submission(draft, now)
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    draft = await create_limit_draft(database, now)
+    pending, created = begin_order_submission(database, draft, now)
     assert created
     provider = FixtureExecutionProvider()
-    restarted = OrderSubmissionService(
-        repository, provider, lambda: now, allow_fixture_submission
+    create_server(
+        FixturePortfolioProvider(),
+        execution_provider=provider,
+        database_url=f"sqlite:///{tmp_path / 'portfolio.db'}",
+        clock=lambda: now,
+        database=database,
     )
 
-    order = await restarted.confirm(draft.id, draft.fingerprint, True)
+    order = order_for_draft(database, draft.id)
 
+    assert order is not None
     assert order.id == pending.id
     assert order.state == OrderState.UNKNOWN
     assert provider.invocations == []
+
+
+@pytest.mark.asyncio
+async def test_api_order_list_recovers_submission_after_app_startup(tmp_path) -> None:
+    now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+    database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
+    database = Database(database_url, lambda: now)
+    draft = await create_limit_draft(database, now)
+    provider = FixtureExecutionProvider()
+    app = create_app(
+        FixturePortfolioProvider(),
+        execution_provider=provider,
+        database_url=database_url,
+        clock=lambda: now,
+    )
+    pending, created = begin_order_submission(database, draft, now)
+    assert created
+
+    response = TestClient(app).get("/api/orders")
+
+    assert response.status_code == 200
+    assert response.json()["orders"][0]["id"] == pending.id
+    assert response.json()["orders"][0]["state"] == OrderState.UNKNOWN.value
+    assert provider.invocations == []
+
+
+@pytest.mark.asyncio
+async def test_mcp_startup_does_not_recover_live_submission(tmp_path) -> None:
+    now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+    database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
+    database = Database(database_url, lambda: now)
+    draft = await create_limit_draft(database, now)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingProvider(FixtureExecutionProvider):
+        async def submit_order(self, command: ExecutionCommand) -> ExecutionResult:
+            self.invocations.append(("submit", command.client_order_id))
+            entered.set()
+            await release.wait()
+            return ExecutionResult(
+                OrderState.ACCEPTED, f"fixture-{command.client_order_id}"
+            )
+
+    provider = BlockingProvider()
+    service = OrderSubmissionService(
+        database, provider, lambda: now, allow_fixture_submission
+    )
+    submission = asyncio.create_task(service.confirm(draft.id, draft.fingerprint, True))
+    await entered.wait()
+
+    context = multiprocessing.get_context("spawn")
+    receive, send = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_start_mcp_and_report_order_state,
+        args=(database_url, draft.id, now, send),
+    )
+    process.start()
+    send.close()
+    process_state = None
+    got_process_state = False
+    try:
+        got_process_state = receive.poll(30)
+        if got_process_state:
+            process_state = receive.recv()
+        process.join(timeout=30)
+    finally:
+        receive.close()
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=30)
+        release.set()
+    completed = await submission
+
+    assert got_process_state, "MCP process did not finish startup recovery"
+    assert process.exitcode == 0
+    assert process_state == OrderState.SUBMITTING.value
+    assert completed.state == OrderState.ACCEPTED
+    assert completed.broker_order_id == f"fixture-{completed.client_order_id}"
+    assert [name for name, _ in provider.invocations].count("submit") == 1
+
+
+@pytest.mark.asyncio
+async def test_dead_submission_process_is_recovered_without_retry(tmp_path) -> None:
+    now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+    database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
+    database = Database(database_url, lambda: now)
+    draft = await create_limit_draft(database, now)
+    context = multiprocessing.get_context("spawn")
+    started = context.Event()
+    process = context.Process(
+        target=_submit_and_wait_for_termination,
+        args=(database_url, draft.id, draft.fingerprint, now, started),
+    )
+    process.start()
+    try:
+        assert started.wait(30), "provider write did not start"
+        pending = order_for_draft(database, draft.id)
+        assert pending is not None
+        assert pending.state == OrderState.SUBMITTING
+    finally:
+        process.terminate()
+        process.join(timeout=30)
+
+    assert process.exitcode is not None
+    assert recover_stranded_submissions(database, now) == 1
+    recovered = order_for_draft(database, draft.id)
+    assert recovered is not None
+    assert recovered.state == OrderState.UNKNOWN
+    assert recover_stranded_submissions(database, now) == 0
+
+    retry_provider = FixtureExecutionProvider()
+    service = OrderSubmissionService(
+        database, retry_provider, lambda: now, allow_fixture_submission
+    )
+    result = await service.confirm(draft.id, draft.fingerprint, True)
+
+    assert result.state == OrderState.UNKNOWN
+    assert retry_provider.invocations == []
 
 
 @pytest.mark.asyncio
@@ -972,8 +1217,8 @@ async def test_concurrent_confirmations_create_one_order_and_authorization(
     tmp_path,
 ) -> None:
     now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    draft = await create_limit_draft(repository, now)
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    draft = await create_limit_draft(database, now)
     started = asyncio.Event()
     release = asyncio.Event()
 
@@ -988,23 +1233,53 @@ async def test_concurrent_confirmations_create_one_order_and_authorization(
 
     provider = BlockingProvider()
     service = OrderSubmissionService(
-        repository, provider, lambda: now, allow_fixture_submission
+        database, provider, lambda: now, allow_fixture_submission
     )
     first = asyncio.create_task(service.confirm(draft.id, draft.fingerprint, True))
     await started.wait()
-    second = await service.confirm(draft.id, draft.fingerprint, True)
+    with pytest.raises(TradingValidationError) as error:
+        await service.confirm(draft.id, draft.fingerprint, True)
+    assert error.value.code == "submission_in_progress"
     release.set()
     completed = await first
 
-    assert completed.id == second.id
+    assert completed.state == OrderState.ACCEPTED
     assert [entry for entry in provider.invocations if entry[0] == "submit"] == [
         ("submit", completed.client_order_id)
     ]
-    authorization = repository.authorization_for_draft(draft.id)
+    authorization = authorization_for_draft(database, draft.id)
     assert authorization is not None
     assert authorization.expected_fingerprint == draft.fingerprint
     assert authorization.account_id == draft.account_id
     assert authorization.actor == "dashboard-owner"
+    events = list_order_events(database, order_id=completed.id, limit=100).items
+    assert not any(event.event_type.value == "authorization_failed" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_submission_lock_failure_fails_closed_without_auth_failure_audit(
+    tmp_path, monkeypatch
+) -> None:
+    now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    draft = await create_limit_draft(database, now)
+    provider = FixtureExecutionProvider()
+    service = OrderSubmissionService(
+        database, provider, lambda: now, allow_fixture_submission
+    )
+
+    def fail_claim(draft_id: str):
+        del draft_id
+        raise SubmissionLockError("permission denied")
+
+    monkeypatch.setattr(database.submission_locks, "claim", fail_claim)
+    with pytest.raises(TradingValidationError) as error:
+        await service.confirm(draft.id, draft.fingerprint, True)
+
+    assert error.value.code == "submission_lock_unavailable"
+    assert provider.invocations == []
+    events = list_order_events(database, draft_id=draft.id, limit=100).items
+    assert not any(event.event_type.value == "authorization_failed" for event in events)
 
 
 @pytest.mark.asyncio
@@ -1016,10 +1291,10 @@ async def test_market_confirmation_enforces_quote_freshness_boundary(
     tmp_path, seconds: int, allowed: bool
 ) -> None:
     observed_at = FixtureMarketDataProvider.observed_at
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
     portfolio = FixturePortfolioProvider()
     draft_service = await enabled_order_draft_service(
-        repository,
+        database,
         portfolio,
         FixtureMarketDataProvider(),
         lambda: observed_at,
@@ -1034,7 +1309,7 @@ async def test_market_confirmation_enforces_quote_freshness_boundary(
     )
     provider = FixtureExecutionProvider()
     service = OrderSubmissionService(
-        repository,
+        database,
         provider,
         lambda: observed_at + timedelta(seconds=seconds),
         allow_fixture_submission,
@@ -1160,8 +1435,9 @@ def test_kill_switch_blocks_submission_after_a_draft_is_reviewed(tmp_path) -> No
 
 @pytest.mark.asyncio
 async def test_guard_blocks_missing_hidden_and_disconnected_routes(tmp_path) -> None:
-    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
-    guard = await enabled_trading_guard(repository, FixturePortfolioProvider())
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    repository = ConnectionStore(database)
+    guard = await enabled_trading_guard(database, FixturePortfolioProvider())
     intent = TradeIntent(
         account_id="schwab-taxable-demo",
         symbol="VTI",

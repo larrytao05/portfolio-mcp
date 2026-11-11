@@ -5,7 +5,8 @@ from typing import Any, cast
 import pytest
 
 from portfolio_mcp.cancellation_service import CancellationService
-from portfolio_mcp.database import PortfolioRepository
+from portfolio_mcp.connection_store import ConnectionStore
+from portfolio_mcp.database import Database
 from portfolio_mcp.execution import (
     CapabilityState,
     ExecutionCapability,
@@ -36,7 +37,7 @@ class Provider:
 
 
 def setup(tmp_path):
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'db.sqlite'}")
+    repo = ConnectionStore(Database(f"sqlite:///{tmp_path / 'db.sqlite'}"))
     repo.save_connection("c", "alpaca", "live", "server_env:alpaca", True)
     repo.save_account_route("a", "c", "upstream", trade_enabled=True)
     provider = Provider()
@@ -56,6 +57,14 @@ async def test_unknown_cancel_does_not_retry_and_blocks_until_terminal(tmp_path)
     provider.state = OrderState.FILLED
     assert await service.reconcile("a", "broker-order") == "FILLED"
     assert not repo.has_unresolved_cancellations("a")
+    assert [
+        (event["kind"], event["state"]) for event in repo.cancellation_events("a")
+    ] == [
+        ("reserved", "UNKNOWN"),
+        ("result", "UNKNOWN"),
+        ("reconciliation", "UNKNOWN"),
+        ("reconciliation", "FILLED"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -89,7 +98,7 @@ async def test_concurrent_confirmations_send_at_most_one_cancel(tmp_path):
 async def test_fixture_broker_history_order_can_be_canceled(tmp_path):
     from portfolio_mcp.execution import FixtureExecutionProvider
 
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'fixture.sqlite'}")
+    repo = ConnectionStore(Database(f"sqlite:///{tmp_path / 'fixture.sqlite'}"))
     repo.save_connection("fixture", "fixture", "fixture", "fixture", True)
     repo.save_account_route(
         "schwab-taxable-demo", "fixture", "schwab-taxable-demo", trade_enabled=True
@@ -105,3 +114,26 @@ async def test_fixture_broker_history_order_can_be_canceled(tmp_path):
         await service.cancel("schwab-taxable-demo", "fixture-open", True) == "CANCELED"
     )
     assert [name for name, _ in provider.invocations].count("cancel") == 1
+
+
+@pytest.mark.asyncio
+async def test_mismatched_cancel_and_failed_reconciliation_are_audited(tmp_path):
+    repo, provider, service = setup(tmp_path)
+
+    async def mismatched(order_id):
+        provider.calls += 1
+        return ExecutionResult(OrderState.CANCELED, "different-order")
+
+    provider.cancel_order = mismatched
+    assert await service.cancel("a", "broker-order", True) == "UNKNOWN"
+    assert await service.cancel("a", "broker-order", True) == "UNKNOWN"
+    assert provider.calls == 1
+
+    async def unavailable(order_id):
+        raise TimeoutError("sensitive provider details")
+
+    provider.get_order = unavailable
+    assert await service.reconcile("a", "broker-order") == "UNKNOWN"
+    assert [
+        (event["kind"], event["state"]) for event in repo.cancellation_events("a")
+    ] == [("reserved", "UNKNOWN"), ("result", "UNKNOWN"), ("reconciliation", "UNKNOWN")]

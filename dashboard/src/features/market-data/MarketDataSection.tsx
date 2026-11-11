@@ -5,6 +5,7 @@ import { getIntraday, getQuote, searchInstruments, type Account } from "../../ap
 import { IntradayChart } from "./IntradayChart";
 import { TickerAccounts } from "./TickerAccounts";
 import { quoteSourceLabel } from "../../lib/portfolioDisplay";
+import { readErrorMessage, retryProviderRead } from "../../lib/providerErrors";
 
 export function MarketDataSection({ accounts = [] }: { accounts?: Account[] }) {
   const [extendedHours, setExtendedHours] = useState(false);
@@ -17,12 +18,14 @@ export function MarketDataSection({ accounts = [] }: { accounts?: Account[] }) {
     queryKey: ["instrument-search", submittedQuery],
     queryFn: () => searchInstruments(submittedQuery ?? ""),
     enabled: submittedQuery !== null,
+    retry: retryProviderRead,
   });
   const quote = useQuery({
     queryKey: ["quote", selectedInstrumentId],
     queryFn: () => getQuote(selectedInstrumentId ?? ""),
     enabled: selectedInstrumentId !== null,
     refetchInterval: 15_000,
+    retry: retryProviderRead,
   });
   const intraday = useQuery({
     queryKey: ["intraday", selectedInstrumentId, extendedHours],
@@ -73,8 +76,8 @@ export function MarketDataSection({ accounts = [] }: { accounts?: Account[] }) {
         <p className="state">Searching instruments…</p>
       )}
       {search.isError && (
-        <p className="state state-error">
-          Instrument search is unavailable. Try the search again.
+        <p className="state state-error" role="alert">
+          {readErrorMessage(search.error, "Instrument search is unavailable. Try the search again.")}
         </p>
       )}
       {search.data?.instruments.length === 0 && (
@@ -116,8 +119,8 @@ export function MarketDataSection({ accounts = [] }: { accounts?: Account[] }) {
         <p className="state">Loading quote…</p>
       )}
       {quote.isError && (
-        <p className="state state-error">
-          Quote is unavailable. Select an instrument again to retry.
+        <p className="state state-error" role="alert">
+          {readErrorMessage(quote.error, "Quote is unavailable. Select an instrument again to retry.")}
         </p>
       )}
       {quote.data?.quote && (

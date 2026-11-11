@@ -5,8 +5,10 @@ from typing import Any, cast
 import pytest
 
 from portfolio_mcp.alpaca_trading_policy import AlpacaTradingPolicy
-from portfolio_mcp.database import OrderDraft, PortfolioRepository
+from portfolio_mcp.connection_store import ConnectionStore
+from portfolio_mcp.database import Database
 from portfolio_mcp.models import Instrument, Quote
+from portfolio_mcp.stored_orders import OrderDraft
 from portfolio_mcp.trading_safety import GuardDecision, GuardViolation
 from portfolio_mcp.trading_service import TradingValidationError
 
@@ -92,7 +94,7 @@ class Guard:
 
 
 def setup(tmp_path):
-    repo = PortfolioRepository(f"sqlite:///{tmp_path / 'db.sqlite'}")
+    repo = ConnectionStore(Database(f"sqlite:///{tmp_path / 'db.sqlite'}"))
     repo.save_connection("c", "alpaca", "live", "server_env:alpaca", True)
     repo.save_account_route("a", "c", "upstream", trade_enabled=True)
     portfolio, market = Portfolio(), Market()

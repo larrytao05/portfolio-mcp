@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 
+import pytest
 from fastapi.testclient import TestClient
 
 from portfolio_mcp.alpaca_execution import AlpacaExecutionProvider
@@ -14,6 +15,7 @@ NOW = datetime(2026, 11, 10, 16, tzinfo=UTC)
 class FakeHttp:
     def __init__(self):
         self.writes = []
+        self.order_response: tuple[int, object] | None = None
 
     def request(self, url, headers):
         if url.endswith("/v2/account"):
@@ -26,6 +28,10 @@ class FakeHttp:
                 "trading_blocked": False,
                 "account_blocked": False,
             }
+        if "/v2/orders/" in url or "/v2/orders:by_client_order_id?" in url:
+            return (
+                self.order_response if self.order_response is not None else (404, None)
+            )
         if url.endswith("/v2/positions"):
             return 200, []
         if "/v2/assets?" in url:
@@ -147,6 +153,34 @@ def test_alpaca_order_and_cancel_use_shared_guards(tmp_path):
             == 200
         )
         assert len([x for x in write.requests if x[0] == "POST"]) == 1
+        command = next(x[2] for x in write.requests if x[0] == "POST")
+        http.order_response = (
+            200,
+            {
+                "id": "broker-id",
+                "client_order_id": command["client_order_id"],
+                "symbol": "VTI",
+                "side": "buy",
+                "type": "market",
+                "qty": "1",
+                "filled_qty": "1",
+                "filled_avg_price": "100",
+                "limit_price": None,
+                "time_in_force": "day",
+                "status": "filled",
+                "submitted_at": NOW.isoformat(),
+                "updated_at": NOW.isoformat(),
+            },
+        )
+        order_id = first.json()["order"]["id"]
+        refreshed = client.post(f"/api/orders/{order_id}/refresh")
+        assert refreshed.status_code == 200, refreshed.text
+        assert refreshed.json()["order"]["state"] == "FILLED"
+        assert (
+            client.post(f"/api/orders/{order_id}/reconcile").json()["order"]["state"]
+            == "FILLED"
+        )
+        http.order_response = None
         cancel = client.post(
             f"/api/accounts/{account}/broker-orders/broker-id/cancel",
             json={"confirmed": True},
@@ -341,3 +375,100 @@ def test_dispatch_expiry_is_rejected_without_account_lockout(tmp_path):
         assert not [entry for entry in write.requests if entry[0] == "POST"]
         clock[0] = NOW
         assert client.post("/api/order-drafts", json=body).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_cancel_dispatch_and_disconnect_complete_with_concurrent_api_calls(
+    tmp_path,
+):
+    import asyncio
+    import threading
+    import time
+
+    from httpx import ASGITransport, AsyncClient
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingWrite(FakeWrite):
+        def request(self, method, path, body=None):
+            if method == "DELETE":
+                self.requests.append((method, path, body))
+                entered.set()
+                if not release.wait(8):
+                    raise TimeoutError("synthetic dispatch timed out")
+                return 204, None
+            return super().request(method, path, body)
+
+    write = BlockingWrite()
+
+    class FakeAlpaca(AlpacaPortfolioProvider):
+        def execution_provider(self, account_id, upstream_account_id, **kwargs):
+            return AlpacaExecutionProvider(
+                account_id, upstream_account_id, write, **kwargs
+            )
+
+    settings = AlpacaMarketDataSettings("synthetic", "synthetic")
+    source = FakeAlpaca(settings, http_client=FakeHttp(), clock=lambda: NOW)
+    app = create_app(
+        source,
+        configured_providers={"alpaca": source},
+        market_data_provider=AlpacaMarketDataProvider(
+            settings, http_client=FakeHttp(), clock=lambda: NOW
+        ),
+        database_url=f"sqlite:///{tmp_path / 'api.sqlite'}",
+        clock=lambda: NOW,
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://fixture"
+    ) as client:
+        assert (await client.post("/api/connections/alpaca")).status_code == 200
+        assert (await client.post("/api/refresh")).status_code == 200
+        assert (
+            await client.put(
+                "/api/accounts/alpaca:upstream/connection-settings",
+                json={"trade_enabled": True, "version": 0},
+            )
+        ).status_code == 200
+        assert (await client.get("/api/trading/settings")).json()["settings"][
+            "kill_switch_active"
+        ] is True
+        cancel = asyncio.create_task(
+            client.post(
+                "/api/accounts/alpaca:upstream/broker-orders/broker-id/cancel",
+                json={"confirmed": True},
+            )
+        )
+        assert await asyncio.to_thread(entered.wait, 5)
+        timer = threading.Timer(3, release.set)
+        timer.start()
+        try:
+            started = time.monotonic()
+            disconnect = await client.post("/api/connections/alpaca/disconnect")
+            assert time.monotonic() - started < 1
+            assert disconnect.status_code == 409
+            settings_response = await asyncio.wait_for(
+                client.put(
+                    "/api/trading/settings",
+                    json={
+                        "live_trading_enabled": False,
+                        "kill_switch_active": True,
+                        "max_order_shares": "1",
+                        "max_order_notional_usd": "100",
+                        "version": 0,
+                    },
+                ),
+                timeout=1,
+            )
+            assert settings_response.status_code == 200
+            release.set()
+            response = await asyncio.wait_for(cancel, timeout=5)
+            assert (
+                await client.post("/api/connections/alpaca/disconnect")
+            ).status_code == 200
+        finally:
+            release.set()
+            timer.cancel()
+        assert response.status_code == 200
+        assert response.json()["state"] == "CANCEL_PENDING"
+        assert [method for method, _, _ in write.requests].count("DELETE") == 1
