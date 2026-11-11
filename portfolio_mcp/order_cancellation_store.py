@@ -33,6 +33,8 @@ from portfolio_mcp.order_record_ops import (
     _invalidate_cancellation_requests_for_order_in_session,
 )
 from portfolio_mcp.schema import (
+    AccountRouteRecord,
+    CancellationAttemptRecord,
     CancellationRequestRecord,
     McpAuthorizationRecord,
     OrderAuthorizationRecord,
@@ -420,9 +422,22 @@ def begin_order_cancellation(
     actor: OrderEventActor = OrderEventActor.DASHBOARD,
 ) -> tuple["StoredOrder", UUID | None, bool]:
     now = require_aware_utc(now)
+    with db.sessions() as lookup:
+        account_id = lookup.scalar(
+            select(OrderRecord.account_id).where(OrderRecord.id == order_id)
+        )
+    if account_id is None:
+        raise ValueError("Order not found")
     with db.sessions.begin() as session:
+        locked = session.execute(
+            update(AccountRouteRecord)
+            .where(AccountRouteRecord.account_id == account_id)
+            .values(version=AccountRouteRecord.version)
+        )
+        if not cast(CursorResult[object], locked).rowcount:
+            raise ValueError("Account route unavailable; reconnect the account")
         record = session.get(OrderRecord, order_id)
-        if record is None:
+        if record is None or record.account_id != account_id:
             raise ValueError("Order not found")
 
         draft_record = session.get(OrderDraftRecord, record.draft_id)
@@ -446,6 +461,31 @@ def begin_order_cancellation(
             )
             return _stored_order(record, draft_record), attempt_id, False
 
+        pending_import = session.scalar(
+            select(CancellationAttemptRecord.account_id)
+            .where(
+                CancellationAttemptRecord.account_id == account_id,
+                CancellationAttemptRecord.state.in_(("UNKNOWN", "CANCEL_PENDING")),
+            )
+            .limit(1)
+        )
+        pending_order = session.scalar(
+            select(OrderRecord.id)
+            .where(
+                OrderRecord.account_id == account_id,
+                OrderRecord.id != order_id,
+                OrderRecord.state.in_(
+                    (
+                        OrderState.SUBMITTING,
+                        OrderState.UNKNOWN,
+                        OrderState.CANCEL_PENDING,
+                    )
+                ),
+            )
+            .limit(1)
+        )
+        if pending_import is not None or pending_order is not None:
+            raise ValueError("An earlier action requires reconciliation")
         if (
             record.version != expected_version
             or OrderState(record.state) != expected_state

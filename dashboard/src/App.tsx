@@ -14,17 +14,33 @@ import {
   refreshPortfolio,
 } from "./api/client";
 import { ActivitySection } from "./features/activity/ActivitySection";
+import { ConnectionsSection } from "./features/connections/ConnectionsSection";
 import { AccountsSection } from "./features/accounts/AccountsSection";
 import { MarketDataSection } from "./features/market-data/MarketDataSection";
+import { PositionsSection } from "./features/positions/PositionsSection";
 import { OrdersSection } from "./features/orders/OrdersSection";
 import { OverviewSection } from "./features/overview/OverviewSection";
 import { RecordStrip } from "./features/record/RecordStrip";
 import { ExecutionStatus, TradeSection, TradingSettingsPanel } from "./features/trading/TradingPanels";
 
+function revealSection(id: string) {
+  const target = document.getElementById(id);
+  let parent = target?.parentElement;
+  while (parent) {
+    if (parent instanceof HTMLDetailsElement) parent.open = true;
+    parent = parent.parentElement;
+  }
+  target?.scrollIntoView?.({ block: "start" });
+}
+
 function Navigation() {
-  const [hash, setHash] = useState(window.location.hash || "#accounts");
+  const [hash, setHash] = useState(window.location.hash || "#overview");
   useEffect(() => {
-    const update = () => setHash(window.location.hash || "#accounts");
+    const update = () => {
+      setHash(window.location.hash || "#overview");
+      revealSection(window.location.hash.slice(1));
+    };
+    update();
     window.addEventListener("hashchange", update);
     return () => window.removeEventListener("hashchange", update);
   }, []);
@@ -32,7 +48,9 @@ function Navigation() {
     <nav aria-label="Primary navigation">
       {[
         ["overview", "Overview"],
+        ["positions", "Positions"],
         ["accounts", "Accounts"],
+        ["connections", "Connections"],
         ["activity", "Activity"],
         ["orders", "Orders"],
         ["market-data", "Market data"],
@@ -42,6 +60,7 @@ function Navigation() {
         <a
           key={id}
           href={`#${id}`}
+          onClick={() => revealSection(id)}
           aria-current={hash === `#${id}` ? "location" : undefined}
         >
           {label}
@@ -73,6 +92,7 @@ export function App() {
     onSuccess: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["accounts"] }),
+        queryClient.invalidateQueries({ queryKey: ["connections"] }),
         queryClient.invalidateQueries({ queryKey: ["refreshes"] }),
         queryClient.invalidateQueries({ queryKey: ["activity"] }),
         queryClient.invalidateQueries({ queryKey: ["overview"] }),
@@ -111,10 +131,10 @@ export function App() {
       <main id="top" className="main-content">
         <header className="page-header">
           <div>
-            <p className="kicker">Local portfolio workspace</p>
+            <p className="kicker">Your investments, together</p>
             <h1>Portfolio Dashboard</h1>
             <p className="lede">
-              Saved accounts, positions, and provider observations.
+              A clear view across all your accounts.
             </p>
           </div>
           <button
@@ -149,24 +169,46 @@ export function App() {
             Refresh failed. Your saved data is unchanged.
           </p>
         )}
-        <AccountsSection
-          accounts={accounts.data?.accounts}
-          capabilities={tradingStatus.data?.accounts}
-          loading={accounts.isPending}
-          error={accounts.isError}
-        />
         <OverviewSection
           overview={overviewQuery.data?.overview}
           history={overviewHistoryQuery.data?.history ?? overviewQuery.data?.overview.history}
           loading={overviewQuery.isPending}
           error={overviewQuery.isError}
+          historyLoading={overviewHistoryQuery.isPending}
+          historyError={overviewHistoryQuery.isError}
         />
-        <ActivitySection accounts={accounts.data?.accounts ?? []} />
-        <OrdersSection accounts={accounts.data?.accounts ?? []} />
-        <MarketDataSection />
-        <ExecutionStatus status={tradingStatus.data} loading={tradingStatus.isPending} unavailable={tradingStatus.isError} />
-        <TradingSettingsPanel />
-        <TradeSection accounts={accounts.data?.accounts ?? []} />
+        <PositionsSection accounts={accounts.data?.accounts} loading={accounts.isPending} error={accounts.isError} />
+        <details className="workspace-panel">
+          <summary>Connections</summary>
+          <ConnectionsSection />
+        </details>
+        <details className="workspace-panel">
+          <summary>Account details</summary>
+          <AccountsSection
+            accounts={accounts.data?.accounts}
+            capabilities={tradingStatus.data?.accounts}
+            loading={accounts.isPending}
+            error={accounts.isError}
+          />
+        </details>
+        <details className="workspace-panel">
+          <summary>Activity</summary>
+          <ActivitySection accounts={accounts.data?.accounts ?? []} />
+        </details>
+        <details className="workspace-panel">
+          <summary>Orders</summary>
+          <OrdersSection accounts={accounts.data?.accounts ?? []} />
+        </details>
+        <details className="workspace-panel">
+          <summary>Market data</summary>
+          <MarketDataSection accounts={accounts.data?.accounts ?? []} />
+        </details>
+        <details className="workspace-panel">
+          <summary>Trading &amp; settings</summary>
+          <ExecutionStatus status={tradingStatus.data} loading={tradingStatus.isPending} unavailable={tradingStatus.isError} />
+          <TradingSettingsPanel />
+          <TradeSection accounts={accounts.data?.accounts ?? []} />
+        </details>
       </main>
     </div>
   );

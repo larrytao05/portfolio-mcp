@@ -2,7 +2,8 @@ import asyncio
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import Any, Callable, cast
+from typing import Any, Callable, Literal, cast
+from urllib.parse import urlparse
 
 from snaptrade_client.auth import SnapTradeAuth
 from snaptrade_client.client import SnapTrade
@@ -25,6 +26,7 @@ from portfolio_mcp.provider import (
     ProviderResponseError,
     ProviderUnavailableError,
 )
+from portfolio_mcp.ticker import BrokerOrder, BrokerOrderHistory
 
 
 class SnapTradeProvider:
@@ -35,6 +37,73 @@ class SnapTradeProvider:
                 consumer_key=settings.consumer_key,
             )
         )
+
+    async def connection_portal_url(
+        self, *, broker: str | None = None, reconnect: str | None = None
+    ) -> str:
+        response = await self._call(
+            self._client.authentication.login_snap_trade_user,
+            broker=broker,
+            reconnect=reconnect,
+            connection_type="read",
+        )
+        body = response.body
+        if not isinstance(body, Mapping):
+            raise ProviderResponseError("SnapTrade returned an invalid portal response")
+        url = body.get("redirectURI")
+        if not isinstance(url, str):
+            raise ProviderResponseError("SnapTrade returned an invalid portal response")
+        parsed = urlparse(url)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "app.snaptrade.com"
+            or parsed.username
+            or parsed.password
+        ):
+            raise ProviderResponseError("SnapTrade returned an invalid portal response")
+        return url
+
+    async def connection_accounts(self) -> list[tuple[str, bool, list[str]]]:
+        response = await self._call(
+            self._client.connections.list_brokerage_authorizations
+        )
+        if not isinstance(response.body, list):
+            raise ProviderResponseError("SnapTrade returned invalid connections")
+        result: list[tuple[str, bool, list[str]]] = []
+        for item in response.body:
+            if not isinstance(item, Mapping):
+                raise ProviderResponseError("SnapTrade returned invalid connections")
+            connection_id = _required_string(item, "id")
+            brokerage = _required_mapping(item, "brokerage")
+            brokerage_slug = brokerage.get("slug")
+            if not isinstance(brokerage_slug, str):
+                raise ProviderResponseError("SnapTrade returned invalid connections")
+            if brokerage_slug.upper() not in {"SCHWAB", "FIDELITY"}:
+                continue
+            disabled = item.get("disabled")
+            if not isinstance(disabled, bool):
+                raise ProviderResponseError(
+                    "SnapTrade returned invalid connection status"
+                )
+            accounts_response = await self._call(
+                self._client.connections.list_brokerage_authorization_accounts,
+                authorization_id=connection_id,
+            )
+            body = accounts_response.body
+            if not isinstance(body, list):
+                raise ProviderResponseError(
+                    "SnapTrade returned invalid connection accounts"
+                )
+            ids = []
+            for account in body:
+                if not isinstance(account, Mapping):
+                    raise ProviderResponseError(
+                        "SnapTrade returned invalid connection accounts"
+                    )
+                if account.get("account_category") == "INVESTMENT":
+                    ids.append(_required_string(account, "id"))
+            result.append((connection_id, not disabled, ids))
+        return result
 
     async def list_accounts(self) -> list[Account]:
         response = await self._call(self._client.account_information.list_user_accounts)
@@ -110,6 +179,74 @@ class SnapTradeProvider:
                     reverse=True,
                 )
             ),
+        )
+
+    async def get_broker_orders(
+        self,
+        account_id: str,
+        symbol: str,
+        status: Literal["open", "closed", "all"] = "all",
+    ) -> BrokerOrderHistory:
+        account = await self._get_account(account_id)
+        warning = (
+            "This app imports executed orders through SnapTrade for a requested "
+            "90-day window; completeness and source sync time are unknown. "
+            "Open orders require direct access and an account mapping. "
+            "Fidelity may update daily, "
+            "with up to 24 hours of delay."
+        )
+        if status == "open":
+            return BrokerOrderHistory(
+                account,
+                (),
+                "executed_only",
+                "unknown",
+                warning,
+                source="SnapTrade",
+            )
+        response = await self._call(
+            self._client.account_information.get_user_account_orders,
+            account_id=account_id,
+            state="all",
+            days=90,
+        )
+        if not isinstance(response.body, list):
+            raise ProviderResponseError("SnapTrade returned invalid order history")
+        orders = []
+        for row in response.body:
+            if not isinstance(row, Mapping):
+                raise ProviderResponseError("SnapTrade returned invalid order history")
+            instrument = row.get("universal_symbol")
+            if not isinstance(instrument, Mapping):
+                continue
+            ticker = _optional_string(instrument.get("symbol"))
+            if ticker is None or ticker.casefold() != symbol.casefold():
+                continue
+            order_status = _required_string(row, "status")
+            if order_status not in {"EXECUTED", "PARTIAL", "PARTIAL_CANCELED"}:
+                continue
+            orders.append(
+                BrokerOrder(
+                    _required_string(row, "brokerage_order_id"),
+                    account_id,
+                    ticker,
+                    _required_string(row, "action"),
+                    _optional_string(row.get("order_type")) or "Unknown",
+                    _order_decimal(row.get("total_quantity")),
+                    _order_decimal(row.get("filled_quantity")),
+                    order_status,
+                    _order_decimal(row.get("limit_price")),
+                    _order_time(row.get("time_placed")),
+                    _order_time(row.get("time_executed")),
+                )
+            )
+        return BrokerOrderHistory(
+            account,
+            tuple(orders),
+            "executed_only",
+            "unknown",
+            warning,
+            source="SnapTrade",
         )
 
     async def _get_account(self, account_id: str) -> Account:
@@ -308,3 +445,31 @@ def _translate_error(error: Exception) -> ProviderError:
     if error.status is None or error.status == 0 or error.status >= 500:
         return ProviderUnavailableError("SnapTrade is temporarily unavailable")
     return ProviderResponseError("SnapTrade returned an unexpected response")
+
+
+def _order_decimal(value: object) -> str | None:
+    if value is None:
+        return None
+    try:
+        result = Decimal(str(value))
+        if result.is_finite() and result >= 0:
+            return str(result)
+    except ArithmeticError:
+        pass
+    raise ProviderResponseError("SnapTrade returned invalid order values")
+
+
+def _order_time(value: object) -> str | None:
+    if value is None:
+        return None
+    try:
+        result = (
+            value
+            if isinstance(value, datetime)
+            else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        )
+        if result.tzinfo is not None:
+            return result.isoformat()
+    except ValueError:
+        pass
+    raise ProviderResponseError("SnapTrade returned invalid order time")

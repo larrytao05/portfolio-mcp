@@ -3,6 +3,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import NamedTuple
 
+from portfolio_mcp.connection_store import ConnectionStore
 from portfolio_mcp.database import Database
 from portfolio_mcp.execution import FixtureExecutionProvider
 from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
@@ -33,6 +34,10 @@ async def setup_mcp_services(tmp_path: Path, now: datetime) -> McpTradingContext
     repo = Database(db_url, clock=lambda: now)
     provider = FixturePortfolioProvider()
     await PortfolioRefreshService(provider, repo, clock=lambda: now).refresh()
+    routes = ConnectionStore(repo)
+    routes.save_connection("fixture", "fixture", "fixture", "fixture", True)
+    for account in await provider.list_accounts():
+        routes.save_account_route(account.id, "fixture", account.id, trade_enabled=True)
 
     replace_trading_settings(
         repo,

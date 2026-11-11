@@ -24,6 +24,8 @@ from portfolio_mcp.order_record_ops import (
     _invalidate_cancellation_requests_for_order_in_session,
 )
 from portfolio_mcp.schema import (
+    AccountRouteRecord,
+    CancellationAttemptRecord,
     OrderAuthorizationRecord,
     OrderDraftRecord,
     OrderEventRecord,
@@ -99,6 +101,13 @@ def begin_order_submission(
     client_order_id = str(uuid4())
     try:
         with db.sessions.begin() as session:
+            locked = session.execute(
+                update(AccountRouteRecord)
+                .where(AccountRouteRecord.account_id == draft.account_id)
+                .values(version=AccountRouteRecord.version)
+            )
+            if not cast(CursorResult[object], locked).rowcount:
+                raise ValueError("Account route unavailable")
             existing = session.scalar(
                 select(OrderRecord).where(OrderRecord.draft_id == draft.id)
             )
@@ -106,6 +115,32 @@ def begin_order_submission(
                 return _stored_order(
                     existing, session.get(OrderDraftRecord, existing.draft_id)
                 ), False
+            unresolved = session.scalar(
+                select(CancellationAttemptRecord.account_id)
+                .where(
+                    CancellationAttemptRecord.account_id == draft.account_id,
+                    CancellationAttemptRecord.state.in_(("UNKNOWN", "CANCEL_PENDING")),
+                )
+                .limit(1)
+            )
+            if unresolved is not None:
+                raise ValueError("A cancellation requires reconciliation")
+            pending_order = session.scalar(
+                select(OrderRecord.id)
+                .where(
+                    OrderRecord.account_id == draft.account_id,
+                    OrderRecord.state.in_(
+                        (
+                            OrderState.SUBMITTING,
+                            OrderState.UNKNOWN,
+                            OrderState.CANCEL_PENDING,
+                        )
+                    ),
+                )
+                .limit(1)
+            )
+            if pending_order is not None:
+                raise ValueError("An order requires reconciliation")
             authorization_id = str(uuid4())
             session.add(
                 OrderAuthorizationRecord(

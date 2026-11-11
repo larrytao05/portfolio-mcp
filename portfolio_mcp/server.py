@@ -8,6 +8,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from portfolio_mcp.authorization_records import McpAuthorizationError
 from portfolio_mcp.bootstrap import resolve_submission_validator
+from portfolio_mcp.connection_store import ConnectionStore
 from portfolio_mcp.database import Database
 from portfolio_mcp.execution import (
     ExecutionProvider,
@@ -15,7 +16,7 @@ from portfolio_mcp.execution import (
     OrderReadProvider,
     OrderState,
 )
-from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
+from portfolio_mcp.fixtures import FixtureMarketDataProvider
 from portfolio_mcp.mcp_authorization import McpAuthorizationService
 from portfolio_mcp.order_history import (
     OrderListFilters,
@@ -94,6 +95,24 @@ def create_server(
     )
     validator = resolve_submission_validator(provider, execution, submission_validator)
 
+    def execution_for_account(account_id: str) -> ExecutionProvider:
+        route = ConnectionStore(repo).account_route(account_id)
+        if (
+            route is None
+            or not route.active
+            or not route.included
+            or not route.trade_enabled
+        ):
+            raise TradingValidationError(
+                "account_route_unavailable", "The account is not enabled for trading"
+            )
+        if route.provider_route != "fixture":
+            raise TradingValidationError(
+                "execution_unavailable",
+                "An account-specific execution service is required",
+            )
+        return execution
+
     order_reader = order_read_provider
     if order_reader is None and isinstance(execution, FixtureExecutionProvider):
         order_reader = execution
@@ -118,6 +137,7 @@ def create_server(
             validator=validator,
             trading_guard=trading_guard,
             mcp_auth_service=active_mcp_auth,
+            provider_for_account=execution_for_account,
         )
 
     if recover_on_reads:
@@ -135,7 +155,11 @@ def create_server(
         cancellation_service
         or cancellation_request_service
         or OrderCancellationService(
-            repo, execution, service_clock, mcp_auth_service=active_mcp_auth
+            repo,
+            execution,
+            service_clock,
+            mcp_auth_service=active_mcp_auth,
+            provider_for_account=execution_for_account,
         )
     )
 
@@ -410,6 +434,3 @@ def _parse_date(value: str, field_name: str) -> date:
         raise ToolError(
             f"invalid_date: {field_name} must be an ISO-8601 date (YYYY-MM-DD)"
         ) from error
-
-
-mcp = create_server(FixturePortfolioProvider())

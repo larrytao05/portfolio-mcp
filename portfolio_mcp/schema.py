@@ -382,3 +382,48 @@ class ReconciliationGateRecord(Base):
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
     account_id: Mapped[str] = mapped_column(String(128), nullable=False)
     last_attempt_at_us: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class ConnectionRecord(Base):
+    __tablename__ = "connections"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    provider_route: Mapped[str] = mapped_column(String(32), nullable=False)
+    environment: Mapped[str] = mapped_column(String(16), nullable=False)
+    credential_reference: Mapped[str] = mapped_column(String(128), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
+
+class AccountRouteRecord(Base):
+    __tablename__ = "account_routes"
+    __table_args__ = (UniqueConstraint("connection_id", "upstream_account_id"),)
+
+    account_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    connection_id: Mapped[str] = mapped_column(
+        ForeignKey("connections.id"), nullable=False
+    )
+    upstream_account_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    included: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    trade_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class CancellationAttemptRecord(Base):
+    __tablename__ = "cancellation_attempts"
+
+    account_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    broker_order_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+
+
+class ImportedCancellationEventRecord(Base):
+    __tablename__ = "imported_cancellation_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    broker_order_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)

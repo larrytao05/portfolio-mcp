@@ -191,6 +191,150 @@ async def test_list_accounts_translates_snaptrade_errors(
 
 
 @pytest.mark.asyncio
+async def test_broker_orders_preserve_executed_coverage_and_exact_quantities():
+    provider, information = _provider()
+
+    def orders(**kwargs):
+        assert kwargs == {"account_id": "roth-account", "state": "all", "days": 90}
+        base = {
+            "brokerage_order_id": "one",
+            "universal_symbol": {"symbol": "NVDA"},
+            "status": "EXECUTED",
+            "action": "BUY",
+            "order_type": "Limit",
+            "total_quantity": "0.123456789123456789",
+            "filled_quantity": "0.123456789123456789",
+            "limit_price": "200.00001",
+            "time_placed": datetime.fromisoformat("2026-11-09T15:00:00+00:00"),
+        }
+        return SimpleNamespace(
+            body=[
+                base,
+                {**base, "brokerage_order_id": "pending", "status": "PENDING"},
+                {**base, "universal_symbol": {"symbol": "VTI"}},
+            ]
+        )
+
+    setattr(information, "get_user_account_orders", orders)
+    history = await provider.get_broker_orders("roth-account", "NVDA")
+    assert history.coverage == "executed_only"
+    assert history.freshness == "unknown"
+    assert "24 hours" in history.warning
+    assert "Open orders" in history.warning
+    assert len(history.orders) == 1
+    assert history.orders[0].quantity == "0.123456789123456789"
+    assert history.orders[0].account_id == "roth-account"
+
+
+@pytest.mark.asyncio
+async def test_personal_connection_portal_uses_reconnect_without_user_registration(
+    monkeypatch,
+):
+    from portfolio_mcp.provider import ProviderResponseError
+
+    calls = []
+
+    class Authentication:
+        def login_snap_trade_user(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                body={
+                    "redirectURI": "https://app.snaptrade.com/connect?token=synthetic"
+                }
+            )
+
+    provider = SnapTradeProvider(SnapTradeSettings("fake", "fake"))
+    monkeypatch.setattr(provider._client, "authentication", Authentication())
+    assert (await provider.connection_portal_url(reconnect="connection-id")).startswith(
+        "https://app.snaptrade.com/"
+    )
+    assert calls == [
+        {"broker": None, "reconnect": "connection-id", "connection_type": "read"}
+    ]
+
+    class InvalidAuthentication:
+        def login_snap_trade_user(self, **kwargs):
+            return SimpleNamespace(
+                body={"redirectURI": "https://other.invalid/connect"}
+            )
+
+    monkeypatch.setattr(provider._client, "authentication", InvalidAuthentication())
+    with pytest.raises(ProviderResponseError):
+        await provider.connection_portal_url()
+
+
+@pytest.mark.asyncio
+async def test_connection_accounts_reads_sdk_account_list_response(monkeypatch):
+    provider, _ = _provider()
+
+    class Connections:
+        def list_brokerage_authorizations(self):
+            return SimpleNamespace(
+                body=[
+                    {
+                        "id": "fidelity-authorization",
+                        "disabled": False,
+                        "brokerage": {"name": "Fidelity", "slug": "FIDELITY"},
+                    },
+                    {
+                        "id": "schwab-authorization",
+                        "disabled": False,
+                        "brokerage": {"name": "Schwab", "slug": "SCHWAB"},
+                    },
+                ]
+            )
+
+        def list_brokerage_authorization_accounts(self, *, authorization_id):
+            accounts = {
+                "fidelity-authorization": [
+                    {"id": "fidelity-investment", "account_category": "INVESTMENT"},
+                    {"id": "fidelity-deposit", "account_category": "DEPOSIT"},
+                ],
+                "schwab-authorization": [
+                    {"id": "schwab-investment", "account_category": "INVESTMENT"}
+                ],
+            }
+            return SimpleNamespace(body=accounts[authorization_id])
+
+    monkeypatch.setattr(provider._client, "connections", Connections(), raising=False)
+
+    assert await provider.connection_accounts() == [
+        ("fidelity-authorization", True, ["fidelity-investment"]),
+        ("schwab-authorization", True, ["schwab-investment"]),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_connection_accounts_rejects_unexpected_account_response_shape(
+    monkeypatch,
+):
+    from portfolio_mcp.provider import ProviderResponseError
+
+    provider, _ = _provider()
+
+    class Connections:
+        def list_brokerage_authorizations(self):
+            return SimpleNamespace(
+                body=[
+                    {
+                        "id": "fidelity-authorization",
+                        "disabled": False,
+                        "brokerage": {"name": "Fidelity", "slug": "FIDELITY"},
+                    }
+                ]
+            )
+
+        def list_brokerage_authorization_accounts(self, *, authorization_id):
+            assert authorization_id == "fidelity-authorization"
+            return SimpleNamespace(body={"results": []})
+
+    monkeypatch.setattr(provider._client, "connections", Connections(), raising=False)
+
+    with pytest.raises(ProviderResponseError, match="invalid connection accounts"):
+        await provider.connection_accounts()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
 async def test_snaptrade_rejects_nonfinite_holdings(value, monkeypatch) -> None:
     provider, info = _provider()

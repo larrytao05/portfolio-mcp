@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from portfolio_mcp.api import create_app
+from portfolio_mcp.connection_store import ConnectionStore
 from portfolio_mcp.database import Database
 from portfolio_mcp.execution import (
     CapabilityState,
@@ -104,7 +105,15 @@ def command() -> ExecutionCommand:
 
 
 def enable_trading_api(client: TestClient) -> None:
+    assert client.post("/api/connections/fixture").status_code == 200
     assert client.post("/api/refresh").status_code == 200
+    assert (
+        client.put(
+            "/api/accounts/schwab-taxable-demo/connection-settings",
+            json={"trade_enabled": True, "version": 0},
+        ).status_code
+        == 200
+    )
     response = client.put(
         "/api/trading/settings",
         json={
@@ -139,7 +148,14 @@ async def test_trading_guard_applies_conservative_limits_and_capabilities(
             [snapshot.account.id for snapshot in snapshots]
         ),
     )
+    ConnectionStore(database).save_connection(
+        "fixture", "fixture", "fixture", "fixture", True
+    )
+    ConnectionStore(database).save_account_route(
+        "schwab-taxable-demo", "fixture", "schwab-taxable-demo", trade_enabled=True
+    )
     settings = TradingSettingsService(database, lambda: now)
+
     settings.replace(
         live_trading_enabled=True,
         kill_switch_active=False,
@@ -207,7 +223,14 @@ async def test_trading_guard_fails_closed_for_each_safety_precondition(
             [snapshot.account.id for snapshot in snapshots]
         ),
     )
+    ConnectionStore(database).save_connection(
+        "fixture", "fixture", "fixture", "fixture", True
+    )
+    ConnectionStore(database).save_account_route(
+        "schwab-taxable-demo", "fixture", "schwab-taxable-demo", trade_enabled=True
+    )
     settings = TradingSettingsService(database, lambda: now)
+
     enabled = settings.replace(
         live_trading_enabled=True,
         kill_switch_active=False,
@@ -354,7 +377,14 @@ async def enabled_trading_guard(
         refreshed_at.date(),
         capabilities=capabilities,
     )
+    ConnectionStore(database).save_connection(
+        "fixture", "fixture", "fixture", "fixture", True
+    )
+    ConnectionStore(database).save_account_route(
+        "schwab-taxable-demo", "fixture", "schwab-taxable-demo", trade_enabled=True
+    )
     settings = TradingSettingsService(database, lambda: refreshed_at)
+
     settings.replace(
         live_trading_enabled=True,
         kill_switch_active=False,
@@ -1401,3 +1431,39 @@ def test_kill_switch_blocks_submission_after_a_draft_is_reviewed(tmp_path) -> No
     assert confirmation.status_code == 200
     assert confirmation.json()["order"]["result"]["code"] == "kill_switch_active"
     assert [name for name, _ in provider.invocations] == ["capability"]
+
+
+@pytest.mark.asyncio
+async def test_guard_blocks_missing_hidden_and_disconnected_routes(tmp_path) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    repository = ConnectionStore(database)
+    guard = await enabled_trading_guard(database, FixturePortfolioProvider())
+    intent = TradeIntent(
+        account_id="schwab-taxable-demo",
+        symbol="VTI",
+        asset_class="equity_etf",
+        side="buy",
+        order_type="limit",
+        quantity=Decimal("1"),
+        limit_price=Decimal("300"),
+        bid_price=Decimal("299"),
+        ask_price=Decimal("300"),
+        last_price=Decimal("300"),
+    )
+    assert guard.evaluate(intent).allowed
+    assert "account_route_unavailable" in _violation_codes(
+        guard.evaluate(replace(intent, account_id="unknown"))
+    )
+    repository.save_account_route(
+        "schwab-taxable-demo",
+        "fixture",
+        "schwab-taxable-demo",
+        included=False,
+        trade_enabled=True,
+    )
+    assert "account_route_unavailable" in _violation_codes(guard.evaluate(intent))
+    repository.save_account_route(
+        "schwab-taxable-demo", "fixture", "schwab-taxable-demo", trade_enabled=True
+    )
+    repository.save_connection("fixture", "fixture", "fixture", "fixture", False)
+    assert "account_route_unavailable" in _violation_codes(guard.evaluate(intent))

@@ -49,6 +49,13 @@ def _client(
     app = _app(tmp_path, execution)
     client = TestClient(app)
     assert client.post("/api/refresh").status_code == 200
+    assert (
+        client.put(
+            "/api/accounts/schwab-taxable-demo/connection-settings",
+            json={"version": 0, "trade_enabled": True},
+        ).status_code
+        == 200
+    )
     settings = client.put(
         "/api/trading/settings",
         json={
@@ -439,6 +446,13 @@ async def test_concurrent_cancellations_call_provider_at_most_once(tmp_path) -> 
     app = _app(tmp_path, execution)
     client = TestClient(app)
     assert client.post("/api/refresh").status_code == 200
+    assert (
+        client.put(
+            "/api/accounts/schwab-taxable-demo/connection-settings",
+            json={"version": 0, "trade_enabled": True},
+        ).status_code
+        == 200
+    )
     settings = client.put(
         "/api/trading/settings",
         json={

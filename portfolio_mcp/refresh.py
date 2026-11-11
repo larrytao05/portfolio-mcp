@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Callable
 from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
@@ -31,7 +32,8 @@ class PortfolioRefreshService:
         try:
             accounts = await self._provider.list_accounts()
         except ProviderError as error:
-            return save_failed_refresh(
+            return await asyncio.to_thread(
+                save_failed_refresh,
                 self._database,
                 started_at,
                 self._as_utc(self._clock()),
@@ -39,7 +41,8 @@ class PortfolioRefreshService:
                 str(error),
             )
         except Exception:
-            return save_failed_refresh(
+            return await asyncio.to_thread(
+                save_failed_refresh,
                 self._database,
                 started_at,
                 self._as_utc(self._clock()),
@@ -67,7 +70,8 @@ class PortfolioRefreshService:
         capabilities, failed_capability_accounts = await self._capabilities_for(
             accounts
         )
-        return save_refresh(
+        return await asyncio.to_thread(
+            save_refresh,
             self._database,
             snapshots,
             started_at,

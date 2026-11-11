@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import event
 
+from portfolio_mcp.connection_store import ConnectionStore
 from portfolio_mcp.database import Database
 from portfolio_mcp.fixtures import FixturePortfolioProvider
 from portfolio_mcp.overview import OverviewService
@@ -27,6 +28,10 @@ async def test_overview_keeps_one_read_snapshot_during_a_committed_refresh(tmp_p
     await PortfolioRefreshService(
         FixturePortfolioProvider(), reader, lambda: now
     ).refresh()
+    routes = ConnectionStore(reader)
+    routes.save_connection("fixture", "fixture", "fixture", "fixture", True)
+    for account in await FixturePortfolioProvider().list_accounts():
+        routes.save_account_route(account.id, "fixture", account.id)
     baseline = OverviewService(reader).get_overview()
     committed = False
 
@@ -85,6 +90,10 @@ async def test_removed_account_coverage_at_same_provider_survives_repeat_and_ret
         for snapshot in snapshots
     ]
     save_refresh(database, snapshots, now, now, now.date())
+    routes = ConnectionStore(database)
+    routes.save_connection("fixture", "fixture", "fixture", "fixture", True)
+    for snapshot in snapshots:
+        routes.save_account_route(snapshot.account.id, "fixture", snapshot.account.id)
     for _ in range(2):
         result = save_refresh(database, snapshots[:1], now, now, now.date())
         assert result.status == "partial"
@@ -206,3 +215,56 @@ async def test_refresh_coverage_deduplicates_failures_and_retains_removed_provid
         item.stale_accounts == 0 and item.excluded_accounts == 0
         for item in restored.provider_outcomes
     )
+
+
+@pytest.mark.asyncio
+async def test_unlinked_same_name_account_is_excluded_without_losing_saved_history(
+    tmp_path,
+):
+    from dataclasses import replace
+
+    from portfolio_mcp.portfolio_store import account_detail, daily_values
+
+    now = datetime(2026, 10, 2, 12, tzinfo=UTC)
+    database = Database(f"sqlite:///{tmp_path / 'legacy.db'}", lambda: now)
+    provider = FixturePortfolioProvider()
+    source = await provider.get_holdings("schwab-taxable-demo")
+    legacy = replace(
+        source,
+        account=replace(source.account, id="legacy", label="Shared label"),
+        positions=tuple(
+            replace(position, account_id="legacy") for position in source.positions
+        ),
+    )
+    linked = replace(
+        source,
+        account=replace(source.account, id="linked", label="Shared label"),
+        positions=tuple(
+            replace(position, account_id="linked") for position in source.positions
+        ),
+    )
+    save_refresh(database, [legacy, linked], now, now, now.date())
+    routes = ConnectionStore(database)
+    routes.save_connection("fixture", "fixture", "fixture", "fixture", True)
+    routes.save_account_route("linked", "fixture", "upstream-linked")
+    overview = OverviewService(database).get_overview()
+    assert [item.account_id for item in overview.accounts] == ["linked"]
+    assert any("unlinked" in warning.lower() for warning in overview.warnings)
+    assert account_detail(database, "legacy") is not None
+    assert daily_values(database, "legacy")
+
+
+@pytest.mark.asyncio
+async def test_disconnected_saved_accounts_explain_why_totals_are_empty(tmp_path):
+    now = datetime(2026, 10, 2, 12, tzinfo=UTC)
+    database = Database(f"sqlite:///{tmp_path / 'disconnected.db'}")
+    provider = FixturePortfolioProvider()
+    snapshot = await provider.get_holdings("schwab-taxable-demo")
+    save_refresh(database, [snapshot], now, now, now.date())
+    routes = ConnectionStore(database)
+    routes.save_connection("fixture", "fixture", "fixture", "fixture", True)
+    routes.save_account_route(snapshot.account.id, "fixture", snapshot.account.id)
+    routes.disconnect_connection("fixture")
+    overview = OverviewService(database).get_overview()
+    assert overview.total_known_usd_value is None
+    assert "unlinked or hidden" in overview.warnings[0]

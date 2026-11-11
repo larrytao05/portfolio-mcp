@@ -230,7 +230,7 @@ class OverviewService:
         self._database = database
 
     def get_overview(self) -> PortfolioOverview:
-        view = read_portfolio_view(self._database)
+        view = read_portfolio_view(self._database, included_only=True)
         latest_refresh = view.latest_refresh
         stored_accounts = view.accounts
 
@@ -252,6 +252,13 @@ class OverviewService:
                     provider_coverage=self._build_provider_coverage(
                         latest_refresh, stored_accounts
                     ),
+                )
+            if view.excluded_accounts:
+                return self._empty_overview(
+                    warnings=(
+                        "Saved accounts are unlinked or hidden. "
+                        "Connect or include an account to see its value.",
+                    )
                 )
             return self._empty_overview()
 
@@ -277,7 +284,7 @@ class OverviewService:
             else _sum_decimals(p.position.market_value for p in fresh_usd_positions)
         )
 
-        cash_usd = self._calculate_cash_usd(fresh_usd_positions)
+        cash_usd = self._calculate_cash_usd(fresh_usd_positions, stored_accounts)
         account_contributions, account_slices = self._calculate_contributions(
             stored_accounts, stored_positions, fresh_usd_positions, total_known_usd
         )
@@ -293,6 +300,11 @@ class OverviewService:
             gain_loss_positions, len(stored_positions)
         )
         warnings = self._collect_warnings(stored_accounts, latest_refresh)
+        if view.unlinked_accounts:
+            warnings += (
+                "Saved accounts are unlinked and excluded from totals. "
+                "Reconnect them to include their value.",
+            )
         history = self._build_history(all_daily, len(stored_accounts))
         provider_coverage = self._build_provider_coverage(
             latest_refresh, stored_accounts
@@ -315,7 +327,7 @@ class OverviewService:
         )
 
     def get_history(self) -> RecordedHistory:
-        view = read_portfolio_view(self._database)
+        view = read_portfolio_view(self._database, included_only=True)
         return self._build_history(view.daily_values, len(view.accounts))
 
     def _empty_overview(
@@ -425,14 +437,18 @@ class OverviewService:
         return fresh_usd_positions, exclusions, gain_loss_positions
 
     def _calculate_cash_usd(
-        self, fresh_usd_positions: list[StoredPosition]
+        self,
+        fresh_usd_positions: list[StoredPosition],
+        accounts: Sequence[StoredAccount],
     ) -> Decimal | None:
-        cash_val = _sum_decimals(
-            p.position.market_value
+        cash = [
+            p
             for p in fresh_usd_positions
             if p.position.asset_class in ("cash", "cash_equivalent")
-        )
-        return cash_val if fresh_usd_positions else None
+        ]
+        if {p.position.account_id for p in cash} != {a.account.id for a in accounts}:
+            return None
+        return _sum_decimals(p.position.market_value for p in cash)
 
     def _calculate_contributions(
         self,

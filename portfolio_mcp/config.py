@@ -85,3 +85,25 @@ class ExecutionSettings:
             provider=provider,
             schwab_execution_enabled=schwab_execution_enabled,
         )
+
+
+@dataclass(frozen=True)
+class AlpacaMarketDataSettings:
+    api_key: str
+    secret_key: str
+
+    @classmethod
+    def from_environment(
+        cls, environment: Mapping[str, str] | None = None
+    ) -> "AlpacaMarketDataSettings":
+        source = os.environ if environment is None else environment
+        missing = [
+            name
+            for name in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY")
+            if not source.get(name)
+        ]
+        if missing:
+            raise ProviderConfigurationError(
+                f"Missing required Alpaca configuration: {', '.join(missing)}"
+            )
+        return cls(source["ALPACA_API_KEY"], source["ALPACA_SECRET_KEY"])

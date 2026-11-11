@@ -9,6 +9,7 @@ from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 from mcp.server.mcpserver.exceptions import ToolError
 
+from portfolio_mcp.connection_store import ConnectionStore
 from portfolio_mcp.database import Database
 from portfolio_mcp.execution import OrderState
 from portfolio_mcp.fixtures import FixtureMarketDataProvider, FixturePortfolioProvider
@@ -217,6 +218,12 @@ async def test_create_and_get_order_draft_tools(tmp_path) -> None:
         max_order_notional_usd=Decimal("50000"),
         updated_at=now,
         expected_version=0,
+    )
+
+    routes = ConnectionStore(repo)
+    routes.save_connection("fixture", "fixture", "fixture", "fixture", True)
+    routes.save_account_route(
+        "schwab-taxable-demo", "fixture", "schwab-taxable-demo", trade_enabled=True
     )
 
     server = create_server(
