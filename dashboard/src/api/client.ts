@@ -99,6 +99,9 @@ export type Instrument = {
 };
 
 export type Quote = {
+  feed?: string | null;
+  delay_seconds?: number;
+  trade_observed_at?: string | null;
   instrument: Instrument;
   source: string;
   observed_at: string;
@@ -183,6 +186,7 @@ export type OrderDraft = {
 export type Order = {
   id: string;
   draft_id: string;
+  instrument?: { symbol: string };
   fingerprint: string;
   state: "ACCEPTED" | "REJECTED" | "UNKNOWN" | string;
   result: { code: string | null; message: string | null };
@@ -269,15 +273,22 @@ export type OverviewResponse = {
 export type HistoryResponse = {
   history: DailyRecordedPoint[];
 };
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
 async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     const message = body?.error?.message;
-    throw new Error(
+    throw new ApiError(
       typeof message === "string"
         ? message
         : `Request failed with status ${response.status}`,
+      response.status,
     );
   }
 
@@ -371,10 +382,127 @@ export function confirmOrderDraft(
   });
 }
 
+export function getUnresolvedOrders(accountId: string): Promise<{ orders: Order[] }> {
+  return getJson(`/api/accounts/${encodeURIComponent(accountId)}/unresolved-orders`);
+}
+
+export function getUnresolvedCancellations(accountId: string): Promise<{ cancellations: { broker_order_id: string; state: string }[] }> {
+  return getJson(`/api/accounts/${encodeURIComponent(accountId)}/cancellations`);
+}
+
+export function reconcileOrder(orderId: string): Promise<{ order: Order }> {
+  return getJson(`/api/orders/${encodeURIComponent(orderId)}/reconcile`, { method: "POST" });
+}
+
+export function cancelBrokerOrder(accountId: string, orderId: string): Promise<{ state: string }> {
+  return getJson(`/api/accounts/${encodeURIComponent(accountId)}/broker-orders/${encodeURIComponent(orderId)}/cancel`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ confirmed: true }),
+  });
+}
+
+export function reconcileCancellation(accountId: string, orderId: string): Promise<{ state: string }> {
+  return getJson(`/api/accounts/${encodeURIComponent(accountId)}/broker-orders/${encodeURIComponent(orderId)}/reconcile-cancellation`, { method: "POST" });
+}
+
 export function getOverview(): Promise<OverviewResponse> {
   return getJson("/api/overview");
 }
 
 export function getOverviewHistory(): Promise<HistoryResponse> {
   return getJson("/api/overview/history");
+}
+
+export type IntradayBar = {
+  time: string;
+  open: string;
+  high: string;
+  low: string;
+  close: string;
+  volume: string;
+};
+
+export type IntradayHistory = {
+  session_date: string;
+  extended_hours: boolean;
+  source: string;
+  feed: string;
+  delay_seconds: number;
+  available_through: string;
+  bars: IntradayBar[];
+};
+
+export type BrokerOrderHistory = {
+  account: Pick<Account, "id" | "label" | "provider">;
+  coverage: "open_and_executed" | "executed_only" | "unsupported";
+  freshness: string;
+  warning: string;
+  synced_at: string | null;
+  lookback_days: number | null;
+  source: string;
+  truncated: boolean;
+  orders: {
+    id: string;
+    account_id: string;
+    leg_id: string | null;
+    client_order_id: string | null;
+    filled_avg_price: string | null;
+    symbol: string;
+    side: string;
+    order_type: string;
+    quantity: string | null;
+    filled_quantity: string | null;
+    status: string;
+    limit_price: string | null;
+    time_placed: string | null;
+    time_executed: string | null;
+  }[];
+};
+
+export function getIntraday(instrumentId: string, extendedHours: boolean): Promise<{ history: IntradayHistory }> {
+  return getJson(`/api/instruments/${encodeURIComponent(instrumentId)}/intraday?extended_hours=${extendedHours}`);
+}
+
+export function getBrokerOrders(accountId: string, symbol: string, status: "open" | "closed" | "all" = "all"): Promise<{ history: BrokerOrderHistory }> {
+  return getJson(`/api/accounts/${encodeURIComponent(accountId)}/broker-orders?symbol=${encodeURIComponent(symbol)}&status=${status}`);
+}
+
+export type ConnectionAccount = {
+  account_id: string;
+  label: string;
+  connection_id: string;
+  provider_route: string;
+  active: boolean;
+  included: boolean;
+  trade_enabled: boolean;
+  version: number;
+};
+
+export function getConnections(): Promise<{ configured: Record<string, boolean>; accounts: ConnectionAccount[] }> {
+  return getJson("/api/connections");
+}
+
+export function connectProvider(provider: string): Promise<unknown> {
+  return getJson(`/api/connections/${encodeURIComponent(provider)}`, { method: "POST" });
+}
+
+export function disconnectProvider(connectionId: string): Promise<unknown> {
+  return getJson(`/api/connections/${encodeURIComponent(connectionId)}/disconnect`, { method: "POST" });
+}
+
+export function updateAccountConnection(account: ConnectionAccount, change: { included: boolean } | { trade_enabled: boolean }): Promise<unknown> {
+  return getJson(`/api/accounts/${encodeURIComponent(account.account_id)}/connection-settings`, {
+    method: "PUT", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ...change, version: account.version }),
+  });
+}
+
+export function getSnapTradePortal(reconnect?: string): Promise<{ url: string }> {
+  const query = reconnect ? `?reconnect=${encodeURIComponent(reconnect)}` : "";
+  return getJson(`/api/connections/snaptrade/portal${query}`, { method: "POST" });
+}
+
+export function reactivateConnection(connectionId: string): Promise<unknown> {
+  return getJson(`/api/connections/${encodeURIComponent(connectionId)}/reactivate`, { method: "POST" });
 }

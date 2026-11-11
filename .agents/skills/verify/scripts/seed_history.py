@@ -3,9 +3,10 @@ import asyncio
 import sys
 import tempfile
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from portfolio_mcp.database import PortfolioRepository
 from portfolio_mcp.fixtures import FixturePortfolioProvider
@@ -20,16 +21,17 @@ async def seed(database_path: Path):
         await provider.get_holdings(account.id)
         for account in await provider.list_accounts()
     ]
-    now = datetime.now(UTC)
+    now = datetime.now(ZoneInfo("America/New_York"))
     for offset in range(45, 0, -1):
         if offset in {10, 11}:
             continue
         saved = now - timedelta(days=offset)
+        snapshot_date = saved.date()
         factor = Decimal(1000 - offset + offset % 7) / Decimal(1000)
         daily = [
             replace(
                 snapshot,
-                as_of=saved.date(),
+                as_of=snapshot_date,
                 positions=tuple(
                     replace(
                         position,
@@ -51,7 +53,7 @@ async def seed(database_path: Path):
         ]
         if offset == 15:
             daily = daily[:1]
-        repo.save_refresh(daily, saved, saved, snapshot_date=saved.date())
+        repo.save_refresh(daily, saved, saved, snapshot_date=snapshot_date)
 
 
 if __name__ == "__main__":

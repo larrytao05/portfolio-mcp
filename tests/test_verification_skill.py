@@ -2,7 +2,7 @@ import asyncio
 import importlib.util
 import json
 import subprocess
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -139,11 +139,32 @@ def test_failed_port_binding_leaves_evidence_and_no_scratch(tmp_path, monkeypatc
     assert "Browser verification was not run" in failures[0].read_text()
 
 
-def test_seed_history_has_real_persistence_gaps_and_partial_coverage(tmp_path):
+@pytest.mark.parametrize(
+    "instant",
+    [
+        datetime(2026, 11, 11, 3, 30, tzinfo=UTC),
+        datetime(2026, 11, 11, 4, 30, tzinfo=UTC),
+        datetime(2026, 3, 18, 4, 30, tzinfo=UTC),
+    ],
+)
+def test_seed_history_has_real_persistence_gaps_and_partial_coverage(
+    tmp_path, monkeypatch, instant
+):
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant.astimezone(tz)
+
+    monkeypatch.setattr(seeder, "datetime", FixedDatetime)
     path = tmp_path / "fixture.sqlite"
     asyncio.run(seeder.seed(path))
-    app = create_app(FixturePortfolioProvider(), database_url=f"sqlite:///{path}")
+    app = create_app(
+        FixturePortfolioProvider(),
+        database_url=f"sqlite:///{path}",
+        clock=lambda: instant,
+    )
     with TestClient(app) as client:
+        assert client.post("/api/connections/fixture").status_code == 200
         points = client.get("/api/overview/history").json()["history"]
         assert len(points) == 43
         dates = [date.fromisoformat(point["date"]) for point in points]

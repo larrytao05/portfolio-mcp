@@ -153,9 +153,17 @@ class TradingGuard:
         settings = self._settings_service.get()
         violations = [
             *self._settings_violations(settings),
+            *self._route_violations(intent),
             *self._capability_violations(intent),
             *self._quantity_violations(intent),
         ]
+        if self._repository.has_unresolved_cancellations(intent.account_id):
+            violations.append(
+                GuardViolation(
+                    "cancellation_unresolved",
+                    "An earlier cancellation requires reconciliation before trading.",
+                )
+            )
         estimated_notional = self._notional(intent)
         if estimated_notional is None:
             violations.append(
@@ -166,6 +174,21 @@ class TradingGuard:
         violations.extend(self._limit_violations(settings, intent, estimated_notional))
         violations.extend(self._holdings_violations(intent))
         return GuardDecision(tuple(violations), estimated_notional)
+
+    def _route_violations(self, intent: TradeIntent) -> list[GuardViolation]:
+        route = self._repository.account_route(intent.account_id)
+        if (
+            route is not None
+            and route.active
+            and route.included
+            and route.trade_enabled
+        ):
+            return []
+        return [
+            GuardViolation(
+                "account_route_unavailable", "The account is not enabled for trading."
+            )
+        ]
 
     def _settings_violations(
         self, settings: StoredTradingSettings

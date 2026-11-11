@@ -6,6 +6,8 @@ import {
   createOrderDraft,
   getTradingSettings,
   getTradingStatus,
+  getUnresolvedOrders,
+  reconcileOrder,
   searchInstruments,
   updateTradingSettings,
   type Account,
@@ -140,27 +142,38 @@ export function TradingSettingsPanel() {
     </section>
   );
 }
-function outcomeMessage(order: Order | null): string | null {
+function outcomeMessage(order: Order | null, live: boolean): string | null {
   if (order === null) return null;
+  const provider = live ? "Alpaca" : "Fake execution";
   if (order.state === "UNKNOWN") {
     return "The outcome is unknown. Reconciliation is required; do not resubmit.";
   }
   if (order.state === "REJECTED") {
-    return "Fake execution rejected the order. Review the result before creating a new draft.";
+    return `${provider} rejected the order. Review the result before creating a new draft.`;
   }
   if (order.state === "ACCEPTED") {
-    return "Fake execution accepted the order.";
+    return `${provider} accepted the order.`;
   }
   if (order.state === "PARTIALLY_FILLED") {
-    return "Fake execution partially filled the order. Monitor the remaining quantity.";
+    return `${provider} partially filled the order. Monitor the remaining quantity.`;
   }
   if (order.state === "FILLED") {
-    return "Fake execution filled the order.";
+    return `${provider} filled the order.`;
   }
   return null;
 }
 
+function UnresolvedOrders({ account }: { account: Account }) {
+  const client = useQueryClient();
+  const query = useQuery({ queryKey: ["unresolved-orders", account.id], queryFn: () => getUnresolvedOrders(account.id) });
+  const reconcile = useMutation({ mutationFn: (id: string) => reconcileOrder(id), onSuccess: () => client.invalidateQueries({ queryKey: ["unresolved-orders", account.id] }) });
+  if (query.isError) return <p role="alert">Unresolved orders are unavailable for {account.label}. Do not resubmit.</p>;
+  if (!query.data?.orders.length) return null;
+  return <section aria-label={`Unresolved orders for ${account.label}`}><h3>Unresolved orders for {account.label}</h3><p>Reconcile these orders before placing another order for this account.</p>{query.data.orders.map((order) => <div key={order.id}><span>{order.instrument?.symbol ?? "Order"} · {order.state} · {order.id}</span> {order.state === "UNKNOWN" && <button type="button" disabled={reconcile.isPending} onClick={() => reconcile.mutate(order.id)}>Reconcile order</button>}</div>)}{reconcile.isError && <p role="alert">Reconciliation is unavailable. Do not resubmit.</p>}</section>;
+}
+
 export function TradeSection({ accounts }: { accounts: Account[] }) {
+  const queryClient = useQueryClient();
   const [draft, setDraft] = useState<OrderDraft | null>(null);
   const [order, setOrder] = useState<Order | null>(null);
   const [instrumentQuery, setInstrumentQuery] = useState("");
@@ -192,7 +205,17 @@ export function TradeSection({ accounts }: { accounts: Account[] }) {
       draft === null
         ? Promise.reject(new Error("No draft to confirm"))
         : confirmOrderDraft(draft.id, draft.fingerprint),
-    onSuccess: ({ order: nextOrder }) => setOrder(nextOrder),
+    onSuccess: ({ order: nextOrder }) => {
+      setOrder(nextOrder);
+      void queryClient.invalidateQueries({ queryKey: ["unresolved-orders"] });
+    },
+  });
+  const reconcile = useMutation({
+    mutationFn: () => order ? reconcileOrder(order.id) : Promise.reject(new Error("No order")),
+    onSuccess: ({ order: nextOrder }) => {
+      setOrder(nextOrder);
+      void queryClient.invalidateQueries({ queryKey: ["unresolved-orders"] });
+    },
   });
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -205,15 +228,18 @@ export function TradeSection({ accounts }: { accounts: Account[] }) {
     if (submittedInstrumentQuery === instrumentQuery) void instruments.refetch();
     setSubmittedInstrumentQuery(instrumentQuery);
   }
-  const outcome = outcomeMessage(order);
+  const live = draft?.account.provider.toLowerCase() === "alpaca";
+  const selectedLive = accounts.find((account) => account.id === form.account_id)?.provider.toLowerCase() === "alpaca";
+  const outcome = outcomeMessage(order, live);
   return (
     <section className="content-section" id="trade" aria-labelledby="trade-heading">
       <div className="section-heading">
         <div>
           <h2 id="trade-heading">Trade review</h2>
-          <p className="muted">Orders use the offline fake execution provider.</p>
+          <p className="muted">Review the account and order details before confirming.</p>
         </div>
       </div>
+      {accounts.map((account) => <UnresolvedOrders key={account.id} account={account} />)}
       <form className="filter-bar" onSubmit={submit}>
         <label>
           Account
@@ -279,23 +305,23 @@ export function TradeSection({ accounts }: { accounts: Account[] }) {
           </label>
         )}
         <button type="submit" disabled={createDraft.isPending || accounts.length === 0 || !form.instrument_id}>
-          {createDraft.isPending ? "Creating draft…" : "Review fake order"}
+          {createDraft.isPending ? "Creating draft…" : selectedLive ? "Review live order" : "Review fake order"}
         </button>
       </form>
       {createDraft.isError && <p className="inline-alert" role="alert">{createDraft.error.message}</p>}
       {draft !== null && (
         <article className="quote-card" aria-label="Order review">
           <div>
-            <h3>Confirm fake order</h3>
+            <h3>{live ? "Confirm LIVE Alpaca order" : "Confirm fake order"}</h3>
             <p>
-              Fake execution provider · {draft.account.label} · {draft.instruction.side.toUpperCase()} {draft.instruction.quantity} {draft.instruction.type.toUpperCase()} · {draft.instruction.limit_price ?? "market price"}
+              {live ? `LIVE Alpaca · ${draft.account.label} · account ••••${draft.account.id.slice(-4)}` : `Fake execution provider · ${draft.account.label}`} · {draft.instruction.side.toUpperCase()} {draft.instruction.quantity} {draft.instruction.type.toUpperCase()} · {draft.instruction.limit_price ?? "market price"}
             </p>
             <dl>
               <div><dt>Instrument</dt><dd>{draft.instrument.name} ({draft.instrument.symbol})</dd></div>
               <div><dt>Canonical instrument ID</dt><dd>{draft.instrument.id}</dd></div>
               <div><dt>Time in force</dt><dd>{draft.instruction.time_in_force.toUpperCase()}</dd></div>
               <div><dt>Quote</dt><dd>Last {draft.quote.last_price ?? "unavailable"} · Bid {draft.quote.bid_price ?? "unavailable"} · Ask {draft.quote.ask_price ?? "unavailable"}</dd></div>
-              <div><dt>Quote source</dt><dd>{quoteSourceLabel(draft.quote.source)}</dd></div>
+              <div><dt>Quote source</dt><dd>{draft.quote.source === "alpaca_iex_single_exchange" ? "Alpaca IEX, live quote from one exchange (limited coverage)" : quoteSourceLabel(draft.quote.source)}</dd></div>
               <div><dt>Quote observed</dt><dd>{draft.quote.observed_at === null ? "unavailable" : new Date(draft.quote.observed_at).toLocaleString()}</dd></div>
               <div><dt>Estimated notional</dt><dd>{draft.safety.estimated_notional ?? "unavailable"}</dd></div>
               <div><dt>Account refreshed</dt><dd>{draft.safety.account_refreshed_at === null ? "unavailable" : new Date(draft.safety.account_refreshed_at).toLocaleString()}</dd></div>
@@ -308,12 +334,14 @@ export function TradeSection({ accounts }: { accounts: Account[] }) {
             {draft.warnings.length > 0 && <p>Warnings: {draft.warnings.join(", ")}</p>}
           </div>
           <button type="button" disabled={confirm.isPending || order !== null} onClick={() => confirm.mutate()}>
-            {confirm.isPending ? "Confirming…" : "Confirm fake order"}
+            {confirm.isPending ? "Confirming…" : live ? "Confirm LIVE order" : "Confirm fake order"}
           </button>
         </article>
       )}
       {confirm.isError && <p className="inline-alert" role="alert">Confirmation was not accepted. Create a new draft if it expired or changed.</p>}
       {outcome !== null && <p className={order?.state === "UNKNOWN" ? "inline-alert" : "state"} role="status">{outcome}</p>}
+      {order?.state === "UNKNOWN" && <button type="button" disabled={reconcile.isPending} onClick={() => reconcile.mutate()}>Reconcile order</button>}
+      {reconcile.isError && <p className="inline-alert" role="alert">Reconciliation is unavailable. Do not resubmit.</p>}
       {order?.state === "REJECTED" && order.result.message !== null && (
         <p className="inline-alert" role="alert">{order.result.message}</p>
       )}

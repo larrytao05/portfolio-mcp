@@ -1,4 +1,5 @@
 const quoteSourceLabels = new Map([
+  ["alpaca_market_data", "Alpaca"],
   ["schwab_market_data", "Schwab market data"],
   ["fixture_market_data", "Fixture market data"],
 ]);

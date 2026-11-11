@@ -575,7 +575,7 @@ export function OverviewSection({
       >
         <OverviewHeading />
         <p className="state state-empty">
-          No accounts refreshed yet. Refresh your portfolio to load saved accounts.
+          {overview?.warnings[0] ?? "No accounts refreshed yet. Refresh your portfolio to load saved accounts."}
         </p>
       </section>
     );

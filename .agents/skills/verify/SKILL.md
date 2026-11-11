@@ -45,7 +45,7 @@ Use the available browser-control skill and its documented driver. In Codex, use
 
 Always exercise this common path:
 
-1. Confirm **Portfolio Dashboard**, **API ok**, **Portfolio overview**, and **Positions**. Confirm overview precedes positions and the four secondary panels start collapsed.
+1. Confirm **Portfolio Dashboard**, **API ok**, **Portfolio overview**, and **Positions**. Confirm overview precedes positions and the secondary panels start collapsed.
 2. Click **Refresh portfolio** once. Wait for the completion state. Confirm two fixture accounts, nine positions, and a portfolio value render. Observe the saved record and warnings; an HTTP 200 is insufficient.
 3. In the **Positions across accounts** region, confirm separate `VTI` rows identify Schwab and Fidelity. Set **Position account** to one account, then reset it; search **Search positions** for `VTI`, then for a nonmatching symbol. Confirm rows and the no-match state change correctly.
 4. Use links in **Primary navigation** to visit **Accounts**, **Activity**, and **Market data**. Confirm each link opens its collapsed panel. Collapse **Account details**, then click **Accounts** again; it must reopen even if the URL hash is unchanged.
@@ -106,6 +106,6 @@ The helper checks the saved checkout/run paths and process creation stamps, sign
 
 - `scripts/verify_dashboard.py`: executable `start [--history]`, `doctor RUN_DIR`, and `cleanup RUN_DIR` commands above. Requires Python 3.12+, Node, locked project dependencies, and `lsof` on macOS/Linux.
 - `scripts/seed_history.py`: executable setup invoked only by `start --history`. Refuses an existing database; writes only a new `portfolio.sqlite` inside a fixture run. Do not run it against user data.
-- [Overview and accounts](features/overview-accounts.md), [Positions](features/positions.md), [Activity](features/activity.md), [Market data](features/market-data.md), and [Trading safety](features/trading-safety.md) hold the maintained journeys.
+- [Overview and accounts](features/overview-accounts.md), [Connections](features/connections.md), [Positions](features/positions.md), [Activity](features/activity.md), [Market data](features/market-data.md), and [Trading safety](features/trading-safety.md) hold the maintained journeys.
 
 Use `/maintain-verification-skill` when features, selectors, or launch commands change. Update the affected map and prove one real journey again.

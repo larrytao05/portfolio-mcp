@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Protocol
@@ -24,6 +25,10 @@ class CapabilityState(StrEnum):
 
 
 class ExecutionError(ValueError):
+    pass
+
+
+class ExecutionPreflightError(ExecutionError):
     pass
 
 
@@ -83,6 +88,11 @@ class ExecutionCommand:
     quantity: Decimal
     limit_price: Decimal | None
     time_in_force: str = "day"
+    valid_until: datetime | None = None
+    asset_class: str = ""
+    guard_bid_price: Decimal | None = None
+    guard_ask_price: Decimal | None = None
+    guard_last_price: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -141,7 +151,13 @@ class FixtureExecutionProvider:
     ) -> None:
         self.scenario = scenario
         self.invocations: list[tuple[str, str]] = []
-        self._orders: dict[str, ExecutionResult] = {}
+        self._orders: dict[str, ExecutionResult] = {
+            "fixture-open": ExecutionResult(
+                OrderState.PARTIALLY_FILLED,
+                "fixture-open",
+                fill=FillSummary(Decimal("1.25"), Decimal("198.90")),
+            )
+        }
         self._by_client_order_id: dict[str, list[ExecutionResult]] = {}
         self._capabilities = (
             capabilities

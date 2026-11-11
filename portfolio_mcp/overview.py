@@ -228,7 +228,7 @@ class OverviewService:
 
     def get_overview(self) -> PortfolioOverview:
         latest_refresh = self._repository.latest_refresh()
-        stored_accounts = self._repository.list_accounts()
+        stored_accounts = self._included_accounts()
 
         if not stored_accounts:
             if latest_refresh and latest_refresh.status == "failed":
@@ -248,10 +248,26 @@ class OverviewService:
                         latest_refresh, stored_accounts
                     ),
                 )
+            if self._repository.list_accounts():
+                return self._empty_overview(
+                    warnings=(
+                        "Saved accounts are unlinked or hidden. "
+                        "Connect or include an account to see its value.",
+                    )
+                )
             return self._empty_overview()
 
-        stored_positions = self._repository.all_positions()
-        all_daily = self._repository.all_daily_values()
+        included_ids = {account.account.id for account in stored_accounts}
+        stored_positions = [
+            position
+            for position in self._repository.all_positions()
+            if position.position.account_id in included_ids
+        ]
+        all_daily = [
+            value
+            for value in self._repository.all_daily_values()
+            if value.account_id in included_ids
+        ]
 
         status = self._determine_status(stored_accounts, latest_refresh)
         as_of = max((p.as_of for p in stored_positions), default=None)
@@ -272,7 +288,7 @@ class OverviewService:
             else _sum_decimals(p.position.market_value for p in fresh_usd_positions)
         )
 
-        cash_usd = self._calculate_cash_usd(fresh_usd_positions)
+        cash_usd = self._calculate_cash_usd(fresh_usd_positions, stored_accounts)
         account_contributions, account_slices = self._calculate_contributions(
             stored_accounts, stored_positions, fresh_usd_positions, total_known_usd
         )
@@ -310,9 +326,27 @@ class OverviewService:
         )
 
     def get_history(self) -> RecordedHistory:
-        accounts = self._repository.list_accounts()
-        all_daily = self._repository.all_daily_values()
+        accounts = self._included_accounts()
+        included_ids = {account.account.id for account in accounts}
+        all_daily = [
+            value
+            for value in self._repository.all_daily_values()
+            if value.account_id in included_ids
+        ]
         return self._build_history(all_daily, len(accounts))
+
+    def _included_accounts(self) -> list[StoredAccount]:
+        routes = {
+            route.account_id: route for route in self._repository.account_routes()
+        }
+        accounts = self._repository.list_accounts()
+        return [
+            account
+            for account in accounts
+            if (route := routes.get(account.account.id)) is not None
+            and route.active
+            and route.included
+        ]
 
     def _empty_overview(
         self,
@@ -432,14 +466,16 @@ class OverviewService:
         return fresh_usd_positions, exclusions, gain_loss_positions
 
     def _calculate_cash_usd(
-        self, fresh_usd_positions: list[StoredPosition]
+        self, fresh_usd_positions: list[StoredPosition], accounts: list[StoredAccount]
     ) -> Decimal | None:
-        cash_val = _sum_decimals(
-            p.position.market_value
+        cash = [
+            p
             for p in fresh_usd_positions
             if p.position.asset_class in ("cash", "cash_equivalent")
-        )
-        return cash_val if fresh_usd_positions else None
+        ]
+        if {p.position.account_id for p in cash} != {a.account.id for a in accounts}:
+            return None
+        return _sum_decimals(p.position.market_value for p in cash)
 
     def _calculate_contributions(
         self,

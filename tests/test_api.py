@@ -757,12 +757,15 @@ def test_partial_refresh_keeps_failed_provider_data_stale(tmp_path) -> None:
 
 
 def test_partial_refresh_discloses_a_provider_without_saved_data(tmp_path) -> None:
+    provider = PartiallyFailingFixtureProvider()
     client = TestClient(
         create_app(
-            PartiallyFailingFixtureProvider(),
+            provider,
+            configured_providers={"fixture": provider},
             database_url=f"sqlite:///{tmp_path / 'portfolio.db'}",
         )
     )
+    assert client.post("/api/connections/fixture").status_code == 200
 
     response = client.post("/api/refresh")
 

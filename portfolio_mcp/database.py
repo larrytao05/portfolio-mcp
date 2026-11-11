@@ -86,6 +86,43 @@ class AccountRecord(Base):
     is_stale: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
+class ConnectionRecord(Base):
+    __tablename__ = "connections"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    provider_route: Mapped[str] = mapped_column(String(32), nullable=False)
+    environment: Mapped[str] = mapped_column(String(16), nullable=False)
+    credential_reference: Mapped[str] = mapped_column(String(128), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
+
+class AccountRouteRecord(Base):
+    __tablename__ = "account_routes"
+    __table_args__ = (UniqueConstraint("connection_id", "upstream_account_id"),)
+
+    account_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    connection_id: Mapped[str] = mapped_column(
+        ForeignKey("connections.id"), nullable=False
+    )
+    upstream_account_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    included: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    trade_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+@dataclass(frozen=True)
+class AccountRoute:
+    account_id: str
+    connection_id: str
+    provider_route: str
+    upstream_account_id: str
+    credential_reference: str
+    active: bool
+    included: bool
+    trade_enabled: bool
+    version: int
+
+
 class PositionRecord(Base):
     __tablename__ = "positions"
     __table_args__ = (UniqueConstraint("account_id", "symbol"),)
@@ -193,6 +230,16 @@ class TradingSettingsRecord(Base):
     max_order_notional_usd: Mapped[Decimal | None] = mapped_column(ExactDecimal())
     updated_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
     version: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class CancellationAttemptRecord(Base):
+    __tablename__ = "cancellation_attempts"
+
+    account_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    broker_order_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(UtcTimestamp(), nullable=False)
 
 
 class OrderDraftRecord(Base):
@@ -459,6 +506,225 @@ class PortfolioRepository:
         )
         self._clock = clock or (lambda: datetime.now(UTC))
 
+    def reserve_cancellation(
+        self, account_id: str, broker_order_id: str, now: datetime
+    ) -> tuple[str, bool]:
+        try:
+            with self._sessions.begin() as session:
+                session.execute(
+                    update(AccountRouteRecord)
+                    .where(AccountRouteRecord.account_id == account_id)
+                    .values(version=AccountRouteRecord.version)
+                )
+                existing_order = session.scalar(
+                    select(OrderRecord.id)
+                    .where(
+                        OrderRecord.account_id == account_id,
+                        OrderRecord.state.in_(
+                            (OrderState.SUBMITTING, OrderState.UNKNOWN)
+                        ),
+                    )
+                    .limit(1)
+                )
+                if existing_order is not None:
+                    raise ValueError("A submission requires reconciliation")
+                record = CancellationAttemptRecord(
+                    account_id=account_id,
+                    broker_order_id=broker_order_id,
+                    state="UNKNOWN",
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(record)
+                session.flush()
+                return record.state, True
+        except IntegrityError:
+            state = self.cancellation_state(account_id, broker_order_id)
+            if state is None:
+                raise
+            return state, False
+
+    def cancellation_state(self, account_id: str, broker_order_id: str) -> str | None:
+        with self._sessions() as session:
+            record = session.get(
+                CancellationAttemptRecord, (account_id, broker_order_id)
+            )
+            return record.state if record else None
+
+    def finish_cancellation(
+        self, account_id: str, broker_order_id: str, state: str, now: datetime
+    ) -> None:
+        if state not in {"UNKNOWN", "CANCEL_PENDING", "CANCELED", "FILLED", "REJECTED"}:
+            raise ValueError("Invalid cancellation state")
+        with self._sessions.begin() as session:
+            result = session.execute(
+                update(CancellationAttemptRecord)
+                .where(
+                    CancellationAttemptRecord.account_id == account_id,
+                    CancellationAttemptRecord.broker_order_id == broker_order_id,
+                    CancellationAttemptRecord.state.in_(("UNKNOWN", "CANCEL_PENDING")),
+                )
+                .values(state=state, updated_at=now)
+            )
+            if not cast(CursorResult[object], result).rowcount:
+                raise ValueError("Cancellation is not unresolved")
+
+    def unresolved_cancellations(self, account_id: str) -> list[dict[str, str]]:
+        with self._sessions() as session:
+            records = session.scalars(
+                select(CancellationAttemptRecord).where(
+                    CancellationAttemptRecord.account_id == account_id,
+                    CancellationAttemptRecord.state.in_(("UNKNOWN", "CANCEL_PENDING")),
+                )
+            )
+            return [
+                {"broker_order_id": record.broker_order_id, "state": record.state}
+                for record in records
+            ]
+
+    def has_unresolved_cancellations(self, account_id: str) -> bool:
+        with self._sessions() as session:
+            return (
+                session.scalar(
+                    select(CancellationAttemptRecord.account_id)
+                    .where(
+                        CancellationAttemptRecord.account_id == account_id,
+                        CancellationAttemptRecord.state.in_(
+                            ("UNKNOWN", "CANCEL_PENDING")
+                        ),
+                    )
+                    .limit(1)
+                )
+                is not None
+            )
+
+    def save_connection(
+        self,
+        connection_id: str,
+        provider_route: str,
+        environment: str,
+        credential_reference: str,
+        active: bool,
+    ) -> None:
+        if provider_route not in {"alpaca", "snaptrade", "schwab", "fixture"}:
+            raise ValueError("Unknown provider route")
+        if environment not in {"live", "fixture"}:
+            raise ValueError("Unknown connection environment")
+        with self._sessions.begin() as session:
+            record = session.get(ConnectionRecord, connection_id)
+            if record is None:
+                record = ConnectionRecord(id=connection_id)
+                session.add(record)
+            elif (
+                record.provider_route,
+                record.environment,
+                record.credential_reference,
+            ) != (provider_route, environment, credential_reference):
+                raise ValueError("Connection identity cannot be reassigned")
+            record.provider_route = provider_route
+            record.environment = environment
+            record.credential_reference = credential_reference
+            record.active = active
+
+    def save_account_route(
+        self,
+        account_id: str,
+        connection_id: str,
+        upstream_account_id: str,
+        *,
+        included: bool = True,
+        trade_enabled: bool = False,
+    ) -> None:
+        with self._sessions.begin() as session:
+            if session.get(ConnectionRecord, connection_id) is None:
+                raise ValueError("Connection not found")
+            record = session.get(AccountRouteRecord, account_id)
+            if record is None:
+                record = AccountRouteRecord(account_id=account_id)
+                session.add(record)
+            elif (record.connection_id, record.upstream_account_id) != (
+                connection_id,
+                upstream_account_id,
+            ):
+                raise ValueError("Account route cannot be reassigned")
+            record.connection_id = connection_id
+            record.upstream_account_id = upstream_account_id
+            record.included = included
+            record.trade_enabled = trade_enabled if included else False
+
+    def change_account_settings(
+        self,
+        account_id: str,
+        version: int,
+        *,
+        included: bool | None = None,
+        trade_enabled: bool | None = None,
+    ) -> bool:
+        with self._sessions.begin() as session:
+            active_connection = select(ConnectionRecord.id).where(
+                ConnectionRecord.active.is_(True)
+            )
+            query = update(AccountRouteRecord).where(
+                AccountRouteRecord.account_id == account_id,
+                AccountRouteRecord.version == version,
+                AccountRouteRecord.connection_id.in_(active_connection),
+            )
+            if included is not None:
+                values = {
+                    "included": included,
+                    "version": AccountRouteRecord.version + 1,
+                }
+                if not included:
+                    values["trade_enabled"] = False
+            else:
+                query = query.where(AccountRouteRecord.included.is_(True))
+                values = {
+                    "trade_enabled": bool(trade_enabled),
+                    "version": AccountRouteRecord.version + 1,
+                }
+            result = cast(CursorResult[object], session.execute(query.values(**values)))
+            return result.rowcount == 1
+
+    def disconnect_connection(self, connection_id: str) -> bool:
+        with self._sessions.begin() as session:
+            connection = session.get(ConnectionRecord, connection_id)
+            if connection is None:
+                return False
+            connection.active = False
+            session.execute(
+                update(AccountRouteRecord)
+                .where(AccountRouteRecord.connection_id == connection_id)
+                .values(trade_enabled=False, version=AccountRouteRecord.version + 1)
+            )
+            return True
+
+    def account_routes(self) -> list[AccountRoute]:
+        with self._sessions() as session:
+            ids = list(session.scalars(select(AccountRouteRecord.account_id)))
+        return [
+            route for account_id in ids if (route := self.account_route(account_id))
+        ]
+
+    def account_route(self, account_id: str) -> AccountRoute | None:
+        with self._sessions() as session:
+            route = session.get(AccountRouteRecord, account_id)
+            if route is None:
+                return None
+            connection = session.get(ConnectionRecord, route.connection_id)
+            if connection is None:
+                return None
+            return AccountRoute(
+                account_id=route.account_id,
+                connection_id=connection.id,
+                provider_route=connection.provider_route,
+                upstream_account_id=route.upstream_account_id,
+                credential_reference=connection.credential_reference,
+                active=connection.active,
+                included=route.included,
+                trade_enabled=route.trade_enabled,
+                version=route.version,
+            )
+
     def save_order_draft(self, draft: "OrderDraft") -> None:
         with self._sessions.begin() as session:
             session.add(
@@ -566,11 +832,38 @@ class PortfolioRepository:
         client_order_id = str(uuid4())
         try:
             with self._sessions.begin() as session:
+                session.execute(
+                    update(AccountRouteRecord)
+                    .where(AccountRouteRecord.account_id == draft.account_id)
+                    .values(version=AccountRouteRecord.version)
+                )
                 existing = session.scalar(
                     select(OrderRecord).where(OrderRecord.draft_id == draft.id)
                 )
                 if existing is not None:
                     return self._stored_order(existing), False
+                unresolved_cancel = session.scalar(
+                    select(CancellationAttemptRecord.account_id)
+                    .where(
+                        CancellationAttemptRecord.account_id == draft.account_id,
+                        CancellationAttemptRecord.state.in_(
+                            ("UNKNOWN", "CANCEL_PENDING")
+                        ),
+                    )
+                    .limit(1)
+                )
+                unresolved_order = session.scalar(
+                    select(OrderRecord.id)
+                    .where(
+                        OrderRecord.account_id == draft.account_id,
+                        OrderRecord.state.in_(
+                            (OrderState.SUBMITTING, OrderState.UNKNOWN)
+                        ),
+                    )
+                    .limit(1)
+                )
+                if unresolved_cancel is not None or unresolved_order is not None:
+                    raise ValueError("An earlier action requires reconciliation")
                 session.add(
                     OrderAuthorizationRecord(
                         id=str(uuid4()),
@@ -614,6 +907,18 @@ class PortfolioRepository:
                 if existing is None:
                     raise
                 return self._stored_order(existing), False
+
+    def unresolved_orders(self, account_id: str) -> list["StoredOrder"]:
+        with self._sessions() as session:
+            records = session.scalars(
+                select(OrderRecord)
+                .where(
+                    OrderRecord.account_id == account_id,
+                    OrderRecord.state.in_((OrderState.SUBMITTING, OrderState.UNKNOWN)),
+                )
+                .order_by(OrderRecord.created_at.desc())
+            )
+            return [self._stored_order(record) for record in records]
 
     def order(self, order_id: str) -> "StoredOrder | None":
         with self._sessions() as session:

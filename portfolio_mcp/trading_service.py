@@ -4,10 +4,12 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 
+from portfolio_mcp.alpaca_market_data import AlpacaMarketDataProvider
 from portfolio_mcp.database import (
     OrderDraft,
     PortfolioRepository,
@@ -19,6 +21,7 @@ from portfolio_mcp.execution import (
     ExecutionCapability,
     ExecutionCommand,
     ExecutionIndeterminateError,
+    ExecutionPreflightError,
     ExecutionProvider,
     ExecutionResult,
     OrderState,
@@ -38,7 +41,15 @@ class TradingValidationError(ValueError):
         self.code = code
 
 
-SubmissionValidator = Callable[[OrderDraft, datetime], Awaitable[None]]
+@dataclass(frozen=True)
+class SubmissionCheck:
+    intent: TradeIntent
+    valid_until: datetime
+
+
+SubmissionValidator = Callable[
+    [OrderDraft, datetime], Awaitable[SubmissionCheck | None]
+]
 
 
 class OrderDraftService:
@@ -75,7 +86,19 @@ class OrderDraftService:
                 "invalid_order_type", "type must be market or limit"
             )
 
-        quote = await self._market_data_provider.get_quote(instrument_id)
+        route = self._repository.account_route(account_id)
+        if (
+            route is not None
+            and route.provider_route == "alpaca"
+            and order_type == "market"
+        ):
+            if not isinstance(self._market_data_provider, AlpacaMarketDataProvider):
+                raise TradingValidationError(
+                    "quote_unavailable", "A fresh Alpaca IEX quote is required"
+                )
+            quote = await self._market_data_provider.get_execution_quote(instrument_id)
+        else:
+            quote = await self._market_data_provider.get_quote(instrument_id)
         if quote.instrument.asset_class not in {"equity", "etf", "equity_etf"}:
             raise TradingValidationError(
                 "unsupported_instrument", "Only US stocks and ETFs are supported"
@@ -164,9 +187,12 @@ class OrderSubmissionService:
         clock: Callable[[], datetime],
         validator: SubmissionValidator,
         trading_guard: TradingGuard | None = None,
+        provider_for_account: Callable[[str], ExecutionProvider] | None = None,
     ) -> None:
         self._repository = repository
-        self._execution_provider = execution_provider
+        self._provider_for_account = provider_for_account or (
+            lambda _account_id: execution_provider
+        )
         self._clock = clock
         self._validator = validator
         self._trading_guard = trading_guard or TradingGuard(
@@ -205,8 +231,9 @@ class OrderSubmissionService:
                 )
             return existing
         await self._validator(draft, _utc_now(self._clock()))
+        execution_provider = self._provider_for_account(draft.account_id)
         try:
-            capability = await self._execution_provider.get_execution_capability(
+            capability = await execution_provider.get_execution_capability(
                 draft.account_id
             )
             if not _capability_is_well_formed(capability, draft.account_id):
@@ -228,7 +255,12 @@ class OrderSubmissionService:
         if now > draft.expires_at:
             raise TradingValidationError("draft_expired", "Order draft has expired")
         self._require_fresh_market_quote(draft, now)
-        order, created = self._repository.begin_order_submission(draft, now)
+        try:
+            order, created = self._repository.begin_order_submission(draft, now)
+        except ValueError:
+            raise TradingValidationError(
+                "reconciliation_required", "An earlier action requires reconciliation"
+            ) from None
         if not created:
             return order
         command = ExecutionCommand(
@@ -247,8 +279,26 @@ class OrderSubmissionService:
             if final_now > draft.expires_at:
                 raise TradingValidationError("draft_expired", "Order draft has expired")
             self._require_fresh_market_quote(draft, final_now)
-            await self._validator(draft, final_now)
-            _require_guard(self._trading_guard, _trade_intent(draft))
+            checked = await self._validator(draft, final_now)
+            _require_guard(
+                self._trading_guard, checked.intent if checked else _trade_intent(draft)
+            )
+            command = replace(
+                command,
+                valid_until=min(draft.expires_at, checked.valid_until)
+                if checked
+                else draft.expires_at,
+                asset_class=draft.asset_class,
+                guard_bid_price=checked.intent.bid_price
+                if checked
+                else draft.quote_bid_price,
+                guard_ask_price=checked.intent.ask_price
+                if checked
+                else draft.quote_ask_price,
+                guard_last_price=checked.intent.last_price
+                if checked
+                else draft.quote_last_price,
+            )
         except TradingValidationError as error:
             return self._repository.finish_order_submission(
                 order.id,
@@ -258,8 +308,16 @@ class OrderSubmissionService:
                 result_message=str(error),
             )
         try:
-            result = await self._execution_provider.submit_order(command)
+            result = await execution_provider.submit_order(command)
             return self._persist_provider_result(order, result, now)
+        except ExecutionPreflightError:
+            return self._repository.finish_order_submission(
+                order.id,
+                OrderState.REJECTED,
+                _utc_now(self._clock()),
+                result_code="dispatch_refused",
+                result_message="Safeguards blocked the order before submission.",
+            )
         except asyncio.CancelledError:
             self._unknown(order, now)
             raise
@@ -267,6 +325,35 @@ class OrderSubmissionService:
             return self._unknown(order, now)
         except Exception:
             return self._unknown(order, now)
+
+    async def reconcile(self, order_id: str) -> StoredOrder:
+        order = self._repository.order(order_id)
+        if order is None:
+            raise TradingValidationError("order_not_found", "Order not found")
+        if order.state != OrderState.UNKNOWN:
+            return order
+        provider = self._provider_for_account(order.account_id)
+        try:
+            capability = await provider.get_execution_capability(order.account_id)
+            if (
+                not _capability_is_well_formed(capability, order.account_id)
+                or not capability.permits_submission
+            ):
+                return order
+            results = await provider.list_recent_orders(order.client_order_id, 1)
+        except Exception:
+            return order
+        if len(results) != 1:
+            return order
+        result = results[0]
+        if result.state not in {
+            OrderState.ACCEPTED,
+            OrderState.PARTIALLY_FILLED,
+            OrderState.FILLED,
+            OrderState.REJECTED,
+        }:
+            return order
+        return self._persist_provider_result(order, result, _utc_now(self._clock()))
 
     def _persist_provider_result(
         self, order: StoredOrder, result: object, now: datetime
@@ -499,12 +586,12 @@ def _utc_now(value: datetime) -> datetime:
 
 def _safe_message(state: OrderState) -> str:
     if state == OrderState.ACCEPTED:
-        return "Fake execution accepted the order."
+        return "Execution provider accepted the order."
     if state == OrderState.PARTIALLY_FILLED:
-        return "Fake execution partially filled the order."
+        return "Execution provider partially filled the order."
     if state == OrderState.FILLED:
-        return "Fake execution filled the order."
-    return "Fake execution rejected the order."
+        return "Execution provider filled the order."
+    return "Execution provider rejected the order."
 
 
 def _draft_warnings(

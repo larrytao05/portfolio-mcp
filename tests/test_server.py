@@ -17,7 +17,7 @@ EXPECTED_TOOLS = ["list_accounts", "get_holdings", "get_transactions"]
 async def test_mcp_server_connection() -> None:
     async with AsyncExitStack() as exit_stack:
         server_params = StdioServerParameters(
-            command="python", args=[SERVER_PATH], env=None
+            command="python", args=[SERVER_PATH], env={"PORTFOLIO_PROVIDER": "fixture"}
         )
         stdio, write = await exit_stack.enter_async_context(stdio_client(server_params))
         session = await exit_stack.enter_async_context(ClientSession(stdio, write))
@@ -32,7 +32,7 @@ async def test_mcp_server_connection() -> None:
 async def test_mcp_tools_return_fixture_data() -> None:
     async with AsyncExitStack() as exit_stack:
         server_params = StdioServerParameters(
-            command="python", args=[SERVER_PATH], env=None
+            command="python", args=[SERVER_PATH], env={"PORTFOLIO_PROVIDER": "fixture"}
         )
         stdio, write = await exit_stack.enter_async_context(stdio_client(server_params))
         session = await exit_stack.enter_async_context(ClientSession(stdio, write))

@@ -12,9 +12,16 @@ from portfolio_mcp.overview import (
 )
 
 
+def bind_saved_accounts(repository):
+    repository.save_connection("fixture", "fixture", "fixture", "fixture", True)
+    for account in repository.list_accounts():
+        repository.save_account_route(account.account.id, "fixture", account.account.id)
+
+
 def test_empty_portfolio(tmp_path) -> None:
     database_url = f"sqlite:///{tmp_path / 'empty.db'}"
     repository = PortfolioRepository(database_url)
+    bind_saved_accounts(repository)
     service = OverviewService(repository)
 
     overview = service.get_overview()
@@ -152,6 +159,7 @@ def test_multi_account_usd_portfolio(tmp_path) -> None:
         snapshot_date=snap_date,
     )
 
+    bind_saved_accounts(repository)
     service = OverviewService(repository)
     overview = service.get_overview()
 
@@ -290,6 +298,7 @@ def test_duplicate_symbols_across_accounts_preserve_identities(tmp_path) -> None
         snapshot_date=snap_date,
     )
 
+    bind_saved_accounts(repository)
     service = OverviewService(repository)
     overview = service.get_overview()
 
@@ -377,6 +386,7 @@ def test_missing_market_value_and_cost_basis(tmp_path) -> None:
         snapshot_date=snap_date,
     )
 
+    bind_saved_accounts(repository)
     service = OverviewService(repository)
     overview = service.get_overview()
 
@@ -471,6 +481,7 @@ def test_non_usd_holdings_excluded_and_reported(tmp_path) -> None:
         snapshot_date=snap_date,
     )
 
+    bind_saved_accounts(repository)
     service = OverviewService(repository)
     overview = service.get_overview()
 
@@ -575,6 +586,7 @@ def test_partial_refresh_and_stale_accounts(tmp_path) -> None:
         failed_accounts=[acc2],
     )
 
+    bind_saved_accounts(repository)
     service = OverviewService(repository)
     overview = service.get_overview()
 
@@ -646,6 +658,7 @@ def test_failed_refresh_all_accounts_stale(tmp_path) -> None:
         error_message="Schwab API unavailable",
     )
 
+    bind_saved_accounts(repository)
     service = OverviewService(repository)
     overview = service.get_overview()
 
@@ -802,6 +815,7 @@ def test_daily_value_history_aggregation_and_gap_preservation(tmp_path) -> None:
             )
         )
 
+    bind_saved_accounts(repository)
     service = OverviewService(repository)
     overview = service.get_overview()
 
@@ -879,6 +893,7 @@ def test_overview_to_dict_serialization(tmp_path) -> None:
         snapshot_date=snap_date,
     )
 
+    bind_saved_accounts(repository)
     service = OverviewService(repository)
     data = service.get_overview().to_dict()
 
@@ -963,6 +978,7 @@ def test_mixed_currency_account_daily_history_excludes_non_usd_from_usd_snapshot
         snapshot_date=snap_date,
     )
 
+    bind_saved_accounts(repository)
     service = OverviewService(repository)
     overview = service.get_overview()
 

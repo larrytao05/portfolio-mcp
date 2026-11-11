@@ -14,6 +14,7 @@ import {
   refreshPortfolio,
 } from "./api/client";
 import { ActivitySection } from "./features/activity/ActivitySection";
+import { ConnectionsSection } from "./features/connections/ConnectionsSection";
 import { AccountsSection } from "./features/accounts/AccountsSection";
 import { MarketDataSection } from "./features/market-data/MarketDataSection";
 import { PositionsSection } from "./features/positions/PositionsSection";
@@ -48,6 +49,7 @@ function Navigation() {
         ["overview", "Overview"],
         ["positions", "Positions"],
         ["accounts", "Accounts"],
+        ["connections", "Connections"],
         ["activity", "Activity"],
         ["market-data", "Market data"],
         ["settings", "Settings"],
@@ -88,6 +90,7 @@ export function App() {
     onSuccess: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["accounts"] }),
+        queryClient.invalidateQueries({ queryKey: ["connections"] }),
         queryClient.invalidateQueries({ queryKey: ["refreshes"] }),
         queryClient.invalidateQueries({ queryKey: ["activity"] }),
         queryClient.invalidateQueries({ queryKey: ["overview"] }),
@@ -172,6 +175,10 @@ export function App() {
         />
         <PositionsSection accounts={accounts.data?.accounts} loading={accounts.isPending} error={accounts.isError} />
         <details className="workspace-panel">
+          <summary>Connections</summary>
+          <ConnectionsSection />
+        </details>
+        <details className="workspace-panel">
           <summary>Account details</summary>
           <AccountsSection
             accounts={accounts.data?.accounts}
@@ -186,7 +193,7 @@ export function App() {
         </details>
         <details className="workspace-panel">
           <summary>Market data</summary>
-          <MarketDataSection />
+          <MarketDataSection accounts={accounts.data?.accounts ?? []} />
         </details>
         <details className="workspace-panel">
           <summary>Trading &amp; settings</summary>

@@ -15,6 +15,12 @@ import type { Position } from "./api/client";
 const api = vi.hoisted(() => ({
   confirmOrderDraft: vi.fn(),
   createOrderDraft: vi.fn(),
+  getConnections: vi.fn(),
+  connectProvider: vi.fn(),
+  disconnectProvider: vi.fn(),
+  reactivateConnection: vi.fn(),
+  updateAccountConnection: vi.fn(),
+  getSnapTradePortal: vi.fn(),
   getAccount: vi.fn(),
   getActivity: vi.fn(),
   getAccounts: vi.fn(),
@@ -23,6 +29,8 @@ const api = vi.hoisted(() => ({
   getOverview: vi.fn(),
   getOverviewHistory: vi.fn(),
   getQuote: vi.fn(),
+  getIntraday: vi.fn().mockRejectedValue(new Error("Unsupported chart")),
+  getBrokerOrders: vi.fn().mockRejectedValue(new Error("Unsupported orders")),
   getTradingStatus: vi.fn(),
   getTradingSettings: vi.fn(),
   refreshPortfolio: vi.fn(),
@@ -68,6 +76,7 @@ describe("App", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    api.getConnections.mockResolvedValue({ configured: {}, accounts: [] });
     api.getHealth.mockResolvedValue({ status: "ok" });
     api.getAccounts.mockResolvedValue({ accounts: [] });
     api.getAccount.mockResolvedValue(savedAccount());
@@ -139,17 +148,17 @@ describe("App", () => {
     const { container } = renderApp();
     await screen.findByRole("heading", { name: "Portfolio Dashboard" });
     const panels = Array.from(container.querySelectorAll<HTMLDetailsElement>(".workspace-panel"));
-    expect(panels).toHaveLength(4);
+    expect(panels).toHaveLength(5);
     expect(panels.every((panel) => !panel.open)).toBe(true);
     const overview = container.querySelector("#overview")!;
     const positions = container.querySelector("#positions")!;
     expect(overview.compareDocumentPosition(positions) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     fireEvent.click(screen.getByRole("link", { name: "Accounts" }));
-    expect(panels[0].open).toBe(true);
+    expect(panels[1].open).toBe(true);
     fireEvent.click(screen.getByText("Account details", { selector: "summary" }));
-    expect(panels[0].open).toBe(false);
+    expect(panels[1].open).toBe(false);
     fireEvent.click(screen.getByRole("link", { name: "Accounts" }));
-    expect(panels[0].open).toBe(true);
+    expect(panels[1].open).toBe(true);
   });
 
   it("starts with visibly blocking trading safeguards", async () => {

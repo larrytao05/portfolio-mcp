@@ -456,6 +456,14 @@ td.identity-column span {
 .filter-bar select {
   min-width: 110px;
 }
+.filter-bar fieldset {
+  min-width: 0;
+  max-width: 100%;
+}
+.filter-bar fieldset button {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 
 .overview-strip {
   margin: 20px 0 24px;
@@ -755,6 +763,11 @@ td.identity-column span {
   flex-wrap: wrap;
   gap: 28px;
   margin: 24px 0;
+}
+.quote-card dl > div {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 .quote-card dd {
   font-size: 20px;
@@ -1085,3 +1098,23 @@ input, select { border-radius: 5px; }
   .side-rail nav { flex-wrap: wrap; justify-content: flex-start; }
   .content-section { scroll-margin-top: 180px; }
 }
+
+.ticker-chart-panel { margin-block: 24px; border: 1px solid var(--line); padding: 20px; border-radius: 8px; min-width: 0; }
+.intraday-chart svg { width: 100%; height: auto; display: block; }
+.intraday-chart svg text { fill: var(--muted); font-size: 11px; }
+.intraday-chart .snapshot-control { display: block; }
+.intraday-chart .snapshot-control input { display: block; }
+.chart-readout { font-size: 12px; min-height: 36px; overflow-wrap: anywhere; }
+.ticker-session { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.ticker-session input { width: auto; }
+.ticker-accounts { margin-block: 24px; min-width: 0; }
+.ticker-accounts article { border-top: 1px solid var(--line); padding-block: 16px; }
+.ticker-tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+.ticker-tabs button[aria-pressed="true"] { background: var(--accent); }
+.ticker-accounts .table-scroll { overflow-x: auto; }
+.ticker-accounts table { min-width: 750px; }
+@media (max-width: 760px) { .ticker-chart-panel { padding: 12px; } }
+.ticker-market-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(230px, 300px); gap: 20px; align-items: start; }
+.ticker-market-grid .quote-card { margin-block: 24px; }
+.ticker-market-grid .quote-card small { display: block; margin-top: 12px; }
+@media (max-width: 1000px) { .ticker-market-grid { grid-template-columns: minmax(0, 1fr); } }

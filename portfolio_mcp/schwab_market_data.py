@@ -7,8 +7,9 @@ from decimal import Decimal
 from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
+from urllib.request import Request, build_opener
 
+from portfolio_mcp.alpaca_market_data import _NoRedirect
 from portfolio_mcp.config import SchwabMarketDataSettings
 from portfolio_mcp.models import Instrument, Quote
 from portfolio_mcp.provider import (
@@ -41,7 +42,7 @@ class UrllibSchwabHttpClient:
     ) -> tuple[int, object]:
         request = Request(url, data=body, headers=headers, method=method)
         try:
-            with urlopen(request, timeout=15) as response:
+            with build_opener(_NoRedirect()).open(request, timeout=15) as response:
                 return response.status, _decode_body(response.read())
         except HTTPError as error:
             return error.code, _decode_body(error.read())

@@ -50,7 +50,15 @@ def command() -> ExecutionCommand:
 
 
 def enable_trading_api(client: TestClient) -> None:
+    assert client.post("/api/connections/fixture").status_code == 200
     assert client.post("/api/refresh").status_code == 200
+    assert (
+        client.put(
+            "/api/accounts/schwab-taxable-demo/connection-settings",
+            json={"trade_enabled": True, "version": 0},
+        ).status_code
+        == 200
+    )
     response = client.put(
         "/api/trading/settings",
         json={
@@ -85,6 +93,10 @@ async def test_trading_guard_applies_conservative_limits_and_capabilities(
         capabilities=await portfolio.get_account_capabilities(
             [snapshot.account.id for snapshot in snapshots]
         ),
+    )
+    repository.save_connection("fixture", "fixture", "fixture", "fixture", True)
+    repository.save_account_route(
+        "schwab-taxable-demo", "fixture", "schwab-taxable-demo", trade_enabled=True
     )
     settings = TradingSettingsService(repository, lambda: now)
     settings.replace(
@@ -154,6 +166,10 @@ async def test_trading_guard_fails_closed_for_each_safety_precondition(
         capabilities=await portfolio.get_account_capabilities(
             [snapshot.account.id for snapshot in snapshots]
         ),
+    )
+    repository.save_connection("fixture", "fixture", "fixture", "fixture", True)
+    repository.save_account_route(
+        "schwab-taxable-demo", "fixture", "schwab-taxable-demo", trade_enabled=True
     )
     settings = TradingSettingsService(repository, lambda: now)
     enabled = settings.replace(
@@ -300,6 +316,10 @@ async def enabled_trading_guard(
         refreshed_at,
         refreshed_at.date(),
         capabilities=capabilities,
+    )
+    repository.save_connection("fixture", "fixture", "fixture", "fixture", True)
+    repository.save_account_route(
+        "schwab-taxable-demo", "fixture", "schwab-taxable-demo", trade_enabled=True
     )
     settings = TradingSettingsService(repository, lambda: refreshed_at)
     settings.replace(
@@ -1136,3 +1156,38 @@ def test_kill_switch_blocks_submission_after_a_draft_is_reviewed(tmp_path) -> No
     assert confirmation.status_code == 200
     assert confirmation.json()["order"]["result"]["code"] == "kill_switch_active"
     assert [name for name, _ in provider.invocations] == ["capability"]
+
+
+@pytest.mark.asyncio
+async def test_guard_blocks_missing_hidden_and_disconnected_routes(tmp_path) -> None:
+    repository = PortfolioRepository(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    guard = await enabled_trading_guard(repository, FixturePortfolioProvider())
+    intent = TradeIntent(
+        account_id="schwab-taxable-demo",
+        symbol="VTI",
+        asset_class="equity_etf",
+        side="buy",
+        order_type="limit",
+        quantity=Decimal("1"),
+        limit_price=Decimal("300"),
+        bid_price=Decimal("299"),
+        ask_price=Decimal("300"),
+        last_price=Decimal("300"),
+    )
+    assert guard.evaluate(intent).allowed
+    assert "account_route_unavailable" in _violation_codes(
+        guard.evaluate(replace(intent, account_id="unknown"))
+    )
+    repository.save_account_route(
+        "schwab-taxable-demo",
+        "fixture",
+        "schwab-taxable-demo",
+        included=False,
+        trade_enabled=True,
+    )
+    assert "account_route_unavailable" in _violation_codes(guard.evaluate(intent))
+    repository.save_account_route(
+        "schwab-taxable-demo", "fixture", "schwab-taxable-demo", trade_enabled=True
+    )
+    repository.save_connection("fixture", "fixture", "fixture", "fixture", False)
+    assert "account_route_unavailable" in _violation_codes(guard.evaluate(intent))

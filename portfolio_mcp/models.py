@@ -243,9 +243,23 @@ class Quote:
     bid_price: Decimal | None
     ask_price: Decimal | None
     currency: str | None
+    feed: str | None = None
+    delay_seconds: int = 0
+    trade_observed_at: datetime | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
+            **(
+                {
+                    "feed": self.feed,
+                    "delay_seconds": self.delay_seconds,
+                    "trade_observed_at": self.trade_observed_at.isoformat()
+                    if self.trade_observed_at
+                    else None,
+                }
+                if self.feed
+                else {}
+            ),
             "instrument": self.instrument.to_dict(),
             "source": self.source,
             "observed_at": self.observed_at.isoformat(),
