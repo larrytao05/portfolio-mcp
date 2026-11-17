@@ -227,6 +227,39 @@ async def test_broker_orders_preserve_executed_coverage_and_exact_quantities():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("institution", ["Fidelity", "Charles Schwab"])
+async def test_known_broker_open_orders_are_reported_as_unavailable(institution):
+    provider, information = _provider()
+    information.get_user_account_details = lambda **_: SimpleNamespace(
+        body={
+            **information.list_user_accounts().body[0],
+            "institution_name": institution,
+        }
+    )
+    history = await provider.get_broker_orders("roth-account", "NVDA", "open")
+    assert history.coverage == "executed_only"
+    assert "Open orders" in history.warning
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["open", "closed", "all"])
+async def test_unknown_broker_order_coverage_is_unsupported(status):
+    provider, information = _provider()
+    information.get_user_account_details = lambda **_: SimpleNamespace(
+        body={**information.list_user_accounts().body[0], "institution_name": "Other"}
+    )
+
+    def unexpected_orders(**_):
+        pytest.fail("Unknown broker orders should not be requested")
+
+    setattr(information, "get_user_account_orders", unexpected_orders)
+    history = await provider.get_broker_orders("roth-account", "NVDA", status)
+    assert history.coverage == "unsupported"
+    assert history.orders == ()
+    assert "not been verified" in history.warning
+
+
+@pytest.mark.asyncio
 async def test_personal_connection_portal_uses_reconnect_without_user_registration(
     monkeypatch,
 ):

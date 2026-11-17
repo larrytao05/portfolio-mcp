@@ -188,6 +188,18 @@ class SnapTradeProvider:
         status: Literal["open", "closed", "all"] = "all",
     ) -> BrokerOrderHistory:
         account = await self._get_account(account_id)
+        if not any(
+            name in account.provider.casefold() for name in ("fidelity", "schwab")
+        ):
+            return BrokerOrderHistory(
+                account,
+                (),
+                "unsupported",
+                "unknown",
+                "Order coverage for this connection has not been verified.",
+                lookback_days=None,
+                source="SnapTrade",
+            )
         warning = (
             "This app imports executed orders through SnapTrade for a requested "
             "90-day window; completeness and source sync time are unknown. "
