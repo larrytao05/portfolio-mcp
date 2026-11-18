@@ -1,5 +1,8 @@
-from datetime import UTC, date, datetime
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from typing import Literal
+from zoneinfo import ZoneInfo
 
 from portfolio_mcp.models import (
     Account,
@@ -13,10 +16,81 @@ from portfolio_mcp.models import (
     TransactionHistory,
 )
 from portfolio_mcp.provider import AccountNotFoundError, InstrumentNotFoundError
+from portfolio_mcp.ticker import (
+    BrokerOrder,
+    BrokerOrderHistory,
+    IntradayBar,
+    IntradayHistory,
+)
 
 
 class FixturePortfolioProvider:
     as_of = date(2026, 8, 29)
+
+    async def get_broker_orders(
+        self,
+        account_id: str,
+        symbol: str,
+        status: Literal["open", "closed", "all"] = "all",
+    ) -> BrokerOrderHistory:
+        account = next((item for item in self._accounts if item.id == account_id), None)
+        if account is None:
+            raise AccountNotFoundError("Account not found")
+        direct = account_id == "schwab-taxable-demo"
+        orders: tuple[BrokerOrder, ...] = ()
+        if symbol in {"VTI", "NVDA"}:
+            if direct and status in {"open", "all"}:
+                orders += (
+                    BrokerOrder(
+                        "fixture-open",
+                        account_id,
+                        symbol,
+                        "BUY",
+                        "LIMIT",
+                        "4",
+                        "1.25",
+                        "partially_filled",
+                        "199.00",
+                        "2026-11-09T15:00:00Z",
+                        None,
+                        filled_avg_price="198.90",
+                    ),
+                )
+            if status in {"closed", "all"}:
+                orders += (
+                    BrokerOrder(
+                        "fixture-closed",
+                        account_id,
+                        symbol,
+                        "SELL",
+                        "LIMIT",
+                        "2.50",
+                        "2.50",
+                        "canceled" if direct else "EXECUTED",
+                        "199.00",
+                        "2026-11-09T15:00:00Z",
+                        "2026-11-09T15:01:00Z",
+                    ),
+                )
+                if direct and symbol == "VTI":
+                    orders += tuple(
+                        replace(orders[-1], id=f"fixture-history-{index}")
+                        for index in range(20)
+                    )
+        return BrokerOrderHistory(
+            account,
+            orders,
+            "open_and_executed" if direct else "executed_only",
+            "fixture",
+            "Fictional open and historical orders."
+            if direct
+            else (
+                "Fictional executed orders only. Open orders are not "
+                "exposed by this fixture."
+            ),
+            source="Fixture",
+            lookback_days=90,
+        )
 
     def __init__(self) -> None:
         self._accounts = [
@@ -383,6 +457,43 @@ class FixtureMarketDataProvider:
             if normalized in instrument.symbol.casefold()
             or normalized in instrument.name.casefold()
         ]
+
+    async def get_intraday(
+        self, instrument_id: str, extended_hours: bool
+    ) -> IntradayHistory:
+        observation = await self.get_quote(instrument_id)
+        now = datetime.now(ZoneInfo("America/New_York"))
+        start = now.replace(
+            hour=4 if extended_hours else 9,
+            minute=0 if extended_hours else 30,
+            second=0,
+            microsecond=0,
+        )
+        base = observation.last_price
+        bars = (
+            tuple(
+                IntradayBar(
+                    (start + timedelta(minutes=index)).isoformat(),
+                    str(base + Decimal(index % 9) / 10),
+                    str(base + Decimal(index % 9) / 10 + Decimal(".20")),
+                    str(base + Decimal(index % 9) / 10 - Decimal(".10")),
+                    str(base + Decimal(index % 9) / 10 + Decimal(".05")),
+                    str(1000 + index * 10),
+                )
+                for index in range(90)
+            )
+            if base is not None
+            else ()
+        )
+        return IntradayHistory(
+            now.date(),
+            extended_hours,
+            self.source,
+            "fixture",
+            900,
+            start + timedelta(minutes=89),
+            bars,
+        )
 
     async def get_quote(self, instrument_id: str) -> Quote:
         instrument = self._instruments.get(instrument_id)

@@ -24,6 +24,13 @@ def _client(
         )
     )
     assert client.post("/api/refresh").status_code == 200
+    assert (
+        client.put(
+            "/api/accounts/schwab-taxable-demo/connection-settings",
+            json={"version": 0, "trade_enabled": True},
+        ).status_code
+        == 200
+    )
     settings = client.put(
         "/api/trading/settings",
         json={

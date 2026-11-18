@@ -6,10 +6,12 @@ from portfolio_mcp.provider import ProviderConfigurationError
 from portfolio_mcp.snaptrade import SnapTradeProvider
 
 
-def test_create_provider_defaults_to_fixtures() -> None:
-    provider = create_provider({})
-
-    assert isinstance(provider, FixturePortfolioProvider)
+def test_create_provider_requires_live_configuration_by_default() -> None:
+    with pytest.raises(ProviderConfigurationError, match="SnapTrade"):
+        create_provider({})
+    assert isinstance(
+        create_provider({"PORTFOLIO_PROVIDER": "fixture"}), FixturePortfolioProvider
+    )
 
 
 def test_create_provider_builds_snaptrade_provider() -> None:

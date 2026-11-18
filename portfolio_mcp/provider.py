@@ -1,5 +1,5 @@
 from datetime import date
-from typing import ClassVar, Protocol, runtime_checkable
+from typing import ClassVar, Literal, Protocol, runtime_checkable
 
 from portfolio_mcp.models import (
     Account,
@@ -9,6 +9,7 @@ from portfolio_mcp.models import (
     Quote,
     TransactionHistory,
 )
+from portfolio_mcp.ticker import BrokerOrderHistory, IntradayHistory
 
 
 class ProviderError(ValueError):
@@ -130,3 +131,20 @@ class MarketDataProvider(Protocol):
     async def search_instruments(self, query: str) -> list[Instrument]: ...
 
     async def get_quote(self, instrument_id: str) -> Quote: ...
+
+
+@runtime_checkable
+class IntradayMarketDataProvider(Protocol):
+    async def get_intraday(
+        self, instrument_id: str, extended_hours: bool
+    ) -> "IntradayHistory": ...
+
+
+@runtime_checkable
+class BrokerOrderProvider(Protocol):
+    async def get_broker_orders(
+        self,
+        account_id: str,
+        symbol: str,
+        status: Literal["open", "closed", "all"] = "all",
+    ) -> "BrokerOrderHistory": ...

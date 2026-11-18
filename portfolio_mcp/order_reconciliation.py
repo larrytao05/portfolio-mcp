@@ -5,11 +5,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from portfolio_mcp.connection_store import ConnectionStore
 from portfolio_mcp.database import Database
 from portfolio_mcp.execution import (
     BrokerOrderSearch,
     BrokerOrderSnapshot,
     ExecutionError,
+    FixtureExecutionProvider,
     OrderReadProvider,
     OrderState,
 )
@@ -223,6 +225,15 @@ class OrderReconciliationService:
         return self._finish_match(claim, attempt_at, snapshot), provider_read_started
 
     async def _search(self, order: StoredOrder) -> BrokerOrderSearch:
+        if isinstance(self._provider, FixtureExecutionProvider):
+            route = ConnectionStore(self._database).account_route(order.account_id)
+            if (
+                route is None
+                or route.provider_route != "fixture"
+                or not route.active
+                or not route.included
+            ):
+                raise ExecutionError("Account-specific order reader is unavailable")
         if order.broker_order_id is not None:
             snapshot = await self._provider.find_by_broker_order_id(
                 order.account_id, order.broker_order_id

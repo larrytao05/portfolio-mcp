@@ -1,6 +1,7 @@
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
+from portfolio_mcp.connection_store import ConnectionStore
 from portfolio_mcp.database import Database
 from portfolio_mcp.models import Account, HoldingsSnapshot, Position
 from portfolio_mcp.overview import (
@@ -10,7 +11,18 @@ from portfolio_mcp.overview import (
     PortfolioOverview,
     RecordedHistory,
 )
-from portfolio_mcp.portfolio_store import save_failed_refresh, save_refresh
+from portfolio_mcp.portfolio_store import (
+    list_accounts,
+    save_failed_refresh,
+    save_refresh,
+)
+
+
+def bind_saved_accounts(database):
+    repository = ConnectionStore(database)
+    repository.save_connection("fixture", "fixture", "fixture", "fixture", True)
+    for account in list_accounts(database):
+        repository.save_account_route(account.account.id, "fixture", account.account.id)
 
 
 def test_empty_portfolio(tmp_path) -> None:
@@ -154,7 +166,9 @@ def test_multi_account_usd_portfolio(tmp_path) -> None:
         snapshot_date=snap_date,
     )
 
+    bind_saved_accounts(database)
     service = OverviewService(database)
+
     overview = service.get_overview()
 
     assert overview.status == "fresh"
@@ -288,7 +302,9 @@ def test_duplicate_symbols_across_accounts_preserve_identities(tmp_path) -> None
         snapshot_date=snap_date,
     )
 
+    bind_saved_accounts(database)
     service = OverviewService(database)
+
     overview = service.get_overview()
 
     assert overview.total_known_usd_value == Decimal("5000.00")
@@ -376,7 +392,9 @@ def test_missing_market_value_and_cost_basis(tmp_path) -> None:
         snapshot_date=snap_date,
     )
 
+    bind_saved_accounts(database)
     service = OverviewService(database)
+
     overview = service.get_overview()
 
     assert overview.total_known_usd_value == Decimal("1500.00")
@@ -468,7 +486,9 @@ def test_non_usd_holdings_excluded_and_reported(tmp_path) -> None:
         snapshot_date=snap_date,
     )
 
+    bind_saved_accounts(database)
     service = OverviewService(database)
+
     overview = service.get_overview()
 
     assert overview.total_known_usd_value == Decimal("3000.00")
@@ -572,7 +592,9 @@ def test_partial_refresh_and_stale_accounts(tmp_path) -> None:
         failed_accounts=[acc2],
     )
 
+    bind_saved_accounts(database)
     service = OverviewService(database)
+
     overview = service.get_overview()
 
     assert overview.status == "partial"
@@ -644,7 +666,9 @@ def test_failed_refresh_all_accounts_stale(tmp_path) -> None:
         error_message="Schwab API unavailable",
     )
 
+    bind_saved_accounts(database)
     service = OverviewService(database)
+
     overview = service.get_overview()
 
     assert overview.status == "stale"
@@ -794,7 +818,9 @@ def test_daily_value_history_aggregation_and_gap_preservation(tmp_path) -> None:
             )
         )
 
+    bind_saved_accounts(database)
     service = OverviewService(database)
+
     overview = service.get_overview()
 
     history = overview.history
@@ -827,6 +853,81 @@ def test_daily_value_history_aggregation_and_gap_preservation(tmp_path) -> None:
     assert pt5.value == Decimal("100.00")
     assert pt5.currency == "USD"
     assert pt5.accounts_count == 1
+
+
+def test_overview_to_dict_serialization(tmp_path) -> None:
+    from portfolio_mcp.models import Account, HoldingsSnapshot, Position
+
+    database_url = f"sqlite:///{tmp_path / 'dict.db'}"
+    database = Database(database_url)
+
+    now = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
+    snap_date = date(2026, 8, 29)
+
+    acc = Account(
+        id="acc-1",
+        provider="Schwab",
+        label="Schwab 1",
+        account_type="taxable_brokerage",
+        currency="USD",
+    )
+    pos = [
+        Position(
+            account_id="acc-1",
+            symbol="VTI",
+            name="Vanguard Total Stock Market ETF",
+            asset_class="equity_etf",
+            quantity=Decimal("10"),
+            current_price=Decimal("300.00"),
+            market_value=Decimal("3000.00"),
+            cost_basis=Decimal("2500.00"),
+            currency="USD",
+        )
+    ]
+
+    save_refresh(
+        database,
+        snapshots=[
+            HoldingsSnapshot(account=acc, as_of=snap_date, positions=tuple(pos))
+        ],
+        started_at=now,
+        completed_at=now,
+        snapshot_date=snap_date,
+    )
+
+    bind_saved_accounts(database)
+    service = OverviewService(database)
+    data = service.get_overview().to_dict()
+
+    assert data["total_known_usd_value"] == "3000.00"
+    assert data["status"] == "fresh"
+    assert data["as_of"] == "2026-08-29"
+    assert data["refreshed_at"] == now.isoformat()
+    assert isinstance(data["accounts"], list)
+    accounts = data["accounts"]
+    assert isinstance(accounts, list)
+    acc0 = accounts[0]
+    assert isinstance(acc0, dict)
+    assert acc0["market_value"] == "3000.00"
+    assert acc0["percentage_of_total"] == "1.0000"
+
+    allocations = data["allocations"]
+    assert isinstance(allocations, dict)
+    account_alloc = allocations["account"]
+    assert isinstance(account_alloc, dict)
+    assert account_alloc["denominator"] == "3000.00"
+    asset_alloc = allocations["asset_class"]
+    assert isinstance(asset_alloc, dict)
+    assert asset_alloc["denominator"] == "3000.00"
+
+    gain_loss = data["gain_loss"]
+    assert isinstance(gain_loss, dict)
+    assert gain_loss["unrealized_gain_loss"] == "500.00"
+    assert gain_loss["market_value"] == "3000.00"
+    assert gain_loss["cost_basis"] == "2500.00"
+
+    history = data["history"]
+    assert isinstance(history, list)
 
 
 def test_mixed_currency_account_daily_history_excludes_non_usd_from_usd_snapshot(
@@ -880,7 +981,9 @@ def test_mixed_currency_account_daily_history_excludes_non_usd_from_usd_snapshot
         snapshot_date=snap_date,
     )
 
+    bind_saved_accounts(database)
     service = OverviewService(database)
+
     overview = service.get_overview()
 
     assert len(overview.history.points) == 1

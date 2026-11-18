@@ -1,15 +1,18 @@
 import { useQuery } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
 
-import { getQuote, searchInstruments } from "../../api/client";
+import { getIntraday, getQuote, searchInstruments, type Account } from "../../api/client";
+import { IntradayChart } from "./IntradayChart";
+import { TickerAccounts } from "./TickerAccounts";
 import { quoteSourceLabel } from "../../lib/portfolioDisplay";
 import { readErrorMessage, retryProviderRead } from "../../lib/providerErrors";
 
-export function MarketDataSection() {
+export function MarketDataSection({ accounts = [] }: { accounts?: Account[] }) {
+  const [extendedHours, setExtendedHours] = useState(false);
   const [instrumentQuery, setInstrumentQuery] = useState(""),
     [submittedQuery, setSubmittedQuery] = useState<string | null>(null),
     [selectedInstrumentId, setSelectedInstrumentId] = useState<string | null>(
-      null,
+      new URLSearchParams(window.location.search).get("ticker"),
     );
   const search = useQuery({
     queryKey: ["instrument-search", submittedQuery],
@@ -21,11 +24,27 @@ export function MarketDataSection() {
     queryKey: ["quote", selectedInstrumentId],
     queryFn: () => getQuote(selectedInstrumentId ?? ""),
     enabled: selectedInstrumentId !== null,
+    refetchInterval: 15_000,
     retry: retryProviderRead,
   });
+  const intraday = useQuery({
+    queryKey: ["intraday", selectedInstrumentId, extendedHours],
+    queryFn: () => getIntraday(selectedInstrumentId ?? "", extendedHours),
+    enabled: selectedInstrumentId !== null,
+    refetchInterval: 60_000,
+  });
+  function selectInstrument(id: string) {
+    const url = new URL(window.location.href);
+    url.searchParams.set("ticker", id);
+    window.history.replaceState(null, "", url);
+    setSelectedInstrumentId(id);
+  }
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setSelectedInstrumentId(null);
+    const url = new URL(window.location.href);
+    url.searchParams.delete("ticker");
+    window.history.replaceState(null, "", url);
     if (submittedQuery === instrumentQuery) void search.refetch();
     setSubmittedQuery(instrumentQuery);
   }
@@ -73,7 +92,7 @@ export function MarketDataSection() {
               <button
                 onClick={() => {
                   if (selectedInstrumentId === i.id) void quote.refetch();
-                  setSelectedInstrumentId(i.id);
+                  selectInstrument(i.id);
                 }}
                 type="button"
               >
@@ -87,6 +106,15 @@ export function MarketDataSection() {
           ))}
         </ul>
       )}
+      <div className="ticker-market-grid">
+      {selectedInstrumentId && <div className="ticker-chart-panel">
+        <h3>{quote.data?.quote?.instrument.symbol ?? "Selected ticker"} · Today</h3>
+        <label className="ticker-session"><input type="checkbox" checked={extendedHours} onChange={(event) => setExtendedHours(event.target.checked)} />Include extended hours</label>
+        {intraday.isPending && <p>Loading current-day chart…</p>}
+        {intraday.isError && <p className="state state-error">Intraday chart is unavailable. <button onClick={() => void intraday.refetch()}>Retry chart</button></p>}
+        {intraday.isError && intraday.data && <p className="state-error">Stale previously loaded chart. Refresh failed.</p>}
+        {intraday.data && <IntradayChart history={intraday.data.history} />}
+      </div>}
       {quote.isPending && selectedInstrumentId !== null && (
         <p className="state">Loading quote…</p>
       )}
@@ -99,11 +127,13 @@ export function MarketDataSection() {
         <article className="quote-card" aria-label="Instrument quote">
           <div>
             <h3>{quote.data.quote.instrument.symbol} quote</h3>
+            {quote.isError && <p className="state-error">Stale previously loaded quote. Refresh failed.</p>}
             <p>
-              Source: {quoteSourceLabel(quote.data.quote.source)} · Observed:{" "}
+              Source: {quoteSourceLabel(quote.data.quote.source)}{quote.data.quote.delay_seconds ? " · SIP, 15-minute delay" : ""} · Observed:{" "}
               {new Date(quote.data.quote.observed_at).toLocaleString()}
             </p>
           </div>
+          {quote.data.quote.trade_observed_at && <p className="muted">Last trade observed: {new Date(quote.data.quote.trade_observed_at).toLocaleString()}</p>}
           <dl>
             <div>
               <dt>Last price</dt>
@@ -125,9 +155,12 @@ export function MarketDataSection() {
               </dd>
             </div>
           </dl>
+          <button type="button" onClick={() => void quote.refetch()}>Refresh quote</button>
           <small>Canonical identity: {quote.data.quote.instrument.id}</small>
         </article>
       )}
+      </div>
+      {quote.data?.quote && <TickerAccounts accounts={accounts} symbol={quote.data.quote.instrument.symbol} />}
     </section>
   );
 }

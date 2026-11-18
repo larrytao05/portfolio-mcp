@@ -286,3 +286,5 @@ class PortfolioView:
     accounts: tuple[StoredAccount, ...]
     positions: tuple[StoredPosition, ...]
     daily_values: tuple[DailyAccountValue, ...]
+    unlinked_accounts: int = 0
+    excluded_accounts: int = 0

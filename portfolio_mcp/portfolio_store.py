@@ -38,7 +38,9 @@ from portfolio_mcp.portfolio_records import (
 from portfolio_mcp.schema import (
     AccountCapabilityRecord,
     AccountRecord,
+    AccountRouteRecord,
     ActivityRecord,
+    ConnectionRecord,
     DailyAccountValueRecord,
     PositionRecord,
     RefreshProviderOutcomeRecord,
@@ -790,12 +792,51 @@ def _save_transactions(
         record.currency = transaction.currency
 
 
-def read_portfolio_view(db: Database) -> PortfolioView:
+def read_portfolio_view(db: Database, *, included_only: bool = False) -> PortfolioView:
     with db.sessions() as session:
         session.connection().exec_driver_sql("BEGIN")
+        accounts = _list_accounts(session)
+        positions = _all_positions(session)
+        daily_values = _all_daily_values(session)
+        unlinked_accounts = 0
+        excluded_accounts = 0
+        if included_only:
+            routed_ids = set(session.scalars(select(AccountRouteRecord.account_id)))
+            unlinked_accounts = sum(
+                account.account.id not in routed_ids for account in accounts
+            )
+            included_ids = set(
+                session.scalars(
+                    select(AccountRouteRecord.account_id)
+                    .join(
+                        ConnectionRecord,
+                        ConnectionRecord.id == AccountRouteRecord.connection_id,
+                    )
+                    .where(
+                        AccountRouteRecord.included.is_(True),
+                        ConnectionRecord.active.is_(True),
+                    )
+                )
+            )
+            excluded_accounts = sum(
+                account.account.id not in included_ids for account in accounts
+            )
+            accounts = [
+                account for account in accounts if account.account.id in included_ids
+            ]
+            positions = [
+                position
+                for position in positions
+                if position.position.account_id in included_ids
+            ]
+            daily_values = [
+                value for value in daily_values if value.account_id in included_ids
+            ]
         return PortfolioView(
             latest_refresh=_latest_refresh(session),
-            accounts=tuple(_list_accounts(session)),
-            positions=tuple(_all_positions(session)),
-            daily_values=tuple(_all_daily_values(session)),
+            accounts=tuple(accounts),
+            positions=tuple(positions),
+            daily_values=tuple(daily_values),
+            unlinked_accounts=unlinked_accounts,
+            excluded_accounts=excluded_accounts,
         )

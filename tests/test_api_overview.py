@@ -6,10 +6,11 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from portfolio_mcp.api import create_app
+from portfolio_mcp.connection_store import ConnectionStore
 from portfolio_mcp.database import Database
 from portfolio_mcp.fixtures import FixturePortfolioProvider
 from portfolio_mcp.models import Account, HoldingsSnapshot, Position
-from portfolio_mcp.portfolio_store import save_refresh
+from portfolio_mcp.portfolio_store import list_accounts, save_refresh
 from portfolio_mcp.provider import ProviderUnavailableError
 
 
@@ -49,10 +50,20 @@ def create_client(
     database_url = f"sqlite:///{tmp_path / 'portfolio.db'}"
     app = create_app(
         provider,
+        configured_providers={"fixture": provider},
         database_url=database_url,
         clock=clock,
     )
-    return TestClient(app), Database(database_url)
+    client = TestClient(app)
+    client.post("/api/connections/fixture")
+    return client, Database(database_url)
+
+
+def bind_saved(database):
+    routes = ConnectionStore(database)
+    for account in list_accounts(database):
+        if routes.account_route(account.account.id) is None:
+            routes.save_account_route(account.account.id, "fixture", account.account.id)
 
 
 def test_fresh_overview_endpoint(tmp_path) -> None:
@@ -70,7 +81,7 @@ def test_fresh_overview_endpoint(tmp_path) -> None:
 
     assert overview["status"] == "fresh"
     assert overview["total_known_usd_value"] == "9999.95"
-    assert overview["cash_usd"] is not None
+    assert overview["cash_usd"] is None
     assert overview["buying_power_usd"] is None
     assert overview["as_of"] == "2026-08-29"
     assert overview["refreshed_at"] is not None
@@ -298,6 +309,7 @@ def test_history_endpoint_preserves_gaps(tmp_path) -> None:
     )
     save_refresh(repo, [snap2_1, snap2_2], now2, now2, snapshot_date=date(2026, 8, 25))
 
+    bind_saved(repo)
     response = client.get("/api/overview/history")
     assert response.status_code == 200
     history = response.json()["history"]
@@ -394,6 +406,7 @@ def test_missing_market_value_and_cost_basis_exclusions(tmp_path) -> None:
         ),
     )
     save_refresh(repo, [snap], now, now, snapshot_date=date(2026, 8, 20))
+    bind_saved(repo)
 
     resp = client.get("/api/overview")
     assert resp.status_code == 200
@@ -500,6 +513,7 @@ def test_provider_coverage_mixed_account_outcomes(tmp_path) -> None:
         snapshot_date=snap_date,
     )
 
+    bind_saved(repo)
     resp = client.get("/api/overview")
     assert resp.status_code == 200
     overview = resp.json()["overview"]

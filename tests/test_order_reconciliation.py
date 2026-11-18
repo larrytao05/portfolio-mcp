@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 
+from portfolio_mcp.connection_store import ConnectionStore
 from portfolio_mcp.database import Database
 from portfolio_mcp.execution import (
     BrokerOrderSearch,
@@ -53,6 +54,10 @@ async def create_limit_draft(database: Database, now: datetime):
         refreshed_at.date(),
         capabilities=capabilities,
     )
+    routes = ConnectionStore(database)
+    routes.save_connection("fixture", "fixture", "fixture", "fixture", True)
+    for account in accounts:
+        routes.save_account_route(account.id, "fixture", account.id, trade_enabled=True)
     settings = TradingSettingsService(database, lambda: refreshed_at)
     settings.replace(
         live_trading_enabled=True,
@@ -642,3 +647,38 @@ async def test_sync_does_not_recover_a_live_submitting_order(tmp_path) -> None:
     assert synced.state == OrderState.SUBMITTING
     assert synced.provider_submission_started_at is None
     assert provider.reads == []
+
+
+@pytest.mark.asyncio
+async def test_fixture_reader_cannot_reconcile_live_route_even_with_colliding_order(
+    tmp_path,
+):
+    from sqlalchemy import update
+
+    from portfolio_mcp.execution import FixtureExecutionProvider
+    from portfolio_mcp.order_reconciliation import OrderReconciliationService
+    from portfolio_mcp.schema import AccountRouteRecord
+
+    now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+    database = Database(f"sqlite:///{tmp_path / 'portfolio.db'}")
+    order = await create_unknown_order(database, now)
+    routes = ConnectionStore(database)
+    routes.save_connection("live", "alpaca", "live", "server_env:alpaca", True)
+    with database.sessions.begin() as session:
+        session.execute(
+            update(AccountRouteRecord)
+            .where(AccountRouteRecord.account_id == order.account_id)
+            .values(connection_id="live", upstream_account_id="upstream")
+        )
+
+    class CollidingFixture(FixtureExecutionProvider):
+        async def find_by_client_order_id(self, account_id, client_order_id):
+            raise AssertionError("Fixture reader must not be called for live accounts")
+
+    reader = CollidingFixture()
+    result = await OrderReconciliationService(
+        database, reader, lambda: now
+    ).reconcile_unknown(order.id)
+    assert result.state == OrderState.UNKNOWN
+    assert result.result_code == "provider_error"
+    assert reader.invocations == []

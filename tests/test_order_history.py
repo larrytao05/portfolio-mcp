@@ -207,7 +207,7 @@ async def test_event_and_order_pages_are_tie_safe_and_filter_bound(tmp_path) -> 
         FixtureMarketDataProvider(),
         lambda: now,
     )
-    for _ in range(3):
+    for index in range(3):
         draft = await draft_service.create(
             account_id="schwab-taxable-demo",
             instrument_id="us-etf:VTI",
@@ -216,7 +216,16 @@ async def test_event_and_order_pages_are_tie_safe_and_filter_bound(tmp_path) -> 
             quantity="1",
             limit_price="300.25",
         )
-        orders.append(begin_order_submission(database, draft, now)[0])
+        order = begin_order_submission(database, draft, now)[0]
+        orders.append(order)
+        if index < 2:
+            finish_order_submission(
+                database,
+                order.id,
+                OrderState.REJECTED,
+                now,
+                expected_version=order.version,
+            )
 
     event_ids = []
     cursor = None
@@ -236,8 +245,8 @@ async def test_event_and_order_pages_are_tie_safe_and_filter_bound(tmp_path) -> 
         if order_cursor is None:
             break
 
-    assert len(event_ids) == 12
-    assert len(set(event_ids)) == 12
+    assert len(event_ids) == 14
+    assert len(set(event_ids)) == 14
     assert set(order_ids) == {order.id for order in orders}
     assert len(order_ids) == len(set(order_ids)) == 3
     first_page_cursor = query_orders(database, limit=1).next_cursor

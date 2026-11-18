@@ -574,3 +574,47 @@ async def test_dashboard_issue_mcp_authorization_boundary_errors(tmp_path) -> No
         )
         assert resp_conflict.status_code == 409
         assert "already been created" in resp_conflict.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_default_mcp_service_never_uses_fixture_executor_for_live_route(tmp_path):
+    from sqlalchemy import update
+
+    from portfolio_mcp.connection_store import ConnectionStore
+    from portfolio_mcp.schema import AccountRouteRecord
+
+    now = datetime(2026, 9, 12, 20, 0, tzinfo=UTC)
+    context = await _setup_services(tmp_path, now)
+    draft = await context.drafts.create(
+        account_id="schwab-taxable-demo",
+        instrument_id="us-etf:VTI",
+        side="buy",
+        order_type="limit",
+        quantity="1",
+        limit_price="220.00",
+    )
+    authorization = context.authorization.create_authorization(
+        action="submit", target_draft_id=draft.id
+    )
+    routes = ConnectionStore(context.database)
+    routes.save_connection("live", "alpaca", "live", "server_env:alpaca", True)
+    with context.database.sessions.begin() as session:
+        session.execute(
+            update(AccountRouteRecord)
+            .where(AccountRouteRecord.account_id == draft.account_id)
+            .values(connection_id="live", upstream_account_id="upstream")
+        )
+    server = create_server(
+        context.provider,
+        database=context.database,
+        market_data_provider=context.market_data,
+        execution_provider=context.execution,
+        mcp_auth_service=context.authorization,
+        clock=lambda: now,
+    )
+    with pytest.raises(ToolError, match="execution_unavailable"):
+        await server.call_tool(
+            "submit_authorized_order",
+            {"draft_id": draft.id, "code": authorization.plaintext_code},
+        )
+    assert context.execution.invocations == []
